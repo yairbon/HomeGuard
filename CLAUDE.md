@@ -48,10 +48,14 @@ coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4") }`. זה
 הראשונה שהתקלה הזו בכלל נחשפה.
 
 **הרצה על מכשיר פיזי אמיתי (לא רק build — קישוריות בזמן ריצה):**
-`main.dart` משתמש כברירת מחדל ב-`http://localhost:8000` בתור baseUrl של
-ה-backend — זה עובד לאמולטור/desktop/web (רצים על אותה מכונה כמו
-ה-backend), אבל **לא** לטלפון פיזי, כי `localhost` שם מתייחס לטלפון עצמו.
-שתי גישות אפשריות:
+כתובת ה-backend כבר לא הארד-קודד — `BackendConfig` (`app/lib/services/
+backend_config.dart`) שומר אותה ב-SharedPreferences, נטען לפני `runApp`
+ב-`main.dart`, ונערך במסך Settings ("Backend connection"). ברירת המחדל
+עדיין `http://localhost:8000`, וכל שינוי דורש **restart של האפליקציה**
+(ה-`baseUrl` על `HttpBackendService` הוא `final` — אין live-reconnect
+בכוונה, ראה את הקומנט ב-`_saveBackendUrl`). `localhost` עובד
+לאמולטור/desktop/web (רצים על אותה מכונה כמו ה-backend), אבל **לא**
+לטלפון פיזי, כי `localhost` שם מתייחס לטלפון עצמו. שלוש גישות אפשריות:
 1. **IP אמיתי ברשת ה-WiFi המקומית** (במקום `localhost` ב-`main.dart`,
    נמצא עם `Get-NetIPAddress`/`ipconfig`) — דורש גם firewall rule
    (`New-NetFirewallRule -DisplayName "HomeGuard backend (dev)" -Direction
@@ -73,6 +77,22 @@ coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4") }`. זה
    לבלבול אמיתי (פקודות arm/disarm הצליחו ב-REST, אבל המסך לא השתקף בזמן
    אמת). גם: חיבור ה-USB לפעמים נופל (transport_id משתנה) — `adb reverse
    --list` בודק אם המנהרה עדיין קיימת, ואפשר להריץ שוב בבטחה (אידמפוטנטי).
+3. **Tailscale** (VPN רשתי פרטי, WireGuard) — נבחר כדי לפתור את הבעיה
+   ששתי הגישות למעלה לא פותרות: "עובד מכל רשת, לא רק USB/LAN מקומי".
+   המחשב והטלפון מתחברים שניהם **החוצה** לשרתי Tailscale (בלי לפתוח אף
+   port לאינטרנט הפתוח — חשוב במיוחד כאן כי זו מערכת אזעקה עם auth חלש,
+   סיסמה משותפת אחת + lockout של 30 שניות בלבד; לא ראוי לחשוף את
+   ה-backend לאינטרנט הרחב). זה אותו עיקרון שחברות כמו Ring/Nest
+   משתמשות בו (המכשיר הביתי יוזם חיבור יוצא, לא מקשיב לנכנס), רק בקנה
+   מידה אישי דרך שירות מוכן במקום ענן עצמאי. **מותקן על המחשב הזה**
+   (`C:\Program Files\Tailscale`, שירות רץ), אבל **לא מחובר לחשבון** —
+   `tailscale status` יחזיר "Logged out" עד שמישהו יפתח את ה-URL
+   שההתקנה נתנה ויתחבר. זו התחברות לחשבון (Google/Microsoft/GitHub SSO
+   או מייל) — **לא פעולה שסוכן יכול/צריך לבצע**, בדיוק כמו ה-firewall
+   rule למעלה. אחרי חיבור: להתקין Tailscale גם בטלפון, להריץ `tailscale
+   ip -4` במחשב כדי לקבל את ה-IP הפרטי שלו (בטווח `100.x.x.x`), ולהזין
+   אותו (עם `http://` ו-`:8000`) בשדה "Backend URL" במסך Settings של
+   האפליקציה.
 
 שחזור סביבה במחשב חדש: אם Windows בריא (לא עם התקלה הזו) — נסה קודם
 `.\scripts\setup-windows.ps1`. אם נתקלים באותה תקלה — `scripts\setup-wsl.sh`
@@ -105,7 +125,8 @@ Nice-to-have: אימות ביומטרי, דאשבורד לוג בזמן אמת, 
 בנוי: מסך login (עם ניעילה חכמה אחרי 3 ניסיונות שגויים — כמו הקודן הפיזי),
 דאשבורד (AlarmStatusIndicator + מצבי דריכה Home/Away + פאנל חיישנים לפי
 חיישן ספציפי + סטטוס חיבור ESP32), מסך event log עם פילטר לפי חומרה, מסך
-settings עם שינוי סיסמה + night mode + איש קשר לחירום, מסך faces, מסך
+settings עם שינוי סיסמה + night mode + איש קשר לחירום + כתובת backend
+(ראה הסעיף על Tailscale למעלה), מסך faces, מסך
 camera. **מדבר בפועל עם ה-backend האמיתי** — `HttpBackendService`
 (`services/http_backend_service.dart`) הוא ה-`BackendService` שנטען
 כברירת מחדל ב-`main.dart` (REST + WebSocket ל-`/ws`), נבדק end-to-end

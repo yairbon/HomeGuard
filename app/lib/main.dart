@@ -5,6 +5,7 @@ import 'screens/login_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/alarm_service.dart';
 import 'services/auth_service.dart';
+import 'services/backend_config.dart';
 import 'services/backend_service.dart';
 import 'services/http_backend_service.dart';
 import 'services/notification_service.dart';
@@ -18,10 +19,15 @@ import 'theme/app_theme.dart';
 /// binding exists. Local notifications are set up before [runApp] so the
 /// service is ready to fire before any UI (and any alarm event that might
 /// trigger a notification) can appear.
-void main() {
+///
+/// [BackendConfig.load] is awaited here (rather than inside a widget) so
+/// [HomeGuardApp] can build [HttpBackendService] with the right URL on the
+/// very first frame — no placeholder-then-reconnect flicker.
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   NotificationService.init();
-  runApp(const HomeGuardApp());
+  final backendUrl = await BackendConfig.load();
+  runApp(HomeGuardApp(backendUrl: backendUrl));
 }
 
 /// Root widget of the app.
@@ -33,12 +39,20 @@ class HomeGuardApp extends StatelessWidget {
   /// Creates the app. [backend] is normally left null so [build] falls back
   /// to a real [HttpBackendService]; tests pass a mock/fake here instead so
   /// they don't hit a real network connection that won't exist in a test run.
-  const HomeGuardApp({super.key, this.backend});
+  /// [backendUrl] defaults to [BackendConfig.defaultUrl] so widget tests
+  /// (which always pass [backend] and never go through `main()`) don't need
+  /// to care about it.
+  const HomeGuardApp({super.key, this.backend, this.backendUrl = BackendConfig.defaultUrl});
 
   /// Backend implementation to inject, or null to use the default
   /// [HttpBackendService] pointed at the local dev server. See [backend]'s
   /// use in [build] for the injection point.
   final BackendService? backend;
+
+  /// URL [HttpBackendService] is constructed with when [backend] is null —
+  /// see the "Backend connection" section of [SettingsScreen] for where the
+  /// user edits this, and [BackendConfig] for how it's persisted.
+  final String backendUrl;
 
   /// Builds the [MultiProvider] tree and the [MaterialApp] shell.
   @override
@@ -46,21 +60,33 @@ class HomeGuardApp extends StatelessWidget {
     return MultiProvider(
       providers: [
         Provider<BackendService>(
-          // localhost works for the emulator/desktop/web targets, since
-          // the backend runs on that same machine. On a real Android
-          // device, localhost means the phone itself, not your PC — the
-          // LAN-IP approach (backend machine's real WiFi IP) was tried
-          // here but this specific network setup couldn't route
-          // phone-to-PC traffic (confirmed with a raw TCP test from the
-          // phone — connection just timed out, no response at all,
-          // pointing at router-level client isolation or a firewall layer
-          // outside Windows' own). `adb reverse tcp:8000 tcp:8000` (run
-          // BEFORE launching the app, so the very first connection
-          // attempt succeeds instead of racing the tunnel setup) tunnels
-          // the phone's own localhost:8000 to this PC over the USB
-          // debugging connection instead — works regardless of WiFi
-          // topology.
-          create: (_) => backend ?? HttpBackendService(baseUrl: 'http://localhost:8000'),
+          // localhost (the default in BackendConfig) works for the
+          // emulator/desktop/web targets, since the backend runs on that
+          // same machine. On a real Android device, localhost means the
+          // phone itself, not your PC.
+          //
+          // Two approaches were tried for reaching the backend from a
+          // physical device:
+          // - LAN IP (backend machine's real WiFi IP): this specific
+          //   network setup couldn't route phone-to-PC traffic (confirmed
+          //   with a raw TCP test from the phone — connection just timed
+          //   out, no response at all, pointing at router-level client
+          //   isolation or a firewall layer outside Windows' own).
+          // - `adb reverse tcp:8000 tcp:8000` (run BEFORE launching the
+          //   app, so the very first connection attempt succeeds instead
+          //   of racing the tunnel setup): tunnels the phone's own
+          //   localhost:8000 to this PC over the USB debugging connection
+          //   instead — works regardless of WiFi topology, but needs a
+          //   cable and only reaches one phone at a time.
+          //
+          // `backendUrl` (edited in SettingsScreen's "Backend connection"
+          // section, persisted via BackendConfig) exists so a Tailscale
+          // (or other private-VPN) IP can be used instead once that's set
+          // up — same idea as the LAN-IP attempt above, but over a private
+          // mesh network instead of the raw local WiFi, so router-level
+          // client isolation doesn't apply and it keeps working off that
+          // WiFi entirely (e.g. on cellular).
+          create: (_) => backend ?? HttpBackendService(baseUrl: backendUrl),
           dispose: (_, backend) => backend.dispose(),
         ),
         ChangeNotifierProvider<AuthService>(

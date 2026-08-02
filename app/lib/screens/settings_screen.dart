@@ -2,17 +2,20 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/auth_service.dart';
+import '../services/backend_config.dart';
 import '../services/backend_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/homeguard_icons.dart';
 
 /// Account and system settings screen.
 ///
-/// Covers three independent areas: a night-mode toggle, emergency-contact
-/// details plus the police-call response delay, and a change-password
-/// form. The night-mode switch and emergency-contact fields persist to
-/// [BackendService] as soon as they change; the password form is only
-/// submitted when the user taps its button (see [_submitPassword]).
+/// Covers four independent areas: a night-mode toggle, emergency-contact
+/// details plus the police-call response delay, a change-password form,
+/// and the backend URL. The night-mode switch and emergency-contact
+/// fields persist to [BackendService] as soon as they change; the password
+/// form is only submitted when the user taps its button (see
+/// [_submitPassword]). The backend URL persists to local device storage
+/// via [BackendConfig] instead — see [_saveBackendUrl].
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -26,6 +29,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _newController = TextEditingController();
   final _confirmController = TextEditingController();
   final _emergencyController = TextEditingController();
+  final _backendUrlController = TextEditingController();
 
   bool _isSubmitting = false;
   String? _error;
@@ -38,10 +42,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // controls pre-populated with the hardcoded defaults above.
   bool _settingsLoaded = false;
 
+  // True right after the backend-URL save button is tapped, until the next
+  // build; shows a one-off "restart to apply" hint rather than a permanent
+  // one, since most visits to this screen aren't about that field.
+  bool _backendUrlSaved = false;
+
   @override
   void initState() {
     super.initState();
     _loadSettings();
+    // Independent of _loadSettings: this comes from local device storage
+    // (BackendConfig/SharedPreferences), not the backend, so it doesn't
+    // need to wait on — or block — the network round-trip the other
+    // settings make.
+    BackendConfig.load().then((url) {
+      if (!mounted) return;
+      setState(() => _backendUrlController.text = url);
+    });
+  }
+
+  /// Persists the backend-URL field to [BackendConfig] and flips on the
+  /// one-off "restart to apply" hint (see [_backendUrlSaved]). Doesn't
+  /// validate the URL's shape — an unreachable/malformed value just means
+  /// [HttpBackendService] fails to connect after restart, surfaced the
+  /// same way any other backend-offline state is (see [_SectionCard]'s
+  /// sibling screens' connectivity indicators), which is simpler than
+  /// duplicating URL-validity rules the app doesn't otherwise need.
+  Future<void> _saveBackendUrl() async {
+    await BackendConfig.save(_backendUrlController.text);
+    if (!mounted) return;
+    setState(() => _backendUrlSaved = true);
   }
 
   /// Fetches night mode, emergency number, and police-call delay from
@@ -77,6 +107,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _newController.dispose();
     _confirmController.dispose();
     _emergencyController.dispose();
+    _backendUrlController.dispose();
     super.dispose();
   }
 
@@ -117,8 +148,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   ///
   /// Shows a centered spinner until [_settingsLoaded] is true (see
   /// [_loadSettings]), then renders the night-mode switch, emergency
-  /// contact section, and change-password form, each inside its own
-  /// [_SectionCard].
+  /// contact section, change-password form, and backend-URL section, each
+  /// inside its own [_SectionCard]. The backend-URL section doesn't wait
+  /// on [_settingsLoaded] conceptually (it loads independently in
+  /// [initState]) but is still gated behind the same spinner for a
+  /// simpler single-loading-state screen rather than sections popping in
+  /// at different times.
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -282,6 +317,59 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ],
                       ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  _SectionCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const HomeGuardIcon(HGIcon.settings, color: AppColors.system, size: 20),
+                            const SizedBox(width: 10),
+                            const Text('Backend connection',
+                                style: TextStyle(color: AppColors.textPrimary)),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Where the app looks for the backend. Use a private-network '
+                          '(e.g. Tailscale) address to reach it off your home WiFi.',
+                          style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                        ),
+                        const SizedBox(height: 14),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _backendUrlController,
+                                keyboardType: TextInputType.url,
+                                style: const TextStyle(color: AppColors.textPrimary),
+                                decoration: const InputDecoration(
+                                  labelText: 'Backend URL',
+                                  hintText: 'http://100.x.x.x:8000',
+                                ),
+                                onChanged: (_) {
+                                  if (_backendUrlSaved) setState(() => _backendUrlSaved = false);
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            IconButton.filled(
+                              onPressed: _saveBackendUrl,
+                              icon: const Icon(Icons.save_outlined),
+                            ),
+                          ],
+                        ),
+                        if (_backendUrlSaved) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            'Saved — restart the app for this to take effect.',
+                            style: TextStyle(color: AppColors.safe, fontSize: 12),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                 ],
