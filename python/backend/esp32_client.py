@@ -1,0 +1,79 @@
+"""Communication with the door/keypad controller board.
+
+There are three ESP32 boards in this project (see esp32/), each with its
+own sketch. Two of them (ultrasonic, vibration) are pure sensor-push
+clients — they call this backend's `/esp32/sensor-event` and
+`/esp32/heartbeat` endpoints directly and never receive anything back, so
+they need no entry here.
+
+The door/keypad controller is different: it's the arm/disarm authority
+(it owns the keypad), so the app needs to be able to command it remotely,
+not just receive reports from it. That board runs a small WebServer with
+`/arm` and `/disarm` routes — see esp32/door_keypad_controller/. This
+module's `send_arm`/`send_disarm` call those routes and are believed to
+match the real firmware (built together with it), but re-check against
+the actual sketch if you change either side.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+import httpx
+
+from .models import ArmMode
+from .state import state
+
+logger = logging.getLogger("esp32_client")
+
+# The door/keypad controller board's IP, e.g. "http://192.168.1.50".
+# Find it by opening the Arduino IDE's Serial Monitor after that board
+# boots — it prints its assigned IP on connect.
+DOOR_CONTROLLER_URL = os.environ.get("HOMEGUARD_DOOR_CONTROLLER_URL", "")
+
+_client = httpx.AsyncClient(timeout=3.0)
+
+
+async def _post(path: str, json: dict | None = None) -> bool:
+    """Shared helper behind send_arm/send_disarm: POSTs to the door
+    controller and reports success as a bool rather than raising, since
+    callers (arm/disarm route handlers) treat "couldn't reach the board"
+    as a soft failure, not an error to surface as a 500.
+
+    If DOOR_CONTROLLER_URL isn't configured (e.g. running the backend
+    without real hardware attached), this is a no-op that just logs and
+    returns False — lets the rest of the app/demo work without a board.
+
+    Also doubles as a lightweight connectivity signal: a successful
+    request marks the ESP32 online, and an HTTPError (timeout, connection
+    refused, non-2xx, etc.) marks it offline — independent of whatever
+    /esp32/heartbeat last reported.
+    """
+    if not DOOR_CONTROLLER_URL:
+        logger.info(
+            "HOMEGUARD_DOOR_CONTROLLER_URL not set — skipping outbound command to %s", path
+        )
+        return False
+    try:
+        response = await _client.post(f"{DOOR_CONTROLLER_URL}{path}", json=json)
+        response.raise_for_status()
+        await state.set_esp32_online(True)
+        return True
+    except httpx.HTTPError as exc:
+        logger.warning("Door controller request to %s failed: %s", path, exc)
+        await state.set_esp32_online(False)
+        return False
+
+
+async def send_arm(mode: ArmMode) -> bool:
+    """Tell the door controller to arm. It runs its own exit-delay
+    countdown before actually going ARMED (see the sketch's EXITING
+    state) and reports back via /esp32/state-change once it does.
+    """
+    return await _post("/arm", json={"mode": mode.value})
+
+
+async def send_disarm() -> bool:
+    """Tell the door controller to disarm immediately."""
+    return await _post("/disarm")

@@ -1,0 +1,8 @@
+# OS/editor cruft not already covered by app/.gitignore or python/.gitignore
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+
+# WSL2 build scratch, if ever run from the repo root by mistake
+/build/
