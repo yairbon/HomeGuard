@@ -1,4 +1,4 @@
-<#
+﻿<#
 HomeGuard dev environment setup (Windows).
 Reproduces the Flutter + Android toolchain from scratch: JDK 17, Android SDK
 command-line tools, Flutter SDK. Run from an elevated or normal PowerShell

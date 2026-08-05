@@ -1,4 +1,4 @@
-<#
+﻿<#
 HomeGuard — install the shared Claude Code plugin set at USER scope (Windows).
 
 Why this exists: the repo already carries this plugin set at *project* scope

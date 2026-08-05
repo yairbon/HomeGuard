@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Gets HomeGuard running on a USB-connected Android phone in one command.
 
@@ -106,16 +106,24 @@ if ($SkipBackend) {
         Start-Process -FilePath $BackendPy `
             -ArgumentList "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "$Port" `
             -WorkingDirectory (Join-Path $RepoRoot "python")
-        Write-Host "   waiting for it to come up..."
+        # 90s, not 30s: this backend imports OpenCV (opencv-contrib-python)
+        # and numpy and loads the Haar cascade at startup, which on a cold
+        # Windows run regularly takes over 30 seconds. A 30s cap made the
+        # script throw "Backend never answered" while the backend was in
+        # fact starting normally and came up moments later — a false
+        # failure that aborted the run before it ever reached install.
+        $waitSeconds = 90
+        Write-Host "   waiting for it to come up (up to ${waitSeconds}s; OpenCV import makes the first start slow)..."
         $up = $false
-        foreach ($i in 1..30) {
+        foreach ($i in 1..$waitSeconds) {
             Start-Sleep -Seconds 1
             try {
                 Invoke-RestMethod -Uri "http://localhost:$Port/health" -TimeoutSec 2 | Out-Null
                 $up = $true; break
             } catch { }
+            if ($i % 15 -eq 0) { Write-Host "   still waiting... ${i}s" }
         }
-        if (-not $up) { throw "Backend never answered on http://localhost:$Port/health. Check the window it opened for the error." }
+        if (-not $up) { throw "Backend never answered on http://localhost:$Port/health after ${waitSeconds}s. Check the window it opened for the error." }
         Ok "backend healthy on port $Port"
     }
 }
@@ -145,13 +153,35 @@ export PATH="/opt/flutter/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/c
 cd $wslProject/app
 flutter build apk --debug
 "@
+    # Record the timestamp before building so a stale artifact can be
+    # detected afterwards (see the freshness check below).
+    $apkBefore = if (Test-Path $BuiltApk) { (Get-Item $BuiltApk).LastWriteTime } else { [datetime]::MinValue }
+
     wsl -d Ubuntu -- bash -c $buildCmd
     if ($LASTEXITCODE -ne 0) {
         throw "WSL2 build failed. If the errors look like unrelated Dart parse failures, it's usually a stale cache from mixing Windows/WSL2 builds — run 'flutter clean && flutter pub get' inside WSL2 and retry."
     }
     if (-not (Test-Path $BuiltApk)) { throw "Build reported success but no APK at $BuiltApk" }
+
+    # Existence alone is NOT proof the build produced anything: Gradle can
+    # report success while leaving a previous APK untouched (seen in
+    # practice after switching git branches — the build "succeeded" and the
+    # script happily installed a 3-hour-old APK that predated the branch,
+    # so the phone ran code that lacked the newly added screen entirely and
+    # the failure looked like a UI bug rather than a build one). Compare the
+    # write time instead, and say so plainly rather than installing a stale
+    # artifact.
+    $apkAfter = (Get-Item $BuiltApk).LastWriteTime
+    if ($apkAfter -le $apkBefore) {
+        throw @"
+Build reported success but did not rewrite the APK (still dated $apkAfter).
+That artifact predates this build, so installing it would put stale code on
+the phone. This is usually the Windows/WSL2 stale-cache trap in CLAUDE.md.
+Fix: wsl -d Ubuntu -- bash -c 'cd $wslProject/app && flutter clean && flutter pub get && flutter build apk --debug'
+"@
+    }
     $apkPath = $BuiltApk
-    Ok "built $apkPath"
+    Ok "built $apkPath (fresh, $apkAfter)"
 }
 
 # ---- 5. Install ---------------------------------------------------------------
