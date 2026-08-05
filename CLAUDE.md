@@ -98,6 +98,41 @@ backend_config.dart`) שומר אותה ב-SharedPreferences, נטען לפני 
 `.\scripts\setup-windows.ps1`. אם נתקלים באותה תקלה — `scripts\setup-wsl.sh`
 (רץ בתוך WSL2, `wsl -d Ubuntu -- bash /mnt/c/dev/HomeGuard/scripts/setup-wsl.sh`).
 
+## כלי Claude Code — plugins וסקילים
+
+`.claude/settings.json` (מקומם ב-git) מצהיר על שלושה marketplaces ושלושה
+plugins ב-**project scope**, כלומר כל סשן שנפתח על HomeGuard מתקין ומפעיל
+אותם אוטומטית — כולל קונטיינרים ארעיים בענן, שמתחילים כל פעם מ-`$HOME` נקי:
+
+| Plugin | מקור | מה זה נותן |
+| --- | --- | --- |
+| `claude-mem` | `thedotmack/claude-mem` | זיכרון מתמשך בין סשנים; 19 סקילים + hooks (SessionStart/PostToolUse/Stop) + MCP server |
+| `headroom` | `headroomlabs-ai/headroom` | hooks בלבד (SessionStart, PreToolUse), 0 עלות context |
+| `claude-code-setup` | `anthropics/claude-plugins-official` | סקיל שממליץ על אוטומציות (hooks/סקילים/MCP) לפי הקודבייס |
+
+עלות ה-context הקבועה של שלושתם יחד היא ~1.9k טוקנים לסשן. שים לב ש-
+`claude-mem` ו-`headroom` מריצים hooks — כלומר קוד צד-שלישי רץ בכל תחילת
+סשן ובכל קריאת כלי. זו החלטה מודעת, לא תופעת לוואי.
+
+ה-marketplace הרשמי נוסף עם `--sparse` (רק `.claude-plugin` ו-
+`plugins/claude-code-setup`) כדי לא לשכפל מונורפו של 278 plugins.
+
+**סקיל רביעי, `task-observer`, לא מותקן כ-plugin** אלא vendored ב-
+`.claude/skills/task-observer/` — הריפו שלו
+(`rebelytics/one-skill-to-rule-them-all`) מפרסם `SKILL.md` חשוף בלי
+`marketplace.json`, אז אין מה להתקין. פרטים ואיך לעדכן:
+`.claude/skills/task-observer/PROVENANCE.md`.
+
+להתקנת אותו סט ב-**כל ריפו אחר** (user scope, לא רק HomeGuard):
+`scripts/setup-claude-plugins.sh` (WSL2/Linux/macOS) או
+`scripts/setup-claude-plugins.ps1` (Windows). פעם אחת לכל מכונה.
+
+**OmniRoute לא נכלל** — למרות שהוא מופיע ברשימה, `diegosouzapw/OmniRoute`
+הוא אפליקציית LLM-router ב-TypeScript, לא plugin של Claude Code: אין בו
+`.claude-plugin/` בשום מקום בעץ. ה-`skills/` שלו הם 42 מסמכי SKILL.md
+שמתעדים את ה-REST API של שרת OmniRoute רץ — לא רלוונטיים ל-HomeGuard,
+ולא ניתנים להתקנה דרך `claude plugin install`.
+
 ## מבנה וקונבנציות
 
 - `esp32/` — **שלושה בקרים נפרדים**, לא אחד מרכזי (עדכון מהתכנון המקורי —
