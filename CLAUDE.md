@@ -76,6 +76,8 @@ backend_config.dart`) שומר אותה ב-SharedPreferences, נטען לפני 
    firewall נוספת שלא Windows Defender.
 2. **`adb reverse tcp:8000 tcp:8000`** (מנהרת USB, `localhost:8000`
    בטלפון מתועל בפועל ל-`localhost:8000` על ה-PC) — זו הגישה שעבדה בפועל.
+   `scripts/run-on-phone.ps1` עושה את כל הרצף הזה בפקודה אחת (בחירת serial,
+   הרצת בקנד, מנהרה, התקנה, הפעלה, ואימות שהטלפון באמת הגיע לבקנד).
    **קריטי:** להריץ את `adb reverse` **לפני** ההתקנה/הרצה של האפליקציה,
    לא אחרי — אם האפליקציה כבר רצה כשה-tunnel מוקם, ניסיון ה-WebSocket
    הראשון שלה (ב-`HttpBackendService` constructor) נכשל לפני שה-tunnel

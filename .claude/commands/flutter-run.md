@@ -2,6 +2,16 @@
 description: Run/install the HomeGuard Flutter app on a connected Android device
 ---
 
+**Fastest path: `.\scripts\run-on-phone.ps1`** does every step below in one
+command — picks the right device serial, starts the backend and waits for
+it to answer, opens the reverse tunnel *before* installing, installs,
+launches, then checks the phone actually reached the backend. Use
+`-Apk <path>` to skip the build, and `-ResetAppData` if the app was
+previously pointed at a Tailscale/LAN address (SharedPreferences survives
+`install -r`, so a stale Backend URL would ignore the USB tunnel).
+
+The manual steps, for when something needs debugging:
+
 Native Windows Gradle builds are broken on this machine (known Winsock/
 AF_UNIX defect — see CLAUDE.md), so building happens in WSL2, but a
 connected Android device is only visible to Windows-side adb. Workflow:
