@@ -97,28 +97,52 @@ class HttpBackendService implements BackendService {
   /// `python/backend/models.py`) and fans its fields out to each of this
   /// service's individual stream controllers, so the rest of the app can
   /// keep listening to narrow, typed streams instead of one big blob.
+  ///
+  /// Publication order is load-bearing, not cosmetic: `alarm_state` goes
+  /// out **last**. These are async broadcast controllers, so listeners run
+  /// in the order their events were queued — and [AlarmService]'s
+  /// alarm-state listener reads its own already-received `_events` list to
+  /// caption the intrusion notification. Adding the state first meant that
+  /// listener ran while `_events` still held the *previous* snapshot, so a
+  /// break-in notification was captioned with the event before it (e.g.
+  /// "System armed (Away)") instead of the alert that just fired.
+  /// [MockBackendService] already emitted in this order — that's why the
+  /// bug never showed up under the widget tests.
+  ///
+  /// Wrapped in a try/catch because a malformed or unexpected payload
+  /// (`byName` throws on an enum value this build doesn't know, e.g. after
+  /// a backend adds a SensorType the app hasn't shipped yet) would
+  /// otherwise throw straight out of a stream callback as an uncaught
+  /// async error. Dropping one bad frame and waiting for the next
+  /// broadcast is the right failure mode for a live status channel.
   void _handleMessage(dynamic raw) {
-    final json = jsonDecode(raw as String) as Map<String, dynamic>;
+    try {
+      final json = jsonDecode(raw as String) as Map<String, dynamic>;
 
-    _alarmStateController.add(AlarmState.values.byName(json['alarm_state'] as String));
+      _sensorController.add(
+        (json['sensors'] as List).map((s) => _sensorFromJson(s as Map<String, dynamic>)).toList(),
+      );
 
-    _sensorController.add(
-      (json['sensors'] as List).map((s) => _sensorFromJson(s as Map<String, dynamic>)).toList(),
-    );
+      _eventLogController.add(
+        (json['events'] as List).map((e) => _eventFromJson(e as Map<String, dynamic>)).toList(),
+      );
 
-    _eventLogController.add(
-      (json['events'] as List).map((e) => _eventFromJson(e as Map<String, dynamic>)).toList(),
-    );
+      _facesController.add(
+        (json['faces'] as List)
+            .map((f) => ApprovedFace(id: f['id'] as String, name: f['name'] as String))
+            .toList(),
+      );
 
-    _facesController.add(
-      (json['faces'] as List)
-          .map((f) => ApprovedFace(id: f['id'] as String, name: f['name'] as String))
-          .toList(),
-    );
+      _connectivityController.add(json['esp32_online'] as bool);
+      _cameraOnlineController.add(json['camera_online'] as bool);
+      _faceIdEnabledController.add(json['face_id_enabled'] as bool);
 
-    _connectivityController.add(json['esp32_online'] as bool);
-    _cameraOnlineController.add(json['camera_online'] as bool);
-    _faceIdEnabledController.add(json['face_id_enabled'] as bool);
+      // Last, so every list above is already delivered — see the doc note.
+      _alarmStateController.add(AlarmState.values.byName(json['alarm_state'] as String));
+    } catch (_) {
+      // Intentionally silent: there is no caller in a position to handle
+      // this, and the next state broadcast supersedes whatever was lost.
+    }
   }
 
   /// Decodes one entry of the WebSocket message's `sensors` array into a
@@ -236,14 +260,21 @@ class HttpBackendService implements BackendService {
   @override
   Future<void> addFace(String name) => _post('/faces', {'name': name});
 
-  // Note: unlike every other REST call on this class, this one calls
-  // `http.delete` directly instead of going through `_post`/`_get`, so it
-  // does NOT swallow network/HTTP errors — a failed request here throws
-  // instead of silently no-op'ing. Documentation-only pass: not changing
-  // this, just flagging the inconsistency.
+  /// Deletes the approved face with [id]. Uses `http.delete` directly
+  /// since there's no `_delete` helper, but swallows failures the same way
+  /// [_post]/[_get] do — this used to be the one REST call on the class
+  /// that let a network error escape, which meant tapping delete with the
+  /// backend unreachable threw out of a UI callback instead of quietly
+  /// doing nothing like every neighbouring action does. The deletion is
+  /// confirmed by the face disappearing from [facesStream], not by this
+  /// call returning.
   @override
   Future<void> removeFace(String id) async {
-    await http.delete(Uri.parse('$baseUrl/faces/$id'));
+    try {
+      await http.delete(Uri.parse('$baseUrl/faces/$id'));
+    } catch (_) {
+      // Same swallow-and-fall-back contract as _post/_get above.
+    }
   }
 
   /// Turns face-ID recognition on/off.

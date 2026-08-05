@@ -63,6 +63,14 @@ State currentState = DISARMED;
 // --- Keypad & Security Variables ---
 String enteredPin = "";
 const String SECRET_PIN = "1234";
+// Digits are accepted in every state (so the PIN can be pre-typed before
+// the door swings open and ENTRY_DELAY starts), but only ENTRY_DELAY and
+// ALARM ever consume the buffer with '#'. Without a cap, keys pressed in
+// any other state — or just something leaning on the keypad — grow this
+// String forever on a device with ~300 KB of heap and no way to clear it
+// short of a reboot. At the cap the buffer restarts rather than silently
+// ignoring further digits, so a wrong entry can't wedge the keypad.
+const unsigned int MAX_PIN_LENGTH = 8;  // SECRET_PIN is 4; the slack absorbs a mistype
 // TODO: this reads the "keypad" from the Serial Monitor (type digits +
 // '*' to arm / '#' to submit a PIN) — a deliberate stand-in for testing
 // the state machine before the physical 4x4 keypad is wired up. Once it
@@ -87,6 +95,41 @@ const int BEEP_ON_DURATION = 150;     // Beep stays on for 150ms
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 10000;
 
+// --- WiFi ---
+// How long setup() waits for the initial association before giving up and
+// booting anyway. See connectWiFi() for why it gives up at all.
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
+
+// Brings up WiFi with a bounded wait instead of spinning until it
+// succeeds. This board's keypad, door sensor and sirens are the parts
+// that must work with no network whatsoever — an unreachable router is
+// exactly the situation where you still want the house alarm to arm and
+// scream. Blocking here meant a board that powered up before the router
+// did (or during an outage) never reached loop() at all, so the entire
+// local alarm stayed dead until someone noticed and rebooted it.
+// setAutoReconnect lets the ESP32 core keep retrying in the background,
+// so the backend link comes back on its own once the network does; every
+// outbound report already checks WiFi.status() before trying.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("My IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi unavailable — running the alarm locally, retrying in background.");
+    Serial.println("Remote arm/disarm and backend reports stay offline until it connects.");
+  }
+}
+
 // Boot sequence: configure pins, force the buzzers quiet so they don't
 // chirp on power-up, read the door's initial state, then bring up WiFi
 // and the remote-control WebServer.
@@ -110,15 +153,7 @@ void setup() {
                // as-is since this pass is documentation-only.
 
   // --- WiFi + remote-control server ---
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.print("My IP: ");
-  Serial.println(WiFi.localIP());
+  connectWiFi();
 
   server.on("/arm", HTTP_POST, handleRemoteArm);
   server.on("/disarm", HTTP_POST, handleRemoteDisarm);
@@ -277,6 +312,10 @@ void loop() {
 
   // If a number is typed, hide it with an asterisk
   if (input >= '0' && input <= '9') {
+    if (enteredPin.length() >= MAX_PIN_LENGTH) {
+      enteredPin = "";  // see MAX_PIN_LENGTH — restart instead of growing
+      Serial.println("\n[KEYPAD] Too many digits — entry cleared, start again.");
+    }
     enteredPin += input;
     Serial.print("*");
   }

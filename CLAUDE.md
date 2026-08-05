@@ -50,7 +50,13 @@ coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4") }`. זה
 **הרצה על מכשיר פיזי אמיתי (לא רק build — קישוריות בזמן ריצה):**
 כתובת ה-backend כבר לא הארד-קודד — `BackendConfig` (`app/lib/services/
 backend_config.dart`) שומר אותה ב-SharedPreferences, נטען לפני `runApp`
-ב-`main.dart`, ונערך במסך Settings ("Backend connection"). ברירת המחדל
+ב-`main.dart`, ונערך במסך Settings ("Backend connection"). הכתובת עוברת
+`BackendConfig.normalize` בשמירה ובטעינה — משלים `http://` חסר ומוריד `/`
+מסיים. שתי הטעויות האלה היו שקטות לגמרי קודם: הכתובת משמשת רק לשרשור
+מחרוזות (`'$baseUrl/login'`) ול-`replaceFirst('http','ws')`, אף אחד מהם
+לא מוודא כלום, אז `http://host:8000/` יצר `//login` (404 מ-FastAPI) ו-
+`100.64.0.1:8000` בלי סכימה יצר URI בלי host — ובאפליקציה שתיהן נראות
+בדיוק כמו "הבקנד לא זמין". ברירת המחדל
 עדיין `http://localhost:8000`, וכל שינוי דורש **restart של האפליקציה**
 (ה-`baseUrl` על `HttpBackendService` הוא `final` — אין live-reconnect
 בכוונה, ראה את הקומנט ב-`_saveBackendUrl`). `localhost` עובד
@@ -181,6 +187,19 @@ retransmitter דק שמשקף את מה ש-`login()` מחזיר, לא סופר �
 (broadcast streams לא משדרים מחדש לאירועים שכבר קרו). זה גרם לבאג ש"דברים
 מופיעים רק אחרי דריכה ראשונה" — אם משהו דומה קורה שוב, תבדוק קודם `lazy`.
 
+**מלכודת סדר ה-streams:** `HttpBackendService._handleMessage` מפרק הודעת
+`FullState` אחת לשבעה streams נפרדים, ו-`alarm_state` **חייב לצאת אחרון**.
+אלה broadcast controllers אסינכרוניים, אז המאזינים רצים בסדר שבו האירועים
+נדחפו — וה-listener של `alarmStateStream` ב-`AlarmService` קורא את
+`_events` שלו עצמו כדי לנסח את ההתראה. כשה-state יצא ראשון, ה-listener רץ
+בזמן ש-`_events` עוד החזיק את הסנאפשוט הקודם, ולכן התראת פריצה נשאה את
+כותרת האירוע *שלפניה* (למשל "System armed (Away)") במקום את האזעקה עצמה.
+`MockBackendService` תמיד פלט בסדר הנכון — ולכן ה-widget tests לא תפסו את
+זה. אם מוסיפים שדה חדש להודעה, להוסיף אותו לפני ה-`alarm_state`.
+`_handleMessage` גם עטוף ב-try/catch: `enum.values.byName` זורק על ערך
+שה-build הזה לא מכיר (למשל `SensorType` חדש שנוסף בבקנד), וזריקה מתוך
+stream callback היא uncaught async error, לא משהו שמישהו יכול לתפוס.
+
 **התראות:** יש התראות מקומיות (`flutter_local_notifications`) שיורות
 כשהאזעקה מופעלת. **זו לא push אמיתי** — עובד רק כשהאפליקציה חיה
 (foreground/background), לא כשהיא סגורה לגמרי. Push אמיתי (Firebase Cloud
@@ -194,7 +213,7 @@ firebase_messaging בלי לוודא שהקובץ קיים.
 FastAPI, בנוי ונבדק end-to-end (ראה `python/README.md` לפירוט מלא, ו-
 `python/simulate.py` — סקריפט סימולציה חי, לא unit tests עם mocking, שרץ
 נגד שרת אמיתי ובודק כל endpoint כולל lockout מלא עם המתנה אמיתית של 30
-שניות. 51/51 עברו, גם אחרי restart של הבקנד לוודא שזה לא בודק bytecode
+שניות. 65/65 עברו, גם אחרי restart של הבקנד לוודא שזה לא בודק bytecode
 ישן): login+lockout, arm/disarm עם עיכוב יציאה, alerts לפי חיישן ספציפי,
 faces CRUD, WebSocket `/ws` ששולח את כל ה-state בזמן אמת, וזיהוי פנים
 עובד (OpenCV — Haar cascade + LBPH, **לא** dlib/`face_recognition`
@@ -203,11 +222,27 @@ faces CRUD, WebSocket `/ws` ששולח את כל ה-state בזמן אמת, וז�
 `app/lib/services/backend_service.dart` — אם משנים שדה בצד אחד, לשנות
 גם בשני.
 
-**פערים ידועים, לא תוקנו בכוונה** (נמצאו תוך כדי pass תיעוד מקיף, ראה
-`python/README.md` לפירוט): `/arm`/`/disarm` מעדכנים state מקומי ומפקדים
-על החומרה לא-אטומית; `report_state_from_esp32` לא יכול להחיל מחדש את ה-
-bypass של Home mode כי הוא לא מקבל את ה-mode; הודעת הלוג של
-`set_night_mode` מתארת auto-arm שלא ממומש בפועל.
+**פער ידוע שנשאר:** `/arm`/`/disarm` מעדכנים state מקומי ומפקדים על
+החומרה לא-אטומית — אם הקריאה ללוח נכשלת, ה-state המקומי ממשיך בכל זאת דרך
+טיימר עיכוב-היציאה שלו. הדיווחים של הלוח (`/esp32/state-change`) הם מה
+שמיישב את זה בסוף. סגירה אמיתית דורשת handshake דו-שלבי מול חומרה שעדיין
+לא מחווטת, אז זה נשאר מתועד ולא חצי-בנוי.
+
+**שני פערים שהיו כאן ותוקנו** (שניהם עם regression test ב-`simulate.py`
+שנכשל על הקוד הקודם — אומת):
+- `report_state_from_esp32` לא ידע את ה-mode, אז כשלוח הדלת סיים את
+  ספירת היציאה שלו *לפני* הטיימר של הבקנד ודיווח `armed`, מצב Home נדרך
+  עם חיישן הרעידות פעיל. עכשיו `AppState` זוכר את ה-mode של ה-`/arm`
+  האחרון (`_arm_mode`) ומחשב את ה-bypass מחדש ממנו, עם reset ל-`away`
+  בכל disarm — כך שדריכה ישירות מהקודן הפיזי (שאת ה-mode שלה אף פעם לא
+  נדע) לא עוקפת שום חיישן. זה הכיוון הבטוח: אזעקת שווא ולא פספוס.
+- מונה הניסיונות הכושלים לא התאפס כשה-lockout פג, אז הסיסמה השגויה
+  הראשונה *אחרי* הצינון נעלה מיד מחדש, ו-`attempts_remaining` החזיר 0
+  למשתמש שבכלל לא היה נעול.
+
+**מלכודת בבדיקה:** בדיקת lockout שמשתמשת בסיסמה *נכונה* אחרי שהצינון פג
+לא תתפוס את הבאג הזה — התחברות מוצלחת מאפסת את המונה בכל מקרה. צריך
+סיסמה שגויה.
 
 הרצה: `python\venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 מתוך `python/`.

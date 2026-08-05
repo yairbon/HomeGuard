@@ -11,6 +11,7 @@ accurate enough for a small household's approved-faces list.
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 
 import cv2
@@ -92,12 +93,18 @@ class FaceRecognitionService:
         """Deletes all training photos for `face_id` from disk and
         retrains so the recognizer immediately forgets that person. A
         no-op (still retrains) if the folder doesn't exist.
+
+        Uses rmtree rather than unlinking `*.png` and calling rmdir: rmdir
+        raises on a non-empty directory, so a single stray file the glob
+        didn't match (a `.DS_Store`/`Thumbs.db` from a synced folder, a
+        half-written upload) would make this raise. main.py calls this
+        *before* `state.remove_face`, so that raise would leave the photos
+        deleted but the face still listed in the app — the worst of both
+        outcomes for a delete that's supposed to forget someone entirely.
         """
         person_dir = self.faces_dir / face_id
         if person_dir.exists():
-            for f in person_dir.glob("*.png"):
-                f.unlink()
-            person_dir.rmdir()
+            shutil.rmtree(person_dir, ignore_errors=True)
         self.retrain()
 
     def retrain(self) -> None:

@@ -37,23 +37,47 @@ int consecutiveBreaches = 0;          // המונה הנוכחי
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 10000;
 
-// אתחול: הגדרת מצב הפינים, התחברות לרשת ה-WiFi (חוסם עד שההתחברות
-// מצליחה) והדפסת ה-IP שהלוח קיבל ל-Serial (שימושי לאבחון/זיהוי הלוח ברשת).
+// --- Cooldown אחרי דיווח: מונע הצפה של השרת אם החדירה נמשכת. מנוהל
+// עם millis() ולא עם delay() — ראה את ההסבר ב-loop().
+unsigned long lastReportTime = 0;
+bool hasReportedOnce = false;
+const unsigned long REPORT_COOLDOWN = 5000;
+
+// כמה זמן מחכים ל-WiFi באתחול לפני שממשיכים בכל זאת.
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
+
+// התחברות ל-WiFi עם המתנה חסומה בזמן, במקום לולאה אינסופית. אם הראוטר
+// לא זמין ברגע האתחול (למשל הפסקת חשמל שבה הלוח עולה לפני הראוטר),
+// הלולאה המקורית פשוט לא הייתה מסתיימת — הלוח לעולם לא היה מגיע ל-loop()
+// ולכן גם לא היה דוגם את החיישן בכלל. עדיף שימשיך לדגום ויתחבר ברקע:
+// setAutoReconnect גורם לליבת ה-ESP32 להמשיך לנסות לבד, וכל פונקציית
+// שליחה כאן כבר בודקת WiFi.status() לפני שהיא מנסה לדווח.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("My IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi unavailable — ממשיך לדגום, מנסה להתחבר ברקע.");
+  }
+}
+
+// אתחול: הגדרת מצב הפינים והתחברות לרשת ה-WiFi (ראה connectWiFi).
 void setup() {
   Serial.begin(115200);
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
 
-  // התחברות ל-WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected!");
-  Serial.print("My IP: ");
-  Serial.println(WiFi.localIP());
+  connectWiFi();
 }
 
 // פונקציה שמבצעת את המדידה ומחזירה מרחק בס"מ.
@@ -129,11 +153,17 @@ void loop() {
 
       // אם הגענו לרצף הנדרש - זו חדירה אמיתית ולא רעש אקראי
       if (consecutiveBreaches >= REQUIRED_BREACHES) {
-        Serial.println("ALARM! Confirmed intrusion.");
-        sendAlert();
-
+        // ה-cooldown מנוהל ב-millis() ולא ב-delay(5000) כמו קודם. עם
+        // delay חוסם, הלוח היה עיוור לחלוטין למשך 5 שניות אחרי כל דיווח —
+        // גם לדגימת החיישן וגם ל-heartbeat — כלומר בדיוק בחלון שבו פורץ
+        // ממשיך להיכנס. זה גם היה חריג לעומת לוח הרעידות, שכבר עבד ככה.
+        if (!hasReportedOnce || millis() - lastReportTime >= REPORT_COOLDOWN) {
+          Serial.println("ALARM! Confirmed intrusion.");
+          sendAlert();
+          lastReportTime = millis();
+          hasReportedOnce = true;
+        }
         consecutiveBreaches = 0; // איפוס המונה
-        delay(5000); // Cooldown - השהייה כדי לא להפציץ את השרת בהתראות חוזרות
       }
     } else {
       // הטווח חזר להיות תקין - מאפסים את מונה רצף החריגות

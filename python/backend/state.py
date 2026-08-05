@@ -67,6 +67,16 @@ class AppState:
         self._failed_attempts = 0
         self._locked_until: datetime | None = None
         self._arming_task: asyncio.Task | None = None
+        # Which mode the system was last asked to arm in. Needed because
+        # the door controller reports only armed/disarmed, never the mode
+        # (see report_state_from_esp32) — without remembering it here,
+        # Home mode's vibration bypass would silently not be applied
+        # whenever the controller's report, rather than our own
+        # _finish_arming, is what puts the system into `armed`. Reset to
+        # `away` on disarm so a subsequent arm straight from the physical
+        # keypad (which we never see a mode for) bypasses nothing, which
+        # is the fail-safe direction.
+        self._arm_mode = ArmMode.away
 
         self._sockets: set[WebSocket] = set()
 
@@ -158,6 +168,22 @@ class AppState:
         triggers. Clamped at 0 (never negative) for display purposes."""
         return max(0, MAX_LOGIN_ATTEMPTS - self._failed_attempts)
 
+    def _clear_expired_lockout(self) -> None:
+        """Drops a lockout whose window has already elapsed, along with
+        the failed-attempt counter that caused it.
+
+        Without this the counter stays pinned at MAX_LOGIN_ATTEMPTS after
+        a lockout expires, so the very next wrong password would re-lock
+        immediately instead of starting a fresh 3-attempt budget, and
+        `attempts_remaining` would keep reporting 0 to the app while the
+        user isn't actually locked out. Only `login` calls this: it's the
+        single place that reads either field, and main.py builds its
+        LoginResponse from them right after awaiting it.
+        """
+        if self._locked_until is not None and datetime.now() >= self._locked_until:
+            self._locked_until = None
+            self._failed_attempts = 0
+
     async def login(self, password: str) -> bool:
         """Attempts a login. Returns whether it succeeded. On success,
         resets the failed-attempt counter and logs it. On failure,
@@ -168,6 +194,10 @@ class AppState:
         """
         if self.is_locked_out:
             return False
+        # Not locked out — but a *previous* lockout may have just run out,
+        # in which case its counter needs clearing before we judge this
+        # attempt against it.
+        self._clear_expired_lockout()
 
         ok = password == self._password
         if ok:
@@ -216,6 +246,9 @@ class AppState:
             f"Arming ({'Away' if mode == ArmMode.away else 'Home'}) — exit now",
             EventCategory.armDisarm,
         )
+        # Remembered so report_state_from_esp32 can apply the right sensor
+        # bypass if the controller's report beats _finish_arming to it.
+        self._arm_mode = mode
         self.alarm_state = AlarmState.transitional
         await self._broadcast()
 
@@ -267,6 +300,11 @@ class AppState:
         if self._arming_task:
             self._arming_task.cancel()
             self._arming_task = None
+        # Back to the fail-safe default: if the next arm comes from the
+        # physical keypad we never learn its mode, and "bypass nothing" is
+        # the direction that can only cause a false alarm, never a missed
+        # one. An app-initiated arm overwrites this in `arm()` anyway.
+        self._arm_mode = ArmMode.away
         self.sensors = [
             SensorReading(type=s.type, label=s.label, ok=True) for s in self.sensors
         ]
@@ -303,16 +341,26 @@ class AppState:
             return
 
         self.alarm_state = new_state
-        # NOTE: unlike `_finish_arming`, this method has no idea which
-        # ArmMode was requested (the controller only reports armed/
-        # disarmed, not the mode), so it can't (re)compute which sensors
-        # should be bypassed. It just carries forward whatever `bypassed`
-        # each sensor already had (and clears it on disarm). If the
-        # controller's report is what actually puts the system into
-        # `armed` — rather than our own `_finish_arming` having already
-        # run — Home mode's vibration bypass may not get applied here.
+        # The controller reports armed/disarmed but never *which mode*, so
+        # the bypass set is recomputed from `_arm_mode` — the mode the last
+        # /arm asked for — using the same rule as `_finish_arming`. This is
+        # what makes Home mode hold when the controller's report, rather
+        # than our own exit-delay task, is what completes the arm (it wins
+        # that race whenever its countdown finishes first, and it's the
+        # only path at all when someone arms at the physical keypad).
+        # `disarm()` resets `_arm_mode` to `away`, so a keypad-initiated
+        # arm we were never told the mode for bypasses nothing.
         self.sensors = [
-            SensorReading(type=s.type, label=s.label, ok=True, bypassed=s.bypassed if armed else False)
+            SensorReading(
+                type=s.type,
+                label=s.label,
+                ok=True,
+                bypassed=(
+                    armed
+                    and self._arm_mode == ArmMode.home
+                    and s.type == SensorType.vibration
+                ),
+            )
             for s in self.sensors
         ]
         self._log(
@@ -404,33 +452,41 @@ class AppState:
     # ---- Settings ---------------------------------------------------------------
 
     async def set_night_mode(self, enabled: bool) -> None:
-        """Toggles night mode and logs it. NOTE: the log message claims
-        night mode "auto-arms overnight", but no scheduling/auto-arm
-        logic actually exists anywhere in this backend — this flag is
-        currently just stored and surfaced to the app; the described
-        behavior isn't implemented yet.
+        """Toggles night mode and logs it.
+
+        The log message deliberately says only that the flag was turned
+        on, not that anything auto-arms: no scheduling/auto-arm logic
+        exists anywhere in this backend. The flag is stored and surfaced
+        to the app, nothing more. (It used to claim "auto-arms overnight",
+        which described behavior that was never implemented — a log line
+        in a security system's audit trail shouldn't assert a protection
+        the system doesn't actually provide.)
         """
         self.night_mode = enabled
         self._log(
-            "Night mode enabled — auto-arms overnight" if enabled else "Night mode disabled",
+            "Night mode enabled" if enabled else "Night mode disabled",
             EventCategory.info,
         )
         await self._broadcast()
 
     async def set_emergency_number(self, number: str) -> None:
         """Stores the number to call when police auto-dial (if/once
-        implemented) would trigger. Just a plain setting — no validation,
-        no log entry, no broadcast (the app already has the value it just
-        sent, so a round-trip push isn't needed).
+        implemented) would trigger. A plain setting — no validation and no
+        log entry, but it does broadcast: `emergency_number` is part of
+        FullState, so any *other* connected app instance would otherwise
+        keep showing the stale number until it reconnected.
         """
         self.emergency_number = number
+        await self._broadcast()
 
     async def set_police_call_delay(self, seconds: int) -> None:
         """Stores how long to wait after a triggered alarm before
         auto-calling `emergency_number`. Like set_emergency_number, this
-        is currently just stored — see that method's note.
+        is currently just stored — and broadcast, for the same
+        keep-other-clients-in-sync reason.
         """
         self.police_call_delay_seconds = seconds
+        await self._broadcast()
 
     # ---- ESP32 / camera connectivity (set by esp32_client / camera worker) ----
 

@@ -62,16 +62,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   /// Persists the backend-URL field to [BackendConfig] and flips on the
-  /// one-off "restart to apply" hint (see [_backendUrlSaved]). Doesn't
-  /// validate the URL's shape — an unreachable/malformed value just means
+  /// one-off "restart to apply" hint (see [_backendUrlSaved]).
+  ///
+  /// [BackendConfig.save] normalizes what was typed (adds a missing
+  /// scheme, drops a trailing slash — see [BackendConfig.normalize]) and
+  /// returns what it actually stored; that value is written back into the
+  /// field so the user sees the address the app will really use rather
+  /// than their raw input. Beyond that normalization there's no
+  /// reachability check: an unreachable-but-well-formed value just means
   /// [HttpBackendService] fails to connect after restart, surfaced the
-  /// same way any other backend-offline state is (see [_SectionCard]'s
-  /// sibling screens' connectivity indicators), which is simpler than
-  /// duplicating URL-validity rules the app doesn't otherwise need.
+  /// same way any other backend-offline state is.
   Future<void> _saveBackendUrl() async {
-    await BackendConfig.save(_backendUrlController.text);
+    final saved = await BackendConfig.save(_backendUrlController.text);
     if (!mounted) return;
-    setState(() => _backendUrlSaved = true);
+    setState(() {
+      _backendUrlController.text = saved;
+      _backendUrlSaved = true;
+    });
   }
 
   /// Fetches night mode, emergency number, and police-call delay from
@@ -130,6 +137,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     final backend = context.read<BackendService>();
     final ok = await backend.changePassword(_oldController.text, _newController.text);
+
+    // The request can outlive this screen — the user can tab away or log
+    // out while it's in flight — and setState on a disposed State throws.
+    // Every other awaiting method here already guards this way.
+    if (!mounted) return;
 
     setState(() {
       _isSubmitting = false;

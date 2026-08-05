@@ -99,6 +99,11 @@ class FacesScreen extends StatelessWidget {
       ),
     );
 
+    // The controller outlives the dialog's own widget tree (it's created
+    // here, not by the builder), so nothing else will dispose it — without
+    // this, every open of the dialog leaks one.
+    controller.dispose();
+
     // `name` is null if the dialog was cancelled (Navigator.pop() with no
     // value), and possibly an empty string if "Add" was tapped with a blank
     // field (the Add button pops unconditionally) — both cases are treated

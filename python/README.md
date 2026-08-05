@@ -26,14 +26,32 @@ Docs at `http://localhost:8000/docs` (FastAPI auto-generates this).
 it hits a real running server) covering every endpoint: auth + the full
 3-attempt lockout cycle, arm/disarm timing, the Home-mode sensor-bypass
 logic, all three sensor types' alerts, faces CRUD, face-ID/camera, all
-settings, and all three ESP32 endpoints. Run it against a live server:
+settings, all three ESP32 endpoints, and the `/ws` WebSocket (connect
+snapshot plus live pushes for settings changes, arming, alerts and
+disarm). Run it against a live server:
 
 ```powershell
 .\venv\Scripts\python.exe simulate.py
 ```
 
 Takes about a minute (it genuinely waits out the 30-second lockout rather
-than faking the clock). Last run: 51/51 passed.
+than faking the clock). Last run: 65/65 passed.
+
+Two of those sections are regression tests for bugs that were live in this
+backend, and both fail against the code as it was before:
+
+- **Lockout budget** — the failed-attempt counter stayed pinned at 3 once a
+  lockout was set, so the first wrong password *after* the cooldown
+  re-locked instantly and `attempts_remaining` reported 0 while the user
+  wasn't locked out at all. The check deliberately uses a wrong password: a
+  correct one resets the counter either way and hides it.
+- **Home bypass on the controller-reported path** — the door controller
+  runs its own exit-delay countdown and can report `armed` before the
+  backend's timer gets there, and that report carries no arm mode. Home
+  mode therefore armed with the vibration sensor still live. `AppState` now
+  remembers the mode the last `/arm` requested and recomputes the bypass
+  from it, resetting to `away` on disarm so an arm straight from the
+  physical keypad (whose mode we never learn) bypasses nothing.
 
 ## Status
 
@@ -62,17 +80,17 @@ commands — see its own WebServer routes); set
 network. Without it, `/arm`/`/disarm` still work for the app (state and
 timing are simulated here), they just don't reach real hardware.
 
-**Known, deliberately-not-fixed gaps** (found while documenting, left as
-comments in the code rather than silently patched):
-- `/arm` and `/disarm` update local state and command hardware
-  non-atomically — if the door-controller HTTP call fails, local state
-  still proceeds through its own exit-delay timer regardless. The
-  controller's own `/esp32/state-change` reports are what reconcile this.
-- `report_state_from_esp32` (used when the door controller reports its
-  state) can't reapply Home-mode's vibration-sensor bypass, since that
-  path doesn't carry the arm mode.
-- `set_night_mode`'s log message describes auto-arm-overnight behavior
-  that isn't actually implemented anywhere yet.
+**Known remaining gap:** `/arm` and `/disarm` update local state and
+command hardware non-atomically — if the door-controller HTTP call fails,
+local state still proceeds through its own exit-delay timer regardless.
+The controller's own `/esp32/state-change` reports are what reconcile
+this. Closing it properly means a two-phase handshake with hardware that
+isn't wired up yet, so it stays documented rather than half-built.
+
+`night_mode` is still only a stored flag: nothing auto-arms on a schedule.
+Its log line now says just "Night mode enabled" — it used to claim
+"auto-arms overnight", which asserted a protection the system doesn't
+provide, in the one place a user goes to check what the system did.
 
 ## Matching the Flutter side
 

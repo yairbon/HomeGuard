@@ -4,10 +4,14 @@ the actual server the Flutter app talks to, to prove every function
 works end-to-end, including the bypassed-sensor bug fix.
 """
 
+import json
 import time
+
 import httpx
+from websockets.sync.client import connect as ws_connect
 
 BASE = "http://localhost:8000"
+WS_BASE = "ws://localhost:8000"
 c = httpx.Client(base_url=BASE, timeout=10.0)
 
 passed = 0
@@ -71,6 +75,18 @@ r = c.post("/login", json={"password": "homeguard"})
 check("correct password still rejected while locked out", r.json()["ok"] is False)
 print(f"  (waiting {final['lockout_remaining_seconds']}s for lockout to clear...)")
 time.sleep(final["lockout_remaining_seconds"] + 1)
+
+# Regression: an expired lockout has to hand back a *fresh* attempt budget.
+# The failed-attempt counter used to stay pinned at MAX_LOGIN_ATTEMPTS once
+# the lockout was set, so the first wrong password after the cooldown
+# re-locked instantly and attempts_remaining reported 0 while the user
+# wasn't actually locked out. Checked with a WRONG password on purpose —
+# a correct one resets the counter either way and hides the bug.
+r = c.post("/login", json={"password": "still-wrong"})
+body = r.json()
+check("attempt budget resets after lockout expires", body["attempts_remaining"] == 2, body)
+check("one wrong password after lockout does not re-lock", body["locked_out"] is False, body)
+
 r = c.post("/login", json={"password": "homeguard"})
 check("login works again after lockout expires", r.json()["ok"] is True)
 
@@ -209,5 +225,87 @@ state = c.get("/state").json()
 check("esp32-reported arm reflected in state (no exit delay — controller already did its own)",
       state["alarm_state"] == "armed")
 c.post("/disarm")
+
+# ---- Home bypass when the CONTROLLER completes the arm ----------------------
+# The door controller runs its own exit-delay countdown and reports ARMED
+# when it finishes, which can beat the backend's own timer. That path only
+# ever learns "armed", never the mode — so it used to arm with whatever
+# bypass flags happened to be lying around, quietly leaving the vibration
+# sensor live in Home mode. state.py now recomputes the bypass from the
+# mode the last /arm requested.
+section("Home bypass survives a controller-reported arm")
+c.post("/disarm")
+c.post("/arm", json={"mode": "home"})
+c.post("/esp32/state-change", json={"armed": True})  # controller got there first
+state = c.get("/state").json()
+check("controller-reported arm lands in armed", state["alarm_state"] == "armed", state["alarm_state"])
+vib = next(s for s in state["sensors"] if s["type"] == "vibration")
+check("vibration still bypassed after controller-reported arm", vib["bypassed"] is True, vib)
+
+c.post("/trigger-alert", json={"source": "vibration", "reason": "vibration after controller arm"})
+state = c.get("/state").json()
+check(
+    "bypassed vibration still does not escalate on that path",
+    state["alarm_state"] == "armed",
+    f"expected still 'armed', got {state['alarm_state']}",
+)
+c.post("/disarm")
+
+# Fail-safe direction: an arm the app never requested (someone using the
+# physical keypad) carries no mode at all, so nothing may be bypassed.
+c.post("/esp32/state-change", json={"armed": True})
+state = c.get("/state").json()
+check(
+    "keypad-only arm bypasses nothing",
+    all(not s["bypassed"] for s in state["sensors"]),
+    state["sensors"],
+)
+c.post("/disarm")
+
+# ---- WebSocket /ws ----------------------------------------------------------
+# The app's live channel: every screen after login reflects pushes from here
+# rather than polling /state, so a broken broadcast looks like a frozen UI
+# rather than an error. Nothing exercised it before this section.
+section("WebSocket /ws live push")
+with ws_connect(f"{WS_BASE}/ws", open_timeout=5) as ws:
+    snapshot = json.loads(ws.recv(timeout=5))
+    check("/ws sends a full snapshot on connect",
+          "alarm_state" in snapshot and len(snapshot["sensors"]) == 3, snapshot)
+
+    # These two settings updated state without broadcasting, so a second
+    # connected phone kept showing the stale value until it reconnected.
+    c.post("/settings/emergency-number", json={"number": "101"})
+    pushed = json.loads(ws.recv(timeout=5))
+    check("emergency-number change is pushed over /ws",
+          pushed["emergency_number"] == "101", pushed["emergency_number"])
+
+    c.post("/settings/police-call-delay", json={"seconds": 90})
+    pushed = json.loads(ws.recv(timeout=5))
+    check("police-call-delay change is pushed over /ws",
+          pushed["police_call_delay_seconds"] == 90, pushed["police_call_delay_seconds"])
+
+    c.post("/arm", json={"mode": "away"})
+    pushed = json.loads(ws.recv(timeout=5))
+    check("arm is pushed over /ws as transitional",
+          pushed["alarm_state"] == "transitional", pushed["alarm_state"])
+
+    # Arrives on its own once the exit delay elapses — no request in between.
+    pushed = json.loads(ws.recv(timeout=8))
+    check("armed transition is pushed over /ws after the exit delay",
+          pushed["alarm_state"] == "armed", pushed["alarm_state"])
+
+    c.post("/trigger-alert", json={"source": "door", "reason": "ws breach test"})
+    pushed = json.loads(ws.recv(timeout=5))
+    check("alert is pushed over /ws", pushed["alarm_state"] == "triggered", pushed["alarm_state"])
+    check("the alert event rides along in the same push",
+          pushed["events"][0]["category"] == "alert", pushed["events"][0])
+
+    c.post("/disarm")
+    pushed = json.loads(ws.recv(timeout=5))
+    check("disarm is pushed over /ws", pushed["alarm_state"] == "disarmed", pushed["alarm_state"])
+
+# Restore the defaults this section changed.
+c.post("/settings/emergency-number", json={"number": "100"})
+c.post("/settings/police-call-delay", json={"seconds": 60})
 
 print(f"\n{'='*50}\n{passed} passed, {failed} failed\n{'='*50}")

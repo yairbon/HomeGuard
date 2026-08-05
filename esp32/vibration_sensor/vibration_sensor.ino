@@ -36,29 +36,51 @@ int lastVibrationState = LOW;
 
 // --- Cooldown: אחרי דיווח, מתעלמים מרעידות נוספות לזמן מה כדי לא
 // להפציץ את השרת אם הרעידה נמשכת (למשל מכות חוזרות באותה פריצה).
+// hasReportedOnce נדרש כי millis() מתחיל מ-0: בלעדיו התנאי
+// millis() - lastReportTime >= REPORT_COOLDOWN הוא false בחמש השניות
+// הראשונות אחרי האתחול, כלומר רעידה בדיוק בחלון הזה נבלעה בשקט.
 unsigned long lastReportTime = 0;
+bool hasReportedOnce = false;
 const unsigned long REPORT_COOLDOWN = 5000;
 
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 10000;
 
-// אתחול: הגדרת פין החיישן כקלט, התחברות לרשת ה-WiFi (חוסם עד
-// שההתחברות מצליחה) והדפסת ה-IP שהלוח קיבל ל-Serial.
+// כמה זמן מחכים ל-WiFi באתחול לפני שממשיכים בכל זאת.
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
+
+// התחברות ל-WiFi עם המתנה חסומה בזמן, במקום לולאה אינסופית — אותו
+// שיקול בדיוק כמו בלוח האולטרה-סוני: אם הראוטר לא זמין באתחול, הלולאה
+// המקורית לא הייתה מסתיימת והלוח לא היה מגיע ל-loop() בכלל, כלומר לא
+// היה דוגם את חיישן הרעידות. setAutoReconnect ממשיך לנסות ברקע, וכל
+// פונקציית שליחה כאן כבר בודקת WiFi.status() לפני שהיא מדווחת.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("My IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi unavailable — ממשיך לדגום, מנסה להתחבר ברקע.");
+  }
+}
+
+// אתחול: הגדרת פין החיישן כקלט והתחברות לרשת ה-WiFi (ראה connectWiFi).
 void setup() {
   Serial.begin(115200);
   Serial.println();
 
   pinMode(vibrationPin, INPUT);
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.print("My IP: ");
-  Serial.println(WiFi.localIP());
+  connectWiFi();
 }
 
 // שולח דיווח פריצה לבקנד — אותו endpoint שהחיישן האולטרה-סוני
@@ -106,9 +128,10 @@ void loop() {
   if (currentVibrationState == HIGH && lastVibrationState == LOW) {
     Serial.println("Vibration Detected! (Force sensor triggered)");
 
-    if (millis() - lastReportTime >= REPORT_COOLDOWN) {
+    if (!hasReportedOnce || millis() - lastReportTime >= REPORT_COOLDOWN) {
       sendAlert();
       lastReportTime = millis();
+      hasReportedOnce = true;
     }
   }
 
