@@ -372,6 +372,93 @@ state = c.get("/state").json()
 check("police_call_delay_seconds persisted", state["police_call_delay_seconds"] == 45)
 c.post("/settings/police-call-delay", json={"seconds": 60})  # restore default
 
+# ---- Entry delay ---------------------------------------------------------------
+section("Entry delay")
+c.post("/disarm")
+c.post("/arm", json={"mode": "away"})
+time.sleep(3.5)
+r = device.post("/esp32/entry-delay", json={"seconds": 25})
+check("entry-delay report accepted", r.status_code == 200, r.status_code)
+state = c.get("/state").json()
+check("state becomes entryDelay", state["alarm_state"] == "entryDelay", state["alarm_state"])
+check(
+    "countdown is exposed to the app",
+    0 < state["entry_delay_seconds_remaining"] <= 25,
+    state["entry_delay_seconds_remaining"],
+)
+# The controller's door alert, arriving when its countdown expires, must be
+# able to escalate from entryDelay — not only from armed.
+c.post("/trigger-alert", json={"source": "door", "reason": "not disarmed in time"})
+state = c.get("/state").json()
+check("entry delay escalates to the alarm", state["alarm_state"] == "triggered")
+c.post("/disarm")
+state = c.get("/state").json()
+check("disarming clears the countdown", state["entry_delay_seconds_remaining"] == 0)
+
+# ---- Face disarm ---------------------------------------------------------------
+section("Face ID disarm (opt-in)")
+state = c.get("/state").json()
+check("face disarm is off by default", state["face_disarm_enabled"] is False)
+
+c.post("/arm", json={"mode": "away"})
+time.sleep(3.5)
+c.post("/debug/simulate-face-recognition")
+state = c.get("/state").json()
+check(
+    "a recognized face does NOT disarm while the setting is off",
+    state["alarm_state"] == "armed",
+    state["alarm_state"],
+)
+
+r = c.post("/face-disarm-enabled", json={"enabled": True})
+check("face disarm can be enabled", r.json()["ok"] is True)
+c.post("/debug/simulate-face-recognition")
+state = c.get("/state").json()
+check(
+    "a recognized face DOES disarm once enabled",
+    state["alarm_state"] == "disarmed",
+    state["alarm_state"],
+)
+check(
+    "the disarm is attributed in the log",
+    any("Disarmed by Face ID" in e["message"] for e in state["events"][:5]),
+    state["events"][:3],
+)
+c.post("/face-disarm-enabled", json={"enabled": False})
+
+# ---- Notifications / night mode --------------------------------------------------
+section("Notifications & night-mode schedule")
+r = c.post("/settings/ntfy", json={"server": "https://ntfy.example", "topic": "sim-topic"})
+check("ntfy settings accepted", r.json()["ok"] is True)
+state = c.get("/state").json()
+check("ntfy settings persisted", state["ntfy_topic"] == "sim-topic", state["ntfy_topic"])
+check(
+    "the topic is not leaked into the event log",
+    all("sim-topic" not in e["message"] for e in state["events"]),
+)
+r = c.post("/settings/ntfy/test")
+check("test notification reports configured", r.json()["ok"] is True)
+c.post("/settings/ntfy", json={"server": "https://ntfy.sh", "topic": ""})
+r = c.post("/settings/ntfy/test")
+check("test notification reports not-configured when off", r.json()["ok"] is False)
+
+r = c.post("/settings/night-mode-hours", json={"arm_hour": 1, "disarm_hour": 9})
+check("night-mode hours accepted", r.json()["ok"] is True)
+state = c.get("/state").json()
+check(
+    "night-mode hours persisted",
+    (state["night_mode_arm_hour"], state["night_mode_disarm_hour"]) == (1, 9),
+    (state["night_mode_arm_hour"], state["night_mode_disarm_hour"]),
+)
+c.post("/settings/night-mode-hours", json={"arm_hour": 99, "disarm_hour": -5})
+state = c.get("/state").json()
+check(
+    "out-of-range hours are clamped, not rejected",
+    (state["night_mode_arm_hour"], state["night_mode_disarm_hour"]) == (23, 0),
+    (state["night_mode_arm_hour"], state["night_mode_disarm_hour"]),
+)
+c.post("/settings/night-mode-hours", json={"arm_hour": 23, "disarm_hour": 7})
+
 # ---- ESP32 endpoints -----------------------------------------------------------
 section("ESP32 endpoints")
 r = device.post("/esp32/heartbeat", params={"board": "ultrasonic"})

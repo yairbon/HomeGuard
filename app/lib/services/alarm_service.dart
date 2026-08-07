@@ -30,6 +30,12 @@ class AlarmService extends ChangeNotifier {
   AlarmService(this._backend) {
     _stateSub = _backend.alarmStateStream.listen((state) {
       final justTriggered = state == AlarmState.triggered && _state != AlarmState.triggered;
+      // Entering the entry delay is its own notification-worthy moment: it
+      // means a door just opened on an armed system. Waiting for the alarm
+      // to actually fire would waste the whole countdown the user could
+      // have used to disarm.
+      final justEnteredEntryDelay =
+          state == AlarmState.entryDelay && _state != AlarmState.entryDelay;
       final enteredTransitional = state == AlarmState.transitional && _state != AlarmState.transitional;
       _state = state;
       if (enteredTransitional) {
@@ -42,6 +48,8 @@ class AlarmService extends ChangeNotifier {
         NotificationService.showAlert(
           _events.isNotEmpty ? _events.first.message : 'Intrusion detected',
         );
+      } else if (justEnteredEntryDelay) {
+        NotificationService.showAlert('Door opened — disarm the system');
       }
       notifyListeners();
     });
@@ -81,6 +89,18 @@ class AlarmService extends ChangeNotifier {
       _faceIdEnabled = enabled;
       notifyListeners();
     });
+    _faceDisarmSub = _backend.faceDisarmEnabledStream.listen((enabled) {
+      _faceDisarmEnabled = enabled;
+      notifyListeners();
+    });
+    // Unlike the exit-delay countdown, this is not ticked locally: the door
+    // controller owns the real timer and the backend re-broadcasts what's
+    // left, so the number shown always comes from the authority rather than
+    // a second clock that could drift away from it.
+    _entryDelaySub = _backend.entryDelayStream.listen((seconds) {
+      _entryDelaySecondsRemaining = seconds;
+      notifyListeners();
+    });
   }
 
   /// Mirrors `ARMING_EXIT_DELAY` in python/backend/state.py — the backend
@@ -103,6 +123,8 @@ class AlarmService extends ChangeNotifier {
   late final StreamSubscription<List<ApprovedFace>> _facesSub;
   late final StreamSubscription<bool> _cameraOnlineSub;
   late final StreamSubscription<bool> _faceIdSub;
+  late final StreamSubscription<bool> _faceDisarmSub;
+  late final StreamSubscription<int> _entryDelaySub;
 
   AlarmState _state = AlarmState.disarmed;
   List<SecurityEvent> _events = const [];
@@ -113,6 +135,8 @@ class AlarmService extends ChangeNotifier {
   List<ApprovedFace> _faces = const [];
   bool _isCameraOnline = true;
   bool _faceIdEnabled = true;
+  bool _faceDisarmEnabled = false;
+  int _entryDelaySecondsRemaining = 0;
   int _armingSecondsRemaining = 0;
   Timer? _armingTimer;
 
@@ -139,6 +163,14 @@ class AlarmService extends ChangeNotifier {
   List<ApprovedFace> get faces => _faces;
   bool get isCameraOnline => _isCameraOnline;
   bool get faceIdEnabled => _faceIdEnabled;
+
+  /// Whether a recognized face may disarm the system (opt-in — see
+  /// [BackendService.faceDisarmEnabledStream]).
+  bool get faceDisarmEnabled => _faceDisarmEnabled;
+
+  /// Seconds left to disarm during [AlarmState.entryDelay], straight from
+  /// the backend rather than a local ticker.
+  int get entryDelaySecondsRemaining => _entryDelaySecondsRemaining;
   /// Just the subset of [events] relevant to the Camera/face-ID tab,
   /// filtered by category rather than tracked as a separate list.
   List<SecurityEvent> get faceIdEvents =>
@@ -153,6 +185,7 @@ class AlarmService extends ChangeNotifier {
   Future<void> addFace(String name) => _backend.addFace(name);
   Future<void> removeFace(String id) => _backend.removeFace(id);
   Future<void> setFaceIdEnabled(bool enabled) => _backend.setFaceIdEnabled(enabled);
+  Future<void> setFaceDisarmEnabled(bool enabled) => _backend.setFaceDisarmEnabled(enabled);
 
   /// Demo-only: picks one of the currently-monitored (non-bypassed)
   /// sensors and triggers it, so the alert flow can be seen without real
@@ -209,6 +242,8 @@ class AlarmService extends ChangeNotifier {
     _facesSub.cancel();
     _cameraOnlineSub.cancel();
     _faceIdSub.cancel();
+    _faceDisarmSub.cancel();
+    _entryDelaySub.cancel();
     _armingTimer?.cancel();
     super.dispose();
   }

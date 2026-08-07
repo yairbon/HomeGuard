@@ -1,7 +1,15 @@
-/// The states the ESP32's central state machine can report. `transitional`
-/// is app-side only (exit delay while arming) — the real hardware only
-/// needs to report disarmed/armed/triggered.
-enum AlarmState { disarmed, transitional, armed, triggered }
+/// The states the alarm can be in. Mirrors `AlarmState` in
+/// python/backend/models.py.
+///
+/// `transitional` is the exit delay: the system is arming and you're walking
+/// out. `entryDelay` is its mirror image — someone opened the door on an
+/// armed system and has a limited time to disarm before the alarm sounds.
+///
+/// The door controller has always run that entry window (its own
+/// `ENTRY_DELAY` state), but it used to report only the outcome, so the app
+/// jumped straight from ARMED to TRIGGERED and never showed the countdown the
+/// person walking in is actually racing.
+enum AlarmState { disarmed, transitional, armed, entryDelay, triggered }
 
 /// Away arms every sensor. Home arms the perimeter (ultrasonic + door) but
 /// bypasses the vibration sensor, so people can move around inside.
@@ -115,6 +123,23 @@ class LoginResult {
   });
 }
 
+/// Push-notification target: an ntfy server and topic.
+///
+/// On the public ntfy.sh the topic name is the only thing keeping strangers
+/// from reading this house's alarm notifications, so it should be long and
+/// random, or the server should be self-hosted. The settings screen says so
+/// next to the field.
+class NtfyConfig {
+  final String server;
+  final String topic;
+
+  const NtfyConfig({required this.server, required this.topic});
+
+  /// Whether push notifications are actually on. Pushing is opt-in: no topic
+  /// means the backend never sends anything.
+  bool get enabled => topic.isNotEmpty;
+}
+
 /// Everything the app needs from the backend. HttpBackendService talks to
 /// the real FastAPI backend (python/); MockBackendService simulates one
 /// in-memory for UI work without needing it running.
@@ -207,6 +232,21 @@ abstract class BackendService {
   /// Turns face-ID recognition on/off.
   Future<void> setFaceIdEnabled(bool enabled);
 
+  /// Emits whether a recognized face is allowed to disarm the system.
+  ///
+  /// Distinct from [faceIdEnabledStream]: that's whether recognition runs at
+  /// all, this is whether a match may turn the alarm off. Off by default —
+  /// the recognizer has no liveness detection, so a photo may pass, which
+  /// makes this a convenience feature rather than a security one.
+  Stream<bool> get faceDisarmEnabledStream;
+
+  /// Turns face-disarm on/off.
+  Future<void> setFaceDisarmEnabled(bool enabled);
+
+  /// Emits the seconds left to disarm during an [AlarmState.entryDelay],
+  /// and 0 at all other times.
+  Stream<int> get entryDelayStream;
+
   /// Demo-only: simulates the camera recognizing one of the approved
   /// faces, so the flow can be seen without a real camera/model.
   Future<void> simulateFaceRecognition();
@@ -230,6 +270,22 @@ abstract class BackendService {
 
   /// Sets the police-call delay, in [seconds].
   Future<void> setPoliceCallDelaySeconds(int seconds);
+
+  /// Where the backend pushes alerts so they arrive with this app closed —
+  /// the ntfy server URL and topic name (see `python/backend/notifier.py`).
+  ///
+  /// This exists because the app's own notifications only fire while its
+  /// process is alive: swipe it away and a break-in produces nothing. An
+  /// empty topic means pushing is off.
+  Future<NtfyConfig> getNtfyConfig();
+
+  /// Sets the push target. An empty [topic] disables pushing.
+  Future<void> setNtfyConfig(String server, String topic);
+
+  /// Sends a test push so the user can confirm the topic works before
+  /// relying on it. Returns false if no topic is configured; delivery
+  /// itself isn't confirmed.
+  Future<bool> sendTestNotification();
 
   /// Releases any resources (stream controllers, sockets, timers) held by
   /// the implementation. Must be called when the service is no longer

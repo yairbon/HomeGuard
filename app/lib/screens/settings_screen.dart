@@ -30,6 +30,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _confirmController = TextEditingController();
   final _emergencyController = TextEditingController();
   final _backendUrlController = TextEditingController();
+  final _ntfyServerController = TextEditingController();
+  final _ntfyTopicController = TextEditingController();
+
+  bool _isSavingNtfy = false;
+  String? _ntfyMessage;
 
   bool _isSubmitting = false;
   String? _error;
@@ -74,6 +79,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _backendUrlSaved = true);
   }
 
+  /// Persists the ntfy server/topic to the backend.
+  ///
+  /// Unlike the night-mode switch, this isn't optimistic: the value only
+  /// matters if the backend actually stored it, and silently appearing to
+  /// have enabled alerts that were never saved would be worse than a
+  /// moment's latency.
+  Future<void> _saveNtfy() async {
+    setState(() {
+      _isSavingNtfy = true;
+      _ntfyMessage = null;
+    });
+    await context.read<BackendService>().setNtfyConfig(
+          _ntfyServerController.text.trim(),
+          _ntfyTopicController.text.trim(),
+        );
+    if (!mounted) return;
+    setState(() {
+      _isSavingNtfy = false;
+      _ntfyMessage = _ntfyTopicController.text.trim().isEmpty
+          ? 'Push notifications disabled'
+          : 'Saved';
+    });
+  }
+
+  /// Saves first, then asks the backend to push a test notification —
+  /// saving first so the button tests what's on screen rather than whatever
+  /// was stored on a previous visit.
+  Future<void> _testNtfy() async {
+    await _saveNtfy();
+    if (!mounted) return;
+    setState(() => _isSavingNtfy = true);
+    final sent = await context.read<BackendService>().sendTestNotification();
+    if (!mounted) return;
+    setState(() {
+      _isSavingNtfy = false;
+      _ntfyMessage = sent
+          ? 'Test sent — check the ntfy app'
+          : 'Set a topic first';
+    });
+  }
+
   /// Fetches night mode, emergency number, and police-call delay from
   /// [BackendService] and populates the corresponding state.
   ///
@@ -89,12 +135,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       backend.getNightMode(),
       backend.getEmergencyNumber(),
       backend.getPoliceCallDelaySeconds(),
+      backend.getNtfyConfig(),
     ]);
     if (!mounted) return;
+    final ntfy = results[3] as NtfyConfig;
     setState(() {
       _nightMode = results[0] as bool;
       _emergencyController.text = results[1] as String;
       _policeCallDelay = (results[2] as int).toDouble();
+      _ntfyServerController.text = ntfy.server;
+      _ntfyTopicController.text = ntfy.topic;
       _settingsLoaded = true;
     });
   }
@@ -108,6 +158,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _confirmController.dispose();
     _emergencyController.dispose();
     _backendUrlController.dispose();
+    _ntfyServerController.dispose();
+    _ntfyTopicController.dispose();
     super.dispose();
   }
 
@@ -204,12 +256,96 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           children: [
                             const HomeGuardIcon(HGIcon.emergency, color: AppColors.system, size: 20),
                             const SizedBox(width: 10),
-                            const Text('Emergency contact', style: TextStyle(color: AppColors.textPrimary)),
+                            const Text(
+                              'Push notifications',
+                              style: TextStyle(color: AppColors.textPrimary),
+                            ),
                           ],
                         ),
                         const SizedBox(height: 6),
                         Text(
-                          "Auto-called if an alarm isn't cleared in time",
+                          'Alerts reach your phone even when HomeGuard is closed. '
+                          'Install the ntfy app and subscribe to the same topic.',
+                          style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                        ),
+                        const SizedBox(height: 14),
+                        TextField(
+                          controller: _ntfyServerController,
+                          keyboardType: TextInputType.url,
+                          autocorrect: false,
+                          style: const TextStyle(color: AppColors.textPrimary),
+                          decoration: const InputDecoration(labelText: 'ntfy server'),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _ntfyTopicController,
+                          autocorrect: false,
+                          style: const TextStyle(color: AppColors.textPrimary),
+                          decoration: const InputDecoration(
+                            labelText: 'Topic (leave empty to disable)',
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        // Not a footnote: on the public ntfy.sh the topic name
+                        // is the only thing stopping a stranger from reading
+                        // this house's alarm notifications.
+                        Text(
+                          'Anyone who knows the topic name can read your alerts. '
+                          'Use a long random name, or self-host.',
+                          style: TextStyle(color: AppColors.transitional, fontSize: 11),
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton(
+                                onPressed: _isSavingNtfy ? null : _saveNtfy,
+                                child: const Text('SAVE'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: OutlinedButton(
+                                // Sending a test before relying on this is the
+                                // difference between "configured" and "works".
+                                onPressed: _isSavingNtfy ? null : _testNtfy,
+                                child: const Text('SEND TEST'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (_ntfyMessage != null) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            _ntfyMessage!,
+                            style: TextStyle(color: AppColors.safe, fontSize: 12),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  _SectionCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const HomeGuardIcon(HGIcon.emergency, color: AppColors.system, size: 20),
+                            const SizedBox(width: 10),
+                            const Text('Emergency contact', style: TextStyle(color: AppColors.textPrimary)),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        // Reworded to match what actually happens. This used
+                        // to say the number would be "auto-called", which no
+                        // code anywhere did — placing a real call needs a
+                        // telephony provider. What the system does do is push
+                        // a second, urgent notification naming this contact
+                        // if nobody clears the alarm in time.
+                        Text(
+                          "If an alarm isn't cleared in time, an urgent notification "
+                          'tells you to call this number.',
                           style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                         ),
                         const SizedBox(height: 14),
@@ -234,7 +370,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                         const SizedBox(height: 18),
                         Text(
-                          'Response window before calling: ${_policeCallDelay.round()}s',
+                          'Escalate if not cleared within: ${_policeCallDelay.round()}s',
                           style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                         ),
                         Slider(

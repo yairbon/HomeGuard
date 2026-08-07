@@ -81,6 +81,8 @@ class HttpBackendService implements BackendService {
   final _facesController = StreamController<List<ApprovedFace>>.broadcast();
   final _cameraOnlineController = StreamController<bool>.broadcast();
   final _faceIdEnabledController = StreamController<bool>.broadcast();
+  final _faceDisarmEnabledController = StreamController<bool>.broadcast();
+  final _entryDelayController = StreamController<int>.broadcast();
   final _errorController = StreamController<String>.broadcast();
 
   WebSocketChannel? _channel;
@@ -104,6 +106,10 @@ class HttpBackendService implements BackendService {
   Stream<bool> get cameraOnlineStream => _cameraOnlineController.stream;
   @override
   Stream<bool> get faceIdEnabledStream => _faceIdEnabledController.stream;
+  @override
+  Stream<bool> get faceDisarmEnabledStream => _faceDisarmEnabledController.stream;
+  @override
+  Stream<int> get entryDelayStream => _entryDelayController.stream;
   @override
   Stream<String> get errorStream => _errorController.stream;
 
@@ -207,6 +213,10 @@ class HttpBackendService implements BackendService {
     _connectivityController.add(json['esp32_online'] as bool);
     _cameraOnlineController.add(json['camera_online'] as bool);
     _faceIdEnabledController.add(json['face_id_enabled'] as bool);
+    // Tolerated as absent so this build still works against a backend that
+    // predates face-disarm / the entry-delay countdown.
+    _faceDisarmEnabledController.add(json['face_disarm_enabled'] as bool? ?? false);
+    _entryDelayController.add(json['entry_delay_seconds_remaining'] as int? ?? 0);
   }
 
   /// Decodes one entry of the WebSocket message's `sensors` array into a
@@ -418,6 +428,12 @@ class HttpBackendService implements BackendService {
     _report(await _post('/face-id-enabled', {'enabled': enabled}), 'the Face ID toggle');
   }
 
+  @override
+  Future<void> setFaceDisarmEnabled(bool enabled) async {
+    _report(await _post('/face-disarm-enabled', {'enabled': enabled}),
+        'the Face ID disarm toggle');
+  }
+
   /// Asks the backend's debug endpoint to simulate a face-recognition
   /// event (see [BackendService.simulateFaceRecognition]).
   @override
@@ -458,6 +474,27 @@ class HttpBackendService implements BackendService {
         'the response-delay change');
   }
 
+  @override
+  Future<NtfyConfig> getNtfyConfig() async {
+    final body = (await _get('/state')).body;
+    return NtfyConfig(
+      server: body['ntfy_server'] as String? ?? 'https://ntfy.sh',
+      topic: body['ntfy_topic'] as String? ?? '',
+    );
+  }
+
+  @override
+  Future<void> setNtfyConfig(String server, String topic) async {
+    _report(await _post('/settings/ntfy', {'server': server, 'topic': topic}),
+        'the notification settings');
+  }
+
+  @override
+  Future<bool> sendTestNotification() async {
+    final res = _report(await _post('/settings/ntfy/test'), 'the test notification');
+    return res.body['ok'] as bool? ?? false;
+  }
+
   /// Tears down the WebSocket connection and closes every stream
   /// controller. Sets [_disposed] first, before cancelling anything —
   /// [_connect]/[_scheduleReconnect] both check that flag, so this
@@ -476,6 +513,8 @@ class HttpBackendService implements BackendService {
     _facesController.close();
     _cameraOnlineController.close();
     _faceIdEnabledController.close();
+    _faceDisarmEnabledController.close();
+    _entryDelayController.close();
     _errorController.close();
   }
 }

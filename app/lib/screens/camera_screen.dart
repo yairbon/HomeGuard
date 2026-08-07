@@ -59,6 +59,11 @@ class CameraScreen extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 16),
+          _FaceDisarmToggle(
+            enabled: alarm.faceDisarmEnabled,
+            onChanged: (value) => context.read<AlarmService>().setFaceDisarmEnabled(value),
+          ),
           const SizedBox(height: 24),
           Text(
             'RECENT IDENTIFICATIONS',
@@ -88,6 +93,56 @@ class CameraScreen extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Opt-in switch for letting a recognized face disarm the system.
+///
+/// Given a full card with an explicit warning rather than a plain row,
+/// because this is the one setting in the app that *lowers* what it takes to
+/// turn the alarm off. The recognizer compares face embeddings and has no
+/// liveness detection, so a printed photo or a picture on a phone screen may
+/// pass — that makes this convenience, not security, and the UI has to say
+/// so rather than let someone enable it assuming otherwise.
+class _FaceDisarmToggle extends StatelessWidget {
+  const _FaceDisarmToggle({required this.enabled, required this.onChanged});
+
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.surfaceRaised,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 6, 14, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: enabled,
+              activeThumbColor: AppColors.system,
+              onChanged: onChanged,
+              title: const Text(
+                'Disarm with Face ID',
+                style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
+              ),
+              subtitle: Text(
+                'A recognized face turns the alarm off',
+                style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+              ),
+            ),
+            Text(
+              'No liveness check — a photo of an approved face may be enough. '
+              'Treat this as convenience, not security.',
+              style: TextStyle(color: AppColors.transitional, fontSize: 11),
+            ),
+          ],
+        ),
       ),
     );
   }

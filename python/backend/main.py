@@ -30,7 +30,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import esp32_client
+from . import esp32_client, notifier
 from .face_recognition_service import FaceRecognitionService
 from .models import (
     AddFaceRequest,
@@ -43,8 +43,12 @@ from .models import (
     LoginResponse,
     SensorType,
     SetEmergencyNumberRequest,
+    SetEntryDelayRequest,
+    SetFaceDisarmEnabledRequest,
     SetFaceIdEnabledRequest,
+    SetNightModeHoursRequest,
     SetNightModeRequest,
+    SetNtfyRequest,
     SetPoliceCallDelayRequest,
     TriggerAlertRequest,
 )
@@ -76,6 +80,7 @@ async def lifespan(app: FastAPI):
     state.start_monitor()
     yield
     await state.stop_monitor()
+    await notifier.aclose()
 
 
 app = FastAPI(title="HomeGuard Backend", lifespan=lifespan)
@@ -340,6 +345,19 @@ async def set_face_id_enabled(body: SetFaceIdEnabledRequest):
     return {"ok": True}
 
 
+@app.post("/face-disarm-enabled", dependencies=[Depends(require_app)])
+async def set_face_disarm_enabled(body: SetFaceDisarmEnabledRequest):
+    """Toggles whether a recognized face is allowed to disarm the system.
+
+    Distinct from /face-id-enabled: that one controls whether recognition
+    runs, this controls whether a match may turn the alarm off. Off by
+    default — see AppState.log_face_recognized for the liveness caveat that
+    makes this a convenience feature rather than a security one.
+    """
+    await state.set_face_disarm_enabled(body.enabled)
+    return {"ok": True}
+
+
 # ---- Settings -----------------------------------------------------------------
 
 
@@ -357,6 +375,30 @@ async def set_emergency_number(body: SetEmergencyNumberRequest):
     implemented yet, this just stores the setting)."""
     await state.set_emergency_number(body.number)
     return {"ok": True}
+
+
+@app.post("/settings/night-mode-hours", dependencies=[Depends(require_app)])
+async def set_night_mode_hours(body: SetNightModeHoursRequest):
+    """Sets when night mode arms and disarms (whole hours, 0-23)."""
+    await state.set_night_mode_hours(body.arm_hour, body.disarm_hour)
+    return {"ok": True}
+
+
+@app.post("/settings/ntfy", dependencies=[Depends(require_app)])
+async def set_ntfy(body: SetNtfyRequest):
+    """Configures push notifications (see backend/notifier.py) — the channel
+    that makes an alert reach the phone with the app closed."""
+    await state.set_ntfy(body.server, body.topic)
+    return {"ok": True}
+
+
+@app.post("/settings/ntfy/test", dependencies=[Depends(require_app)])
+async def test_ntfy():
+    """Sends a test push, so the topic can be verified before a real
+    break-in depends on it. `ok: false` means no topic is configured;
+    delivery itself isn't waited on."""
+    sent = await state.send_test_notification()
+    return {"ok": sent}
 
 
 @app.post("/settings/police-call-delay", dependencies=[Depends(require_app)])
@@ -410,6 +452,20 @@ async def esp32_sensor_event(
     """
     await state.note_board_seen(board or sensor.value)
     await state.trigger_alert(sensor, reason)
+    return {"ok": True}
+
+
+@app.post("/esp32/entry-delay", dependencies=[Depends(require_device)])
+async def esp32_entry_delay(body: SetEntryDelayRequest):
+    """Called by the door controller when it starts its disarm countdown.
+
+    Without this the board ran that window silently and reported only the
+    outcome, so the app jumped from ARMED straight to TRIGGERED — no
+    countdown, no warning, no chance for someone watching remotely to see
+    that a person had just walked in.
+    """
+    await state.note_board_seen("door_controller")
+    await state.begin_entry_delay(body.seconds)
     return {"ok": True}
 
 

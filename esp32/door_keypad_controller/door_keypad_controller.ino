@@ -207,6 +207,24 @@ void reportStateChange(bool armed) {
   http.end();
 }
 
+// Tells the backend the disarm countdown has started, and how long it runs.
+//
+// Without this the board ran the whole ENTRY_TIME_LIMIT window silently and
+// only reported the outcome, so the app jumped straight from ARMED to
+// TRIGGERED — someone watching remotely never saw that a person had walked
+// in, and the person walking in had no countdown on their phone. The duration
+// is sent rather than hardcoded on the backend so changing ENTRY_TIME_LIMIT
+// here stays correct everywhere.
+void reportEntryDelay() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(backendUrl("/esp32/entry-delay"));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  http.POST("{\"seconds\":" + String(ENTRY_TIME_LIMIT / 1000) + "}");
+  http.end();
+}
+
 // Reports the door-breach-timeout alarm, same pattern as the other two
 // boards use for their own sensors.
 void reportDoorAlert() {
@@ -394,6 +412,7 @@ void loop() {
         lastBeepTime = millis();
         isBuzzerCurrentlyOn = false;
         Serial.println("\nWARNING: Door opened! Enter PIN to disarm.");
+        reportEntryDelay();
       }
       break;
 

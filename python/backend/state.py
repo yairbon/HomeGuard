@@ -20,6 +20,7 @@ from pathlib import Path
 
 from fastapi import WebSocket
 
+from . import notifier
 from .models import (
     AlarmState,
     ApprovedFace,
@@ -49,6 +50,10 @@ BOARD_TIMEOUT = timedelta(seconds=30)
 # stopped reporting would stay "online" in the UI until the next unrelated
 # state change happened to trigger a broadcast.
 BOARD_MONITOR_INTERVAL = 5.0
+
+# How often the night-mode schedule is evaluated. Once a minute is enough
+# for hour-granularity scheduling and costs essentially nothing.
+NIGHT_MODE_CHECK_INTERVAL = 60.0
 
 # Names the three sketches identify themselves with on /esp32/heartbeat.
 # Kept as plain strings (not a SensorType) because the door controller is not
@@ -95,9 +100,21 @@ class AppState:
         self._next_face_id = 3  # ids "1"/"2" are taken by the seed faces above
         self.camera_online = False
         self.face_id_enabled = True
+        # Off by default and deliberately so — see log_face_recognized for
+        # why letting a face turn the alarm off is a security trade-off.
+        self.face_disarm_enabled = False
         self.night_mode = False
+        # Whole hours (0-23): when night mode arms and disarms. Defaults to
+        # arming at 23:00 and disarming at 07:00.
+        self.night_mode_arm_hour = 23
+        self.night_mode_disarm_hour = 7
         self.emergency_number = ""
         self.police_call_delay_seconds = 60
+        # Push-notification target (see backend/notifier.py). Empty topic =
+        # disabled, which is the default: pushing requires the user to pick a
+        # topic name, since that name is the only thing protecting it.
+        self.ntfy_server = "https://ntfy.sh"
+        self.ntfy_topic = ""
 
         # Last time each board was heard from. Absent = never seen this run.
         # Board liveness is derived from these timestamps rather than stored
@@ -109,10 +126,16 @@ class AppState:
         self._locked_until: datetime | None = None
         self._arming_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._night_mode_task: asyncio.Task | None = None
+        # Pending "alarm still not cleared" follow-up; cancelled by disarm.
+        self._escalation_task: asyncio.Task | None = None
         # Which mode the system was last armed in. Needed so a state report
         # from the door controller can reapply Home mode's sensor bypass —
         # the controller only reports armed/disarmed, never the mode.
         self._arm_mode: ArmMode = ArmMode.away
+        # When the door controller's disarm countdown runs out. Set by
+        # begin_entry_delay, read by entry_delay_seconds_remaining.
+        self._entry_delay_ends_at: datetime | None = None
 
         self.tokens = TokenStore()
         self.device_key = ""
@@ -145,11 +168,18 @@ class AppState:
 
         self._password_hash = data.get("password_hash") or self._password_hash
         self.face_id_enabled = data.get("face_id_enabled", self.face_id_enabled)
+        self.face_disarm_enabled = data.get("face_disarm_enabled", self.face_disarm_enabled)
         self.night_mode = data.get("night_mode", self.night_mode)
+        self.night_mode_arm_hour = data.get("night_mode_arm_hour", self.night_mode_arm_hour)
+        self.night_mode_disarm_hour = data.get(
+            "night_mode_disarm_hour", self.night_mode_disarm_hour
+        )
         self.emergency_number = data.get("emergency_number", self.emergency_number)
         self.police_call_delay_seconds = data.get(
             "police_call_delay_seconds", self.police_call_delay_seconds
         )
+        self.ntfy_server = data.get("ntfy_server") or self.ntfy_server
+        self.ntfy_topic = data.get("ntfy_topic", self.ntfy_topic)
 
         faces = data.get("faces")
         if isinstance(faces, list):
@@ -203,9 +233,14 @@ class AppState:
             "faces": [f.model_dump() for f in self.faces],
             "events": [json.loads(e.model_dump_json()) for e in self.events[:MAX_EVENTS]],
             "face_id_enabled": self.face_id_enabled,
+            "face_disarm_enabled": self.face_disarm_enabled,
             "night_mode": self.night_mode,
+            "night_mode_arm_hour": self.night_mode_arm_hour,
+            "night_mode_disarm_hour": self.night_mode_disarm_hour,
             "emergency_number": self.emergency_number,
             "police_call_delay_seconds": self.police_call_delay_seconds,
+            "ntfy_server": self.ntfy_server,
+            "ntfy_topic": self.ntfy_topic,
         }
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -327,31 +362,37 @@ class AppState:
                 await self._broadcast()
 
     def start_monitor(self) -> None:
-        """Starts [_monitor_boards]. Called from the FastAPI lifespan handler
-        rather than from `__init__`, because creating a task requires a
-        running event loop and this object is constructed at import time.
+        """Starts the background loops — board liveness and the night-mode
+        schedule. Called from the FastAPI lifespan handler rather than from
+        `__init__`, because creating a task requires a running event loop and
+        this object is constructed at import time.
         """
         if self._monitor_task is None:
             self._monitor_task = asyncio.create_task(self._monitor_boards())
+        if self._night_mode_task is None:
+            self._night_mode_task = asyncio.create_task(self._night_mode_loop())
 
     async def stop_monitor(self) -> None:
-        """Cancels the board monitor on shutdown and waits for it to actually
-        finish, so the loop can't outlive the app and log into a closing
-        event loop."""
-        if self._monitor_task is None:
-            return
-        self._monitor_task.cancel()
-        try:
-            await self._monitor_task
-        except asyncio.CancelledError:
-            pass
-        self._monitor_task = None
+        """Cancels the background loops on shutdown and waits for them to
+        actually finish, so neither can outlive the app and log into a
+        closing event loop."""
+        for name in ("_monitor_task", "_night_mode_task"):
+            task = getattr(self, name)
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            setattr(self, name, None)
 
     def snapshot(self) -> FullState:
         """Builds the current FullState payload sent both over /state and
         over the WebSocket."""
         return FullState(
             alarm_state=self.alarm_state,
+            entry_delay_seconds_remaining=self.entry_delay_seconds_remaining,
             sensors=self.sensors,
             events=self.events,
             faces=self.faces,
@@ -359,9 +400,14 @@ class AppState:
             boards=self.board_statuses(),
             camera_online=self.camera_online,
             face_id_enabled=self.face_id_enabled,
+            face_disarm_enabled=self.face_disarm_enabled,
             night_mode=self.night_mode,
+            night_mode_arm_hour=self.night_mode_arm_hour,
+            night_mode_disarm_hour=self.night_mode_disarm_hour,
             emergency_number=self.emergency_number,
             police_call_delay_seconds=self.police_call_delay_seconds,
+            ntfy_server=self.ntfy_server,
+            ntfy_topic=self.ntfy_topic,
         )
 
     def _log(self, message: str, category: EventCategory = EventCategory.info) -> None:
@@ -553,6 +599,14 @@ class AppState:
         if self._arming_task:
             self._arming_task.cancel()
             self._arming_task = None
+        # Whatever countdown was running is over — clear it so a stale
+        # deadline can't make the app show a countdown after disarming.
+        self._entry_delay_ends_at = None
+        # Acknowledging the alarm in time is exactly what should stop the
+        # escalation notification from going out.
+        if self._escalation_task:
+            self._escalation_task.cancel()
+            self._escalation_task = None
         self.sensors = [
             SensorReading(type=s.type, label=s.label, ok=True) for s in self.sensors
         ]
@@ -611,6 +665,35 @@ class AppState:
         )
         await self._broadcast()
 
+    async def begin_entry_delay(self, seconds: int) -> None:
+        """The door controller reports that someone opened the door on an
+        armed system and the disarm countdown has started.
+
+        Only meaningful from `armed`. Previously the controller ran this
+        window silently and reported only the outcome, so the app jumped
+        straight from ARMED to TRIGGERED — the person walking in had no idea
+        how long they had, and neither did anyone watching remotely.
+
+        `entry_delay_ends_at` is stored so `entry_delay_seconds_remaining`
+        can be derived on every snapshot; the controller owns the real timer,
+        this is a display mirror of it (same pattern as the exit-delay
+        countdown).
+        """
+        if self.alarm_state != AlarmState.armed:
+            return
+        self.alarm_state = AlarmState.entryDelay
+        self._entry_delay_ends_at = datetime.now() + timedelta(seconds=seconds)
+        self._log("Door opened — enter code to disarm", EventCategory.armDisarm)
+        await self._broadcast()
+
+    @property
+    def entry_delay_seconds_remaining(self) -> int:
+        """Seconds left to disarm before the alarm sounds, for the app's
+        countdown. 0 whenever not in an entry delay."""
+        if self.alarm_state != AlarmState.entryDelay or self._entry_delay_ends_at is None:
+            return 0
+        return max(0, int((self._entry_delay_ends_at - datetime.now()).total_seconds()))
+
     async def trigger_alert(self, source: SensorType | None, reason: str) -> None:
         """Raises an alert and flips the system to `triggered`, if (and
         only if) the system is currently `armed`. `source` identifies
@@ -620,11 +703,15 @@ class AppState:
         AppState._register_failed_attempt (lockout), /trigger-alert (demo
         button), and /esp32/sensor-event (real sensor reports).
         """
-        if self.alarm_state != AlarmState.armed:
+        if self.alarm_state not in (AlarmState.armed, AlarmState.entryDelay):
             # Ignore triggers while disarmed, still arming (transitional
             # — sensors legitimately fire during the exit walk), or
             # already triggered (avoid re-logging/re-broadcasting an
             # alert that's already in progress).
+            #
+            # `entryDelay` *is* escalatable: it's the state the system is in
+            # when the door controller's disarm countdown expires, and that
+            # expiry arrives here as the controller's door alert.
             return
 
         # A bypassed sensor (e.g. vibration in Home mode) is expected to
@@ -645,6 +732,63 @@ class AppState:
         self.alarm_state = AlarmState.triggered
         self._log(f"ALERT — {reason}", EventCategory.alert)
         self._persist()  # an alert is exactly the event worth surviving a restart
+        # Pushed before the broadcast, but non-blocking (see notifier.notify):
+        # this only schedules the request, so the state push below still goes
+        # out immediately even if the ntfy server is slow or unreachable.
+        notifier.notify(
+            self.ntfy_server,
+            self.ntfy_topic,
+            title="HomeGuard alarm",
+            message=reason,
+        )
+        self._start_escalation(reason)
+        await self._broadcast()
+
+    def _start_escalation(self, reason: str) -> None:
+        """Schedules the follow-up notification for an alarm nobody has
+        cleared.
+
+        This is what `emergency_number` and `police_call_delay_seconds` now
+        actually drive. They previously drove nothing at all: the settings
+        were stored, the UI said the number would be "auto-called", and no
+        code anywhere dialled anything.
+
+        Genuinely placing a phone call needs a telephony provider (an account,
+        credentials, per-message cost) — out of scope here, and adding a
+        half-working version would be worse than none. What this does instead
+        is honest and useful: after the configured delay, if the alarm is
+        *still* unacknowledged, it pushes a second, louder notification naming
+        the emergency contact to call. The UI wording matches.
+        """
+        if self._escalation_task:
+            self._escalation_task.cancel()
+        self._escalation_task = asyncio.create_task(self._escalate_after_delay(reason))
+
+    async def _escalate_after_delay(self, reason: str) -> None:
+        """Waits out the response window, then pushes the escalation if the
+        alarm is still triggered. Cancelled by `disarm`, so acknowledging the
+        alarm in time stops it."""
+        try:
+            await asyncio.sleep(self.police_call_delay_seconds)
+        except asyncio.CancelledError:
+            return
+        if self.alarm_state != AlarmState.triggered:
+            return
+
+        contact = self.emergency_number.strip()
+        message = (
+            f"Alarm still active after {self.police_call_delay_seconds}s — {reason}."
+            + (f" Call {contact}." if contact else "")
+        )
+        self._log("Alarm not cleared — escalation notification sent", EventCategory.alert)
+        notifier.notify(
+            self.ntfy_server,
+            self.ntfy_topic,
+            title="HomeGuard — ALARM NOT CLEARED",
+            message=message,
+            priority="urgent",
+            tags="rotating_light,sos",
+        )
         await self._broadcast()
 
     # ---- Faces ----------------------------------------------------------------
@@ -678,12 +822,50 @@ class AppState:
         self._persist()
         await self._broadcast()
 
-    async def log_face_recognized(self, name: str) -> None:
-        """Records a face-recognition match in the activity log. Purely
-        an audit/notification action — recognizing a face does not by
-        itself disarm the system or change alarm_state.
+    async def log_face_recognized(self, name: str) -> bool:
+        """Records a face-recognition match and, if face-disarm is enabled,
+        disarms the system. Returns whether it disarmed.
+
+        Face-disarm is **off by default**, deliberately. SFace compares face
+        embeddings; it has no liveness detection, so a printed photo or a
+        picture on a phone screen may well pass. That makes this a
+        convenience feature, not a security one — it lowers the bar to
+        disarming from "knows the PIN or the password" to "has a photo of
+        someone who lives here", which is a real downgrade for an alarm.
+        Enabling it is an informed choice the user makes in Settings.
+
+        Only disarms from `armed` or `triggered` — the states where disarming
+        is a meaningful action. Recognizing a face while already disarmed is
+        just an audit-log entry.
         """
         self._log(f"Face recognized: {name}", EventCategory.faceId)
+
+        should_disarm = self.face_disarm_enabled and self.alarm_state in (
+            AlarmState.armed,
+            AlarmState.triggered,
+            AlarmState.entryDelay,
+        )
+        if not should_disarm:
+            await self._broadcast()
+            return False
+
+        # disarm() broadcasts and resets sensors; log the reason first so the
+        # event log reads in cause-then-effect order.
+        self._log(f"Disarmed by Face ID: {name}", EventCategory.armDisarm)
+        await self.disarm()
+        return True
+
+    async def set_face_disarm_enabled(self, enabled: bool) -> None:
+        """Turns face-disarm on or off. Logged either way — this changes what
+        it takes to disarm the alarm, which is exactly the kind of change the
+        activity log exists to record.
+        """
+        self.face_disarm_enabled = enabled
+        self._log(
+            "Face ID disarm enabled" if enabled else "Face ID disarm disabled",
+            EventCategory.auth,
+        )
+        self._persist()
         await self._broadcast()
 
     async def set_face_id_enabled(self, enabled: bool) -> None:
@@ -698,21 +880,71 @@ class AppState:
     # ---- Settings ---------------------------------------------------------------
 
     async def set_night_mode(self, enabled: bool) -> None:
-        """Toggles night mode and logs it.
+        """Toggles night mode: automatic arming overnight.
 
-        The log message says only that the setting changed. It used to claim
-        night mode "auto-arms overnight", which no code anywhere implements —
-        a log line describing behavior the system doesn't have is worse than
-        no log line, because it's the record someone would consult after an
-        incident.
+        This setting used to be stored and nothing more, while both the UI and
+        the log line claimed it "auto-arms overnight" — an alarm system
+        telling the user it's covering them when it isn't. `_night_mode_tick`
+        is what now makes the claim true.
         """
         self.night_mode = enabled
         self._log(
-            "Night mode enabled" if enabled else "Night mode disabled",
+            f"Night mode enabled — arms at {self.night_mode_arm_hour:02d}:00, "
+            f"disarms at {self.night_mode_disarm_hour:02d}:00"
+            if enabled
+            else "Night mode disabled",
             EventCategory.info,
         )
         self._persist()
         await self._broadcast()
+
+    async def set_night_mode_hours(self, arm_hour: int, disarm_hour: int) -> None:
+        """Sets when night mode arms and disarms, as whole hours (0-23).
+
+        Whole hours rather than arbitrary times because the scheduler checks
+        once a minute against the local clock — minute-level precision would
+        imply an accuracy the design doesn't have.
+        """
+        self.night_mode_arm_hour = max(0, min(23, arm_hour))
+        self.night_mode_disarm_hour = max(0, min(23, disarm_hour))
+        self._persist()
+        await self._broadcast()
+
+    async def _night_mode_tick(self, now: datetime | None = None) -> None:
+        """One evaluation of the night-mode schedule. Split out from the loop
+        so tests can drive it with an explicit clock instead of waiting for
+        real hours to pass.
+
+        Arms only from `disarmed`, and disarms only from `armed` — never from
+        `triggered` or `entryDelay`. That restraint is the important part: an
+        alarm going off at 3am must not be silenced by the schedule reaching
+        its morning disarm time. A human decides when an alert is over.
+
+        Acts on the hour boundary only (`minute == 0`), so re-arming is not
+        attempted every minute for an hour after someone deliberately
+        disarmed at 02:30.
+        """
+        now = now or datetime.now()
+        if not self.night_mode or now.minute != 0:
+            return
+
+        if now.hour == self.night_mode_arm_hour and self.alarm_state == AlarmState.disarmed:
+            self._log("Night mode — arming automatically", EventCategory.armDisarm)
+            await self.arm(ArmMode.home)
+        elif now.hour == self.night_mode_disarm_hour and self.alarm_state == AlarmState.armed:
+            self._log("Night mode — disarming automatically", EventCategory.armDisarm)
+            await self.disarm()
+
+    async def _night_mode_loop(self) -> None:
+        """Checks the night-mode schedule once a minute."""
+        while True:
+            await asyncio.sleep(NIGHT_MODE_CHECK_INTERVAL)
+            try:
+                await self._night_mode_tick()
+            except Exception:
+                # A scheduling error must never kill the loop and silently
+                # stop all future auto-arming.
+                logger.exception("Night-mode check failed")
 
     async def set_emergency_number(self, number: str) -> None:
         """Stores the number to call when police auto-dial (if/once
@@ -723,6 +955,40 @@ class AppState:
         self.emergency_number = number
         self._persist()
         await self._broadcast()
+
+    async def set_ntfy(self, server: str, topic: str) -> None:
+        """Sets where alerts are pushed. An empty `topic` turns pushing off.
+
+        The topic is not logged — on a public ntfy server it's the only thing
+        keeping strangers from reading this house's alarm notifications, so it
+        doesn't belong in an event log the app displays.
+        """
+        self.ntfy_server = server.strip() or "https://ntfy.sh"
+        self.ntfy_topic = topic.strip()
+        self._log(
+            "Push notifications enabled" if self.ntfy_topic else "Push notifications disabled",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
+
+    async def send_test_notification(self) -> bool:
+        """Pushes a harmless test notification, so the user can confirm the
+        topic works *before* relying on it for a real break-in. Returns
+        whether a topic was configured at all — not whether it was delivered,
+        which is deliberately not awaited (see notifier.notify).
+        """
+        if not self.ntfy_topic:
+            return False
+        notifier.notify(
+            self.ntfy_server,
+            self.ntfy_topic,
+            title="HomeGuard test",
+            message="Test notification — your alerts will arrive here.",
+            priority="default",
+            tags="white_check_mark",
+        )
+        return True
 
     async def set_police_call_delay(self, seconds: int) -> None:
         """Stores how long to wait after a triggered alarm before

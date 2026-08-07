@@ -94,6 +94,79 @@ The old path is kept as an automatic fallback: if the ONNX files are missing,
 the service logs a warning and uses Haar+LBPH rather than refusing to start.
 `FaceRecognitionService.backend_name` reports which is live.
 
+## Push notifications (ntfy)
+
+The app's own notifications only fire while its process is alive — swipe it
+away and a break-in produces nothing. `backend/notifier.py` closes that gap by
+POSTing to an [ntfy](https://ntfy.sh) topic, which the ntfy Android app
+receives independently of HomeGuard.
+
+Chosen over Firebase Cloud Messaging because FCM needs a Firebase project and
+a `google-services.json` only the project owner can create, and adding the
+Gradle plugin without that file breaks the Android build outright (see
+`../CLAUDE.md`). ntfy needs no account, no new Flutter dependency, and no
+change to the app's build.
+
+Set the server and topic in the app's Settings screen, then install the ntfy
+app and subscribe to the same topic. There's a **Send test** button — use it
+before relying on this.
+
+**The topic name is a secret.** On the public ntfy.sh anyone who knows it can
+read your alarm notifications, so use a long random name or self-host. The
+topic is deliberately never written to the event log.
+
+Two kinds of push are sent: one the moment the alarm triggers, and — if the
+alarm is *still* uncleared after `police_call_delay_seconds` — a second,
+urgent one naming the emergency contact. That escalation is what
+`emergency_number` now actually drives; it previously drove nothing while the
+UI claimed the number would be "auto-called". Placing a real call needs a
+telephony provider, which is out of scope, so the wording was corrected to
+match what happens.
+
+## Camera worker
+
+`camera_worker.py` is what actually feeds face recognition. Without it the
+recognizer worked but nothing ever called `/camera/recognize`, so no face was
+ever recognized in normal operation.
+
+```powershell
+$env:HOMEGUARD_DEVICE_KEY = "<the backend's device key>"
+.\venv\Scripts\python.exe camera_worker.py --url http://localhost:8000 --camera 0
+```
+
+A separate process rather than a thread inside the backend: grabbing frames is
+a blocking OpenCV call and the backend is a single event loop serving every
+WebSocket, so a blocking read there would stall the whole alarm UI. It also
+lets the camera live on a different machine.
+
+### Face-ID disarm
+
+Off by default. When enabled (Camera tab), a recognized approved face disarms
+the system — including from a sounding alarm or mid entry-delay.
+
+**This is convenience, not security.** SFace compares face embeddings and has
+no liveness detection, so a printed photo or a picture on a phone screen may
+pass. Enabling it lowers disarming from "knows the PIN or password" to "has a
+photo of a resident". The toggle says so, and every face-disarm is attributed
+in the event log.
+
+## Night mode and entry delay
+
+`night_mode` now runs a real scheduler (`AppState._night_mode_tick`): it arms
+at `night_mode_arm_hour` and disarms at `night_mode_disarm_hour`, whole hours,
+checked once a minute. It was previously a stored flag with no code behind it
+while the UI said it auto-armed.
+
+It never silences a live alarm — it arms only from `disarmed` and disarms only
+from `armed`, never from `triggered` or `entryDelay`. A human decides when an
+alert is over.
+
+`entryDelay` is a new alarm state: the door controller now reports
+(`/esp32/entry-delay`) the moment it starts its disarm countdown, so the app
+shows the countdown the person walking in is racing. Previously the board ran
+that window silently and reported only the outcome, so the app jumped straight
+from ARMED to TRIGGERED.
+
 ## Testing
 
 Two suites, deliberately:
@@ -101,7 +174,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 97 tests, ~30s
+.\venv\Scripts\python.exe -m pytest        # 136 tests, ~50s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 
@@ -118,7 +191,7 @@ $env:HOMEGUARD_DEVICE_KEY = "simulation-device-key"
 .\venv\Scripts\python.exe simulate.py
 ```
 
-`simulate.py` is the live counterpart: 78 checks against a real uvicorn
+`simulate.py` is the live counterpart: 96 checks against a real uvicorn
 process over a real socket, so it also covers the ASGI server, the WebSocket
 transport and genuine wall-clock timing (it really does wait out the
 30-second lockout and the 30-second board timeout — takes a couple of
@@ -146,9 +219,8 @@ success.
 - Arming from the *physical keypad* carries no arm mode, so the backend falls
   back to the last mode requested through the app, defaulting to Away — the
   stricter of the two, so an unknown mode never silently disables a sensor.
-- `emergency_number` / `police_call_delay_seconds` are stored but nothing
-  dials anything.
-- `night_mode` is stored but there's no scheduler; it does not auto-arm.
+- Nothing places an actual phone call. `emergency_number` drives the urgent
+  escalation notification instead — see the ntfy section above.
 
 ## Matching the Flutter side
 

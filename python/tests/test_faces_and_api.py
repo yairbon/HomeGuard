@@ -186,6 +186,7 @@ async def test_state_shape_matches_the_flutter_client(auth_client):
     body = (await auth_client.get("/state")).json()
     assert set(body) == {
         "alarm_state",
+        "entry_delay_seconds_remaining",
         "sensors",
         "events",
         "faces",
@@ -193,9 +194,14 @@ async def test_state_shape_matches_the_flutter_client(auth_client):
         "boards",
         "camera_online",
         "face_id_enabled",
+        "face_disarm_enabled",
         "night_mode",
+        "night_mode_arm_hour",
+        "night_mode_disarm_hour",
         "emergency_number",
         "police_call_delay_seconds",
+        "ntfy_server",
+        "ntfy_topic",
     }
     assert set(body["sensors"][0]) == {"type", "label", "ok", "bypassed"}
     assert set(body["boards"][0]) == {"name", "online", "last_seen"}

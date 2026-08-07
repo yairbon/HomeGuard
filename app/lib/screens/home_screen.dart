@@ -62,6 +62,7 @@ class HomeScreen extends StatelessWidget {
               _StatusHeadline(
                 state: alarm.state,
                 armingSecondsRemaining: alarm.armingSecondsRemaining,
+                entryDelaySecondsRemaining: alarm.entryDelaySecondsRemaining,
               ),
               const SizedBox(height: 28),
               // A single control-panel card groups sensor status and the
@@ -223,10 +224,15 @@ class _OfflineBoardsBanner extends StatelessWidget {
 /// subtitle, instead of a small caption squeezed inside the ring's own
 /// bounding box where it used to compete with the glow for contrast.
 class _StatusHeadline extends StatelessWidget {
-  const _StatusHeadline({required this.state, required this.armingSecondsRemaining});
+  const _StatusHeadline({
+    required this.state,
+    required this.armingSecondsRemaining,
+    required this.entryDelaySecondsRemaining,
+  });
 
   final AlarmState state;
   final int armingSecondsRemaining;
+  final int entryDelaySecondsRemaining;
 
   /// One-line plain-language explanation of [state], shown under the
   /// badge. The transitional case is dynamic — it counts down alongside
@@ -243,6 +249,12 @@ class _StatusHeadline extends StatelessWidget {
         return armingSecondsRemaining > 0
             ? 'Exiting — arms in ${armingSecondsRemaining}s'
             : 'Exiting now';
+      case AlarmState.entryDelay:
+        // The most time-critical line in the app: somebody just opened the
+        // door on an armed system and this is the countdown they're racing.
+        return entryDelaySecondsRemaining > 0
+            ? 'Door opened — alarm in ${entryDelaySecondsRemaining}s'
+            : 'Door opened — enter your code';
     }
   }
 

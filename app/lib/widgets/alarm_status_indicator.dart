@@ -19,6 +19,11 @@ Color alarmStateColor(AlarmState state) {
     case AlarmState.triggered:
       return AppColors.alarm;
     case AlarmState.transitional:
+    // Entry delay shares the transitional amber deliberately: like arming,
+    // it's a "the clock is running, act now" state rather than a settled
+    // one. Painting it alarm-red would be indistinguishable from the alarm
+    // having already gone off.
+    case AlarmState.entryDelay:
       return AppColors.transitional;
   }
 }
@@ -35,6 +40,8 @@ String alarmStateLabel(AlarmState state) {
       return 'ALERT';
     case AlarmState.transitional:
       return 'ARMING';
+    case AlarmState.entryDelay:
+      return 'DISARM NOW';
   }
 }
 
