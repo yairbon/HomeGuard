@@ -45,10 +45,17 @@ async def _post(path: str, json: dict | None = None) -> bool:
     without real hardware attached), this is a no-op that just logs and
     returns False — lets the rest of the app/demo work without a board.
 
-    Also doubles as a lightweight connectivity signal: a successful
-    request marks the ESP32 online, and an HTTPError (timeout, connection
-    refused, non-2xx, etc.) marks it offline — independent of whatever
-    /esp32/heartbeat last reported.
+    Also doubles as a lightweight connectivity signal: a successful request
+    marks the door controller as recently seen, on the same per-board
+    timestamp the heartbeats feed. A *failure* deliberately doesn't mark it
+    offline — board liveness is derived from "how long since we last heard
+    from it" (see AppState.board_statuses), so one failed outbound request
+    doesn't need to, and shouldn't, override that. It'll age out on its own
+    if the board really is gone.
+
+    Authenticates with the shared device key so the board can tell a genuine
+    backend command from anything else on the network that found its IP —
+    this is the channel that can disarm an armed alarm remotely.
     """
     if not DOOR_CONTROLLER_URL:
         logger.info(
@@ -56,13 +63,16 @@ async def _post(path: str, json: dict | None = None) -> bool:
         )
         return False
     try:
-        response = await _client.post(f"{DOOR_CONTROLLER_URL}{path}", json=json)
+        response = await _client.post(
+            f"{DOOR_CONTROLLER_URL}{path}",
+            json=json,
+            headers={"X-Device-Key": state.device_key},
+        )
         response.raise_for_status()
-        await state.set_esp32_online(True)
+        await state.note_board_seen("door_controller")
         return True
     except httpx.HTTPError as exc:
         logger.warning("Door controller request to %s failed: %s", path, exc)
-        await state.set_esp32_online(False)
         return False
 
 

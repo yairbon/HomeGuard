@@ -387,16 +387,23 @@ class _SectionCard extends StatelessWidget {
   final Widget child;
 
   /// Wraps [child] in the card's padding and rounded background.
+  ///
+  /// A [Material] rather than a `Container` with a `BoxDecoration` colour,
+  /// even though the two look identical. Interactive children — the
+  /// [SwitchListTile] in the night-mode section — paint their ink splash on
+  /// the nearest [Material] ancestor, which used to be somewhere further up
+  /// the tree, *behind* this card's opaque background. The tap feedback was
+  /// therefore drawn and then immediately hidden, and Flutter asserts on
+  /// exactly this arrangement.
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.surfaceRaised,
-        borderRadius: BorderRadius.circular(12),
+    return Material(
+      color: AppColors.surfaceRaised,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: SizedBox(width: double.infinity, child: child),
       ),
-      child: child,
     );
   }
 }

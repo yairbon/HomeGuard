@@ -57,6 +57,18 @@ class AlarmService extends ChangeNotifier {
       _isOnline = online;
       notifyListeners();
     });
+    _boardsSub = _backend.boardsStream.listen((boards) {
+      _boards = boards;
+      notifyListeners();
+    });
+    // Infrastructural failures (backend unreachable, session expired) are
+    // held as `lastError` rather than pushed straight to a snackbar, so the
+    // widget layer decides how to present them and can clear them on
+    // acknowledgement. See BackendService.errorStream for why these exist.
+    _errorSub = _backend.errorStream.listen((message) {
+      _lastError = message;
+      notifyListeners();
+    });
     _facesSub = _backend.facesStream.listen((faces) {
       _faces = faces;
       notifyListeners();
@@ -86,6 +98,8 @@ class AlarmService extends ChangeNotifier {
   late final StreamSubscription<List<SecurityEvent>> _logSub;
   late final StreamSubscription<List<SensorReading>> _sensorSub;
   late final StreamSubscription<bool> _connectivitySub;
+  late final StreamSubscription<List<BoardStatus>> _boardsSub;
+  late final StreamSubscription<String> _errorSub;
   late final StreamSubscription<List<ApprovedFace>> _facesSub;
   late final StreamSubscription<bool> _cameraOnlineSub;
   late final StreamSubscription<bool> _faceIdSub;
@@ -94,6 +108,8 @@ class AlarmService extends ChangeNotifier {
   List<SecurityEvent> _events = const [];
   List<SensorReading> _sensors = const [];
   bool _isOnline = true;
+  List<BoardStatus> _boards = const [];
+  String? _lastError;
   List<ApprovedFace> _faces = const [];
   bool _isCameraOnline = true;
   bool _faceIdEnabled = true;
@@ -107,6 +123,19 @@ class AlarmService extends ChangeNotifier {
   List<SecurityEvent> get events => _events;
   List<SensorReading> get sensors => _sensors;
   bool get isOnline => _isOnline;
+
+  /// Per-board liveness for the dashboard (see [BoardStatus]). Empty until
+  /// the first state frame arrives, or when talking to a backend that
+  /// predates per-board tracking.
+  List<BoardStatus> get boards => _boards;
+
+  /// Boards the backend has stopped hearing from — the ones worth calling
+  /// out on the dashboard. An empty list means everything is reporting.
+  List<BoardStatus> get offlineBoards => _boards.where((b) => !b.online).toList();
+
+  /// Most recent infrastructural failure, or null if none is outstanding.
+  /// Cleared via [clearError] once shown.
+  String? get lastError => _lastError;
   List<ApprovedFace> get faces => _faces;
   bool get isCameraOnline => _isCameraOnline;
   bool get faceIdEnabled => _faceIdEnabled;
@@ -139,6 +168,14 @@ class AlarmService extends ChangeNotifier {
   /// Demo-only pass-through (see [BackendService.simulateFaceRecognition]).
   void simulateFaceRecognition() => _backend.simulateFaceRecognition();
 
+  /// Marks [lastError] as handled, so the same message isn't shown twice on
+  /// the next rebuild. Called by the widget that displayed it.
+  void clearError() {
+    if (_lastError == null) return;
+    _lastError = null;
+    notifyListeners();
+  }
+
   /// Starts (or restarts) the display-only 1-second countdown shown on
   /// [AlarmStatusIndicator] while [state] is transitional. Counts down
   /// from [_armingExitDelay] regardless of how the backend's own timer is
@@ -167,6 +204,8 @@ class AlarmService extends ChangeNotifier {
     _logSub.cancel();
     _sensorSub.cancel();
     _connectivitySub.cancel();
+    _boardsSub.cancel();
+    _errorSub.cancel();
     _facesSub.cancel();
     _cameraOnlineSub.cancel();
     _faceIdSub.cancel();

@@ -12,9 +12,20 @@ class MockBackendService implements BackendService {
   final _eventLogController = StreamController<List<SecurityEvent>>.broadcast();
   final _sensorController = StreamController<List<SensorReading>>.broadcast();
   final _connectivityController = StreamController<bool>.broadcast();
+  final _boardsController = StreamController<List<BoardStatus>>.broadcast();
   final _facesController = StreamController<List<ApprovedFace>>.broadcast();
   final _cameraOnlineController = StreamController<bool>.broadcast();
   final _faceIdEnabledController = StreamController<bool>.broadcast();
+  // Never emitted on: the mock has no network to fail, so there is nothing
+  // infrastructural to report. Present only to satisfy the interface.
+  final _errorController = StreamController<String>.broadcast();
+
+  /// All three boards reported healthy, since there's no hardware to model.
+  static const _mockBoards = [
+    BoardStatus(name: 'ultrasonic', online: true),
+    BoardStatus(name: 'vibration', online: true),
+    BoardStatus(name: 'door_controller', online: true),
+  ];
 
   AlarmState _state = AlarmState.disarmed;
   final List<SecurityEvent> _events = [];
@@ -48,6 +59,7 @@ class MockBackendService implements BackendService {
     // the camera's own connection status separately.
     scheduleMicrotask(() {
       _connectivityController.add(true);
+      _boardsController.add(_mockBoards);
       _cameraOnlineController.add(true);
       _faceIdEnabledController.add(_faceIdEnabled);
       _facesController.add(List.unmodifiable(_faces));
@@ -65,6 +77,12 @@ class MockBackendService implements BackendService {
 
   @override
   Stream<bool> get connectivityStream => _connectivityController.stream;
+
+  @override
+  Stream<List<BoardStatus>> get boardsStream => _boardsController.stream;
+
+  @override
+  Stream<String> get errorStream => _errorController.stream;
 
   @override
   Stream<List<ApprovedFace>> get facesStream => _facesController.stream;
@@ -94,6 +112,12 @@ class MockBackendService implements BackendService {
     // backend, which is the actual authority on it.
     return LoginResult(ok: ok, attemptsRemaining: ok ? 3 : 2);
   }
+
+  /// No-op: the mock has no session to invalidate, since it never issued a
+  /// token. Present so [AuthService.logout] can call the same method against
+  /// either implementation.
+  @override
+  Future<void> logout() async {}
 
   /// Changes the stored password, provided [oldPassword] matches the
   /// current one and [newPassword] isn't blank. Returns whether the
@@ -318,6 +342,8 @@ class MockBackendService implements BackendService {
     _eventLogController.close();
     _sensorController.close();
     _connectivityController.close();
+    _boardsController.close();
+    _errorController.close();
     _facesController.close();
     _cameraOnlineController.close();
     _faceIdEnabledController.close();

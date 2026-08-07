@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
+import '../services/alarm_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/homeguard_icons.dart';
 import 'camera_screen.dart';
@@ -59,8 +61,38 @@ class _MainShellState extends State<MainShell> {
   /// replaces), so the selected/unselected accent color that used to come
   /// from `NavigationBarThemeData.iconTheme` is now computed per-tab here
   /// instead.
+  ///
+  /// Also the single place infrastructural failures surface. [AlarmService]
+  /// holds the most recent one as [AlarmService.lastError]; this shows it as
+  /// a SnackBar and immediately clears it, so the same message can't be
+  /// re-shown on every unrelated rebuild. It's done here rather than per
+  /// screen because these failures aren't tied to whichever tab is open — a
+  /// disarm that never reached the backend matters regardless of where the
+  /// user happens to be looking.
+  ///
+  /// The dispatch is deferred to a post-frame callback because showing a
+  /// SnackBar mutates the ScaffoldMessenger, which cannot be done during a
+  /// build.
   @override
   Widget build(BuildContext context) {
+    final error = context.select<AlarmService, String?>((a) => a.lastError);
+    if (error != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(error),
+              backgroundColor: AppColors.alarm,
+              behavior: SnackBarBehavior.floating,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        context.read<AlarmService>().clearError();
+      });
+    }
+
     return Scaffold(
       body: IndexedStack(index: _index, children: _screens),
       bottomNavigationBar: NavigationBarTheme(

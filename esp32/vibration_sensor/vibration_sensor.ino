@@ -22,13 +22,20 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// --- הגדרות רשת (הכניסו את שלכם) ---
-const char* ssid = "Free-TAU";
-const char* password = "free-tau";
+// כל הסודות יושבים ב-secrets.h שלא נכנס לגיט — העתק את
+// esp32/secrets.h.example לתיקייה הזו בשם secrets.h ומלא את הערכים.
+#include "secrets.h"
 
-// כתובת שרת הפייתון (הבקנד).
-const char* backendHost = "192.168.X.X";  // TODO: לעדכן ל-IP האמיתי
-const int backendPort = 8000;
+// --- הגדרות רשת ---
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+
+// כתובת שרת הפייתון (הבקנד) — ראה secrets.h.
+const char* backendHost = BACKEND_HOST;
+const int backendPort = BACKEND_PORT;
+
+// שם הלוח הזה כפי שהבקנד מזהה אותו (ראה BOARD_NAMES ב-state.py).
+const char* BOARD_NAME = "vibration";
 
 // --- הגדרות פינים ---
 const int vibrationPin = 13;
@@ -61,8 +68,14 @@ void setup() {
   Serial.println(WiFi.localIP());
 }
 
+// בסיס ה-URL של הבקנד, מורכב פעם אחת במקום בכל קריאה.
+String backendUrl(const char* path) {
+  return "http://" + String(backendHost) + ":" + String(backendPort) + String(path);
+}
+
 // שולח דיווח פריצה לבקנד — אותו endpoint שהחיישן האולטרה-סוני
-// משתמש בו, רק עם sensor=vibration.
+// משתמש בו, רק עם sensor=vibration. כותרת X-Device-Key היא חובה,
+// אחרת הבקנד מחזיר 401 (ראה require_device ב-main.py).
 void sendAlert() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send alert — WiFi disconnected");
@@ -70,12 +83,14 @@ void sendAlert() {
   }
 
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) +
-               "/esp32/sensor-event?sensor=vibration&reason=Vibration%20sensor%20breached";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/sensor-event?sensor=vibration&board=vibration"
+                        "&reason=Vibration%20sensor%20breached"));
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   int httpResponseCode = http.POST("");
 
-  if (httpResponseCode > 0) {
+  if (httpResponseCode == 401) {
+    Serial.println("Alert REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
+  } else if (httpResponseCode > 0) {
     Serial.printf("Alert sent successfully. Server responded: %d\n", httpResponseCode);
   } else {
     Serial.printf("Error sending alert: %s\n", http.errorToString(httpResponseCode).c_str());
@@ -84,12 +99,12 @@ void sendAlert() {
 }
 
 // שולח פינג "אני חי" לבקנד (ראו הסבר על ה-heartbeat למעלה) — אותה
-// פונקציה בדיוק כמו בלוח האולטרה-סוני.
+// פונקציה בדיוק כמו בלוח האולטרה-סוני, רק עם board=vibration.
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) + "/esp32/heartbeat";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
 }

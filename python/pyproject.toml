@@ -1,0 +1,32 @@
+# Tooling config for the backend. There is no packaging config here — the
+# backend is run in place with uvicorn, not installed as a distribution.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/W  pycodestyle      — formatting slips
+# F    pyflakes         — unused imports/names, undefined names
+# I    isort            — import ordering
+# B    flake8-bugbear   — likely bugs (mutable defaults, shadowed loop vars)
+# UP   pyupgrade        — modern syntax for the pinned Python version
+# ASYNC flake8-async    — blocking calls inside async functions, which on this
+#                         codebase would stall every connected WebSocket at
+#                         once, since it's all one event loop
+select = ["E", "W", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# simulate.py is a top-to-bottom script, not a module: it deliberately runs
+# assertions at import time and rebinds `r`/`state` throughout.
+"simulate.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Every test in this suite is async (the state layer is async throughout),
+# so opting in per-test with a decorator would be pure noise.
+asyncio_mode = "auto"
+# Each test gets a fresh event loop; the state singleton is reset per test by
+# the `state` fixture in conftest.py.
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::DeprecationWarning"]

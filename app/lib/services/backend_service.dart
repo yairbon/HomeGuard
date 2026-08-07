@@ -67,6 +67,36 @@ class ApprovedFace {
   const ApprovedFace({required this.id, required this.name});
 }
 
+/// Liveness of one of the three ESP32 boards. Mirrors `BoardStatus` in
+/// python/backend/models.py.
+///
+/// The dashboard used to show a single ONLINE/OFFLINE badge for "the ESP32",
+/// which couldn't express one board being down while the others were fine —
+/// and which, because the backend's flag latched on permanently, kept
+/// claiming ONLINE for a board that had lost power hours earlier. The backend
+/// now derives each board's status from its last heartbeat; this carries that
+/// per-board detail to the UI.
+///
+/// [lastSeen] is null for a board that hasn't reported at all since the
+/// backend started — "never showed up" reads differently from "was here, went
+/// quiet".
+class BoardStatus {
+  final String name;
+  final bool online;
+  final DateTime? lastSeen;
+
+  const BoardStatus({required this.name, required this.online, this.lastSeen});
+
+  /// Human-readable board name for the dashboard, since the wire format uses
+  /// the backend's identifiers (`door_controller`, not "Door controller").
+  String get label => switch (name) {
+        'ultrasonic' => 'Ultrasonic board',
+        'vibration' => 'Vibration board',
+        'door_controller' => 'Door controller',
+        _ => name,
+      };
+}
+
 /// The backend is the sole lockout authority — client-side-only lockout
 /// is trivially bypassed by just restarting the app, so it can't be the
 /// real security boundary. AuthService just relays whatever comes back
@@ -95,6 +125,12 @@ abstract class BackendService {
   /// remaining — the caller (AuthService) doesn't compute any of that
   /// itself, only relays it.
   Future<LoginResult> login(String password);
+
+  /// Ends the current session. Implementations backed by a real server must
+  /// invalidate the session token there, not just locally — otherwise
+  /// "logging out" leaves a credential that stays valid for hours and can
+  /// still arm or disarm the system.
+  Future<void> logout();
 
   /// Changes the login password from [oldPassword] to [newPassword].
   /// Returns whether the change succeeded (implementations should reject
@@ -128,8 +164,25 @@ abstract class BackendService {
   /// state changes.
   Stream<List<SensorReading>> get sensorStream;
 
-  /// Emits whether the ESP32 hardware is currently reachable.
+  /// Emits whether *any* ESP32 board is currently reachable — the single
+  /// badge on the dashboard. See [boardsStream] for which specific boards.
   Stream<bool> get connectivityStream;
+
+  /// Emits the status of each of the three ESP32 boards whenever any of them
+  /// changes (see [BoardStatus]).
+  Stream<List<BoardStatus>> get boardsStream;
+
+  /// Emits a human-readable message whenever a request fails for an
+  /// infrastructural reason — the backend is unreachable, or it rejected the
+  /// session as expired.
+  ///
+  /// Exists because every REST call in [HttpBackendService] swallows its
+  /// errors and returns an empty response, which made "the backend is down"
+  /// indistinguishable from "the backend said no". On an alarm system that
+  /// matters concretely: a disarm request that never left the phone looked
+  /// exactly like one the backend had processed. Listeners surface these to
+  /// the user; nothing depends on them for control flow.
+  Stream<String> get errorStream;
 
   // Approved faces (biometric layer)
   /// Emits the full list of approved faces whenever it changes.

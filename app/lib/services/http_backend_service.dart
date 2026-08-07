@@ -6,6 +6,39 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'backend_service.dart';
 
+/// Outcome of one REST call, distinguishing the three things that can
+/// happen: the request succeeded, the backend refused it, or the request
+/// never got an answer at all.
+///
+/// Before this existed every call funnelled through a `catch (_) => {}`, so
+/// an unreachable backend and a rejected password produced byte-identical
+/// results. On an alarm panel that is a real hazard — tapping DISARM while
+/// the phone has no route to the backend would leave the UI looking exactly
+/// as if the system had been disarmed.
+class _Result {
+  /// A response that actually came back from the backend, whatever its
+  /// status code.
+  const _Result({required this.statusCode, required this.body}) : reachable = true;
+
+  /// The "never reached the server" case — no status code exists, because
+  /// nothing ever answered.
+  const _Result.unreachable() : statusCode = 0, body = const {}, reachable = false;
+
+  final int statusCode;
+  final Map<String, dynamic> body;
+
+  /// False when the request failed at the transport level (no route, DNS
+  /// failure, connection refused, timeout) — i.e. the backend never saw it.
+  final bool reachable;
+
+  /// True only for a 2xx response that actually arrived.
+  bool get ok => reachable && statusCode >= 200 && statusCode < 300;
+
+  /// True when the backend rejected the session token — the app needs to
+  /// send the user back to the login screen rather than retrying.
+  bool get unauthorized => reachable && statusCode == 401;
+}
+
 /// Talks to the real Python backend (python/) over REST + a WebSocket.
 /// REST for anything the app initiates (login, arm, faces...); the
 /// WebSocket for everything the app just needs to *know about* as it
@@ -16,25 +49,39 @@ import 'backend_service.dart';
 /// python/backend/models.py) — this class fans that single message out
 /// into the individual streams the rest of the app expects, mirroring
 /// how MockBackendService's separate StreamControllers work.
+///
+/// Everything except `/health` and `/login` requires the session token
+/// returned by [login]. That token is held only in memory, deliberately: it
+/// is the credential that can disarm the alarm, so it should not outlive the
+/// process on a device that might be lost or stolen — the user re-enters the
+/// password on a cold start.
 class HttpBackendService implements BackendService {
   /// [baseUrl] is the FastAPI backend's HTTP origin (REST calls use it
   /// as-is; the WebSocket URL is derived from it in [_connect] by
-  /// swapping the scheme to ws/wss). Immediately kicks off the WebSocket
-  /// connection so live state starts flowing as soon as this service
-  /// exists, without waiting for the first widget to subscribe.
-  HttpBackendService({this.baseUrl = 'http://localhost:8000'}) {
-    _connect();
-  }
+  /// swapping the scheme to ws/wss).
+  ///
+  /// Unlike the previous version, this does *not* open the WebSocket
+  /// immediately — the backend now rejects an unauthenticated `/ws`
+  /// handshake, so connecting before [login] would just burn reconnect
+  /// attempts against a socket that can't be accepted yet. [login] opens it
+  /// once there's a token to present.
+  HttpBackendService({this.baseUrl = 'http://localhost:8000'});
 
   final String baseUrl;
+
+  /// Session token from [login]. Null while signed out, which is also what
+  /// makes [_connect] a no-op — there is nothing to authenticate with.
+  String? _token;
 
   final _alarmStateController = StreamController<AlarmState>.broadcast();
   final _eventLogController = StreamController<List<SecurityEvent>>.broadcast();
   final _sensorController = StreamController<List<SensorReading>>.broadcast();
   final _connectivityController = StreamController<bool>.broadcast();
+  final _boardsController = StreamController<List<BoardStatus>>.broadcast();
   final _facesController = StreamController<List<ApprovedFace>>.broadcast();
   final _cameraOnlineController = StreamController<bool>.broadcast();
   final _faceIdEnabledController = StreamController<bool>.broadcast();
+  final _errorController = StreamController<String>.broadcast();
 
   WebSocketChannel? _channel;
   StreamSubscription? _wsSub;
@@ -50,29 +97,50 @@ class HttpBackendService implements BackendService {
   @override
   Stream<bool> get connectivityStream => _connectivityController.stream;
   @override
+  Stream<List<BoardStatus>> get boardsStream => _boardsController.stream;
+  @override
   Stream<List<ApprovedFace>> get facesStream => _facesController.stream;
   @override
   Stream<bool> get cameraOnlineStream => _cameraOnlineController.stream;
   @override
   Stream<bool> get faceIdEnabledStream => _faceIdEnabledController.stream;
+  @override
+  Stream<String> get errorStream => _errorController.stream;
 
   // ---- WebSocket: receiving live state -------------------------------------
 
   /// Opens the WebSocket connection to the backend's `/ws` endpoint and
-  /// starts listening for state updates. Bails out immediately if
-  /// [dispose] has already run (guards against a reconnect timer firing
-  /// after disposal — see [_scheduleReconnect]). Both a synchronous
-  /// connection failure (caught here) and an async one (`onDone`/
-  /// `onError` on the subscription, e.g. the backend closing the socket
-  /// or dropping off the network) fall back to [_scheduleReconnect]
-  /// rather than surfacing an error, since there's no caller in a
-  /// position to handle a broadcast stream failing — the UI should just
-  /// keep retrying and show "offline" via [connectivityStream] instead.
+  /// starts listening for state updates. Bails out immediately if [dispose]
+  /// has already run (guards against a reconnect timer firing after
+  /// disposal), or if there's no token yet — the backend closes an
+  /// unauthenticated handshake with code 1008, so retrying without one would
+  /// just spin.
+  ///
+  /// The token goes in the query string rather than a header because neither
+  /// the browser WebSocket API nor `web_socket_channel` offers a portable way
+  /// to set headers on the handshake; the backend reads it from there (see
+  /// `websocket_endpoint` in python/backend/main.py).
+  ///
+  /// Both a synchronous connection failure (caught here) and an async one
+  /// (`onDone`/`onError` on the subscription, e.g. the backend closing the
+  /// socket or dropping off the network) fall back to [_scheduleReconnect]
+  /// rather than surfacing an error, since there's no caller in a position to
+  /// handle a broadcast stream failing — the UI should just keep retrying and
+  /// show "offline" via [connectivityStream] instead.
   void _connect() {
     if (_disposed) return;
-    final wsUrl = baseUrl.replaceFirst('http', 'ws');
+    final token = _token;
+    if (token == null) return;
+
+    // Only the scheme is rewritten, so a token or path containing "http"
+    // can't be mangled the way a blanket replaceFirst on the whole URL could.
+    final wsUrl = baseUrl.startsWith('https')
+        ? baseUrl.replaceFirst('https', 'wss')
+        : baseUrl.replaceFirst('http', 'ws');
     try {
-      _channel = WebSocketChannel.connect(Uri.parse('$wsUrl/ws'));
+      _channel = WebSocketChannel.connect(
+        Uri.parse('$wsUrl/ws?token=${Uri.encodeQueryComponent(token)}'),
+      );
       _wsSub = _channel!.stream.listen(
         _handleMessage,
         onDone: _scheduleReconnect,
@@ -88,9 +156,20 @@ class HttpBackendService implements BackendService {
   /// first so overlapping failures (e.g. `onError` then `onDone` for the
   /// same socket) don't stack up multiple pending reconnect attempts.
   void _scheduleReconnect() {
-    if (_disposed) return;
+    if (_disposed || _token == null) return;
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(seconds: 3), _connect);
+  }
+
+  /// Closes the WebSocket without scheduling a reconnect. Used on logout,
+  /// where the token that authenticated the socket is about to stop being
+  /// valid.
+  void _disconnect() {
+    _reconnectTimer?.cancel();
+    _wsSub?.cancel();
+    _wsSub = null;
+    _channel?.sink.close();
+    _channel = null;
   }
 
   /// Parses one `FullState` JSON message from the WebSocket (see
@@ -116,6 +195,15 @@ class HttpBackendService implements BackendService {
           .toList(),
     );
 
+    // Tolerated as absent so an app build can talk to a backend that predates
+    // per-board tracking without throwing on every state frame.
+    final boards = json['boards'] as List?;
+    if (boards != null) {
+      _boardsController.add(
+        boards.map((b) => _boardFromJson(b as Map<String, dynamic>)).toList(),
+      );
+    }
+
     _connectivityController.add(json['esp32_online'] as bool);
     _cameraOnlineController.add(json['camera_online'] as bool);
     _faceIdEnabledController.add(json['face_id_enabled'] as bool);
@@ -139,75 +227,129 @@ class HttpBackendService implements BackendService {
         category: EventCategory.values.byName(j['category'] as String),
       );
 
-  // ---- REST helpers ---------------------------------------------------------
-  // Networks fail — a dropped WiFi connection or an unreachable backend
-  // shouldn't crash the app. Callers get an empty map back and treat
-  // missing fields as their safe default (see the `as bool? ?? false`
-  // style casts below) rather than an unhandled exception.
-
-  /// POSTs [body] (default `{}`) as JSON to `$baseUrl$path` and returns
-  /// the decoded JSON response, or `{}` on any failure (unreachable host,
-  /// non-JSON body, empty body, etc.) — see the swallowing rationale in
-  /// the section comment above. Every REST-based method on this class is
-  /// built on this helper specifically so none of them need their own
-  /// try/catch.
-  Future<Map<String, dynamic>> _post(String path, [Map<String, dynamic>? body]) async {
-    try {
-      final response = await http.post(
-        Uri.parse('$baseUrl$path'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(body ?? {}),
+  /// Decodes one entry of the WebSocket message's `boards` array into a
+  /// [BoardStatus].
+  BoardStatus _boardFromJson(Map<String, dynamic> j) => BoardStatus(
+        name: j['name'] as String,
+        online: j['online'] as bool,
+        lastSeen: j['last_seen'] == null ? null : DateTime.parse(j['last_seen'] as String),
       );
-      if (response.body.isEmpty) return {};
-      return jsonDecode(response.body) as Map<String, dynamic>;
+
+  // ---- REST helpers ---------------------------------------------------------
+
+  /// Headers for an authenticated request: JSON content type plus the
+  /// session token, omitted while signed out so `/login` itself works.
+  Map<String, String> get _headers => {
+        'Content-Type': 'application/json',
+        if (_token != null) 'Authorization': 'Bearer $_token',
+      };
+
+  /// Turns an `http.Response` into a [_Result], tolerating an empty or
+  /// non-JSON body (several endpoints reply with a bare `{"ok":true}`, and
+  /// error responses may not be JSON at all).
+  _Result _decode(http.Response response) {
+    Map<String, dynamic> body = const {};
+    if (response.body.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) body = decoded;
+      } catch (_) {
+        // Non-JSON body (e.g. a plain-text proxy error). The status code is
+        // still meaningful, so this isn't treated as unreachable.
+      }
+    }
+    return _Result(statusCode: response.statusCode, body: body);
+  }
+
+  /// Reports a failed request on [errorStream], translating the two failure
+  /// modes into messages a user can act on. Returns the result unchanged so
+  /// callers can chain.
+  _Result _report(_Result result, String action) {
+    if (!result.reachable) {
+      _errorController.add("Couldn't reach the backend — $action may not have taken effect");
+    } else if (result.unauthorized) {
+      _errorController.add('Session expired — sign in again');
+    }
+    return result;
+  }
+
+  /// POSTs [body] (default `{}`) as JSON to `$baseUrl$path`.
+  Future<_Result> _post(String path, [Map<String, dynamic>? body]) async {
+    try {
+      return _decode(await http.post(
+        Uri.parse('$baseUrl$path'),
+        headers: _headers,
+        body: jsonEncode(body ?? {}),
+      ));
     } catch (_) {
-      return {};
+      return const _Result.unreachable();
     }
   }
 
-  /// GETs `$baseUrl$path` and returns the decoded JSON response, or `{}`
-  /// on any failure — same swallow-and-fall-back-to-empty contract as
-  /// [_post] (an empty/invalid body throws inside `jsonDecode`, which the
-  /// catch here turns into `{}` just like an unreachable host would).
-  Future<Map<String, dynamic>> _get(String path) async {
+  /// GETs `$baseUrl$path`.
+  Future<_Result> _get(String path) async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl$path'));
-      return jsonDecode(response.body) as Map<String, dynamic>;
+      return _decode(await http.get(Uri.parse('$baseUrl$path'), headers: _headers));
     } catch (_) {
-      return {};
+      return const _Result.unreachable();
     }
   }
 
   // ---- Auth -------------------------------------------------------------------
 
-  /// Posts [password] to `/login` and translates the backend's response
-  /// into a [LoginResult]. Every field falls back to its "nothing
-  /// happened" default (`ok: false`, no lockout, 0 attempts) so that a
-  /// swallowed network failure (see [_post]) reads as a declined login
-  /// rather than a crash — the user just sees "wrong password" instead
-  /// of an error dialog, and can retry once connectivity returns.
+  /// Posts [password] to `/login` and translates the backend's response into
+  /// a [LoginResult]. On success, stores the returned session token and opens
+  /// the WebSocket — the socket can't be authenticated before this point, so
+  /// login is what brings live state online.
+  ///
+  /// A transport failure surfaces on [errorStream] and comes back as a
+  /// declined login, so the user sees "couldn't reach the backend" rather
+  /// than being told their password was wrong.
   @override
   Future<LoginResult> login(String password) async {
     final res = await _post('/login', {'password': password});
+    if (!res.reachable) {
+      _errorController.add("Couldn't reach the backend — check the URL in Settings");
+      return const LoginResult(ok: false);
+    }
+
+    final token = res.body['token'] as String?;
+    if (token != null) {
+      _token = token;
+      _connect();
+    }
     return LoginResult(
-      ok: res['ok'] as bool? ?? false,
-      lockedOut: res['locked_out'] as bool? ?? false,
-      lockoutRemainingSeconds: res['lockout_remaining_seconds'] as int? ?? 0,
-      attemptsRemaining: res['attempts_remaining'] as int? ?? 0,
+      ok: res.body['ok'] as bool? ?? false,
+      lockedOut: res.body['locked_out'] as bool? ?? false,
+      lockoutRemainingSeconds: res.body['lockout_remaining_seconds'] as int? ?? 0,
+      attemptsRemaining: res.body['attempts_remaining'] as int? ?? 0,
     );
   }
 
-  /// Posts the old/new password pair to `/change-password`. Returns
-  /// `false` (rather than throwing) both when the backend rejects the
-  /// change and when the request itself fails, for the same
-  /// fail-safe-default reason as [login].
+  /// Revokes the session on the backend and tears down the authenticated
+  /// WebSocket. The local token is cleared even if the revoke call fails —
+  /// the user asked to sign out, and a token this app can no longer use is
+  /// strictly better than one it keeps sending.
+  @override
+  Future<void> logout() async {
+    if (_token != null) await _post('/logout');
+    _token = null;
+    _disconnect();
+  }
+
+  /// Posts the old/new password pair to `/change-password`. Returns `false`
+  /// both when the backend rejects the change and when the request fails,
+  /// with the latter distinguished on [errorStream].
   @override
   Future<bool> changePassword(String oldPassword, String newPassword) async {
-    final res = await _post('/change-password', {
-      'old_password': oldPassword,
-      'new_password': newPassword,
-    });
-    return res['ok'] as bool? ?? false;
+    final res = _report(
+      await _post('/change-password', {
+        'old_password': oldPassword,
+        'new_password': newPassword,
+      }),
+      'the password change',
+    );
+    return res.body['ok'] as bool? ?? false;
   }
 
   // ---- Arm / disarm -------------------------------------------------------------
@@ -215,71 +357,106 @@ class HttpBackendService implements BackendService {
   /// Tells the backend to arm in [mode]; the resulting state change is
   /// observed via [alarmStateStream]/[sensorStream] over the WebSocket,
   /// not from this call's response.
+  ///
+  /// The backend's reply also carries `hardware`, saying whether the door
+  /// controller board actually acknowledged the command. A false there means
+  /// the app's state and the physical panel may disagree, which is worth
+  /// telling the user about even though the request itself succeeded.
   @override
-  Future<void> arm(ArmMode mode) => _post('/arm', {'mode': mode.name});
+  Future<void> arm(ArmMode mode) async {
+    final res = _report(await _post('/arm', {'mode': mode.name}), 'arming');
+    if (res.ok && res.body['hardware'] == false) {
+      _errorController.add('Armed, but the door controller board did not respond');
+    }
+  }
 
-  /// Tells the backend to disarm; see [arm] re: how the result is
-  /// observed.
+  /// Tells the backend to disarm; see [arm] re: how the result is observed
+  /// and why `hardware` is surfaced.
   @override
-  Future<void> disarm() => _post('/disarm');
+  Future<void> disarm() async {
+    final res = _report(await _post('/disarm'), 'disarming');
+    if (res.ok && res.body['hardware'] == false) {
+      _errorController.add('Disarmed here, but the door controller board did not respond');
+    }
+  }
 
   /// Forwards a sensor/manual alert to the backend for it to evaluate and
   /// (if armed) escalate; see [BackendService.triggerAlert] for the
   /// no-op-when-disarmed contract, which the backend enforces here.
   @override
-  Future<void> triggerAlert({SensorType? source, required String reason}) =>
-      _post('/trigger-alert', {'source': source?.name, 'reason': reason});
+  Future<void> triggerAlert({SensorType? source, required String reason}) async {
+    _report(await _post('/trigger-alert', {'source': source?.name, 'reason': reason}),
+        'the test alert');
+  }
 
   // ---- Faces --------------------------------------------------------------------
 
   /// Registers a new approved face under [name].
   @override
-  Future<void> addFace(String name) => _post('/faces', {'name': name});
+  Future<void> addFace(String name) async {
+    _report(await _post('/faces', {'name': name}), 'adding the face');
+  }
 
-  // Note: unlike every other REST call on this class, this one calls
-  // `http.delete` directly instead of going through `_post`/`_get`, so it
-  // does NOT swallow network/HTTP errors — a failed request here throws
-  // instead of silently no-op'ing. Documentation-only pass: not changing
-  // this, just flagging the inconsistency.
+  /// Removes the approved face with the given [id]. Routed through the same
+  /// error handling as every other call — it used to call `http.delete`
+  /// directly, so unlike its siblings it threw on a network failure instead
+  /// of reporting one.
   @override
   Future<void> removeFace(String id) async {
-    await http.delete(Uri.parse('$baseUrl/faces/$id'));
+    _Result result;
+    try {
+      result = _decode(await http.delete(Uri.parse('$baseUrl/faces/$id'), headers: _headers));
+    } catch (_) {
+      result = const _Result.unreachable();
+    }
+    _report(result, 'removing the face');
   }
 
   /// Turns face-ID recognition on/off.
   @override
-  Future<void> setFaceIdEnabled(bool enabled) => _post('/face-id-enabled', {'enabled': enabled});
+  Future<void> setFaceIdEnabled(bool enabled) async {
+    _report(await _post('/face-id-enabled', {'enabled': enabled}), 'the Face ID toggle');
+  }
 
   /// Asks the backend's debug endpoint to simulate a face-recognition
   /// event (see [BackendService.simulateFaceRecognition]).
   @override
-  Future<void> simulateFaceRecognition() => _post('/debug/simulate-face-recognition');
+  Future<void> simulateFaceRecognition() async {
+    _report(await _post('/debug/simulate-face-recognition'), 'the recognition test');
+  }
 
   // ---- Settings -----------------------------------------------------------------
   // No dedicated GET endpoints for these — /state already carries them
   // (see python/backend/models.py FullState), so just read from there.
 
   @override
-  Future<bool> getNightMode() async => (await _get('/state'))['night_mode'] as bool? ?? false;
+  Future<bool> getNightMode() async =>
+      (await _get('/state')).body['night_mode'] as bool? ?? false;
 
   @override
-  Future<void> setNightMode(bool enabled) => _post('/settings/night-mode', {'enabled': enabled});
+  Future<void> setNightMode(bool enabled) async {
+    _report(await _post('/settings/night-mode', {'enabled': enabled}), 'the night-mode change');
+  }
 
   @override
   Future<String> getEmergencyNumber() async =>
-      (await _get('/state'))['emergency_number'] as String? ?? '';
+      (await _get('/state')).body['emergency_number'] as String? ?? '';
 
   @override
-  Future<void> setEmergencyNumber(String number) =>
-      _post('/settings/emergency-number', {'number': number});
+  Future<void> setEmergencyNumber(String number) async {
+    _report(await _post('/settings/emergency-number', {'number': number}),
+        'the emergency number change');
+  }
 
   @override
   Future<int> getPoliceCallDelaySeconds() async =>
-      (await _get('/state'))['police_call_delay_seconds'] as int? ?? 60;
+      (await _get('/state')).body['police_call_delay_seconds'] as int? ?? 60;
 
   @override
-  Future<void> setPoliceCallDelaySeconds(int seconds) =>
-      _post('/settings/police-call-delay', {'seconds': seconds});
+  Future<void> setPoliceCallDelaySeconds(int seconds) async {
+    _report(await _post('/settings/police-call-delay', {'seconds': seconds}),
+        'the response-delay change');
+  }
 
   /// Tears down the WebSocket connection and closes every stream
   /// controller. Sets [_disposed] first, before cancelling anything —
@@ -290,15 +467,15 @@ class HttpBackendService implements BackendService {
   @override
   void dispose() {
     _disposed = true;
-    _reconnectTimer?.cancel();
-    _wsSub?.cancel();
-    _channel?.sink.close();
+    _disconnect();
     _alarmStateController.close();
     _eventLogController.close();
     _sensorController.close();
     _connectivityController.close();
+    _boardsController.close();
     _facesController.close();
     _cameraOnlineController.close();
     _faceIdEnabledController.close();
+    _errorController.close();
   }
 }

@@ -139,6 +139,20 @@ camera. **מדבר בפועל עם ה-backend האמיתי** — `HttpBackendSer
 retransmitter דק שמשקף את מה ש-`login()` מחזיר, לא סופר ניסיונות בעצמו
 יותר.
 
+**מלכודת פונטים:** הפונטים (IBM Plex Sans/Mono, Big Shoulders Display)
+מצורפים כ-assets ב-`app/google_fonts/`. `google_fonts` מוריד מהרשת בזמן ריצה
+כברירת מחדל — מה שלא מתאים לאפליקציית אזעקה שצריכה להיקרא בלי אינטרנט, ובפרט
+כשכל תכנון הגישה מרחוק (Tailscale / `adb reverse`) מגיע לבקנד בלי route
+כללי לאינטרנט. **שמות הקבצים נושאים משמעות** — ההתאמה היא
+`<Family>-<Weight>.ttf` (ראה `_findFamilyWithVariantAssetPath` בחבילה), אז
+שינוי שם מחזיר בשקט את אותו face להורדה מהרשת.
+
+**מלכודת שגיאות רשת:** `HttpBackendService._post/_get` מחזירים `_Result` עם
+`reachable` — קודם הם בלעו כל שגיאה והחזירו `{}`, כך ש"הבקנד לא נגיש" נראה
+זהה ל"הבקנד אמר לא". במערכת אזעקה זה קונקרטי: לחיצה על DISARM בלי route
+לבקנד נראתה בדיוק כמו נטרול שהצליח. כשלים מגיעים ל-`AlarmService.lastError`
+ומוצגים כ-SnackBar ב-`MainShell`.
+
 **מלכודת Provider:** `AlarmService`/`AuthService` חייבים `lazy: false`
 ב-`main.dart`. הם נרשמים ל-broadcast streams של ה-backend בקונסטרקטור, וללא
 `lazy: false` הם לא נבנים עד שמשהו קורא להם לראשונה — כלומר אירועים
@@ -154,25 +168,73 @@ Messaging) דורש שהמשתמש ייצור פרויקט Firebase בעצמו (
 Gradle של Firebase תשבור את ה-build לגמרי. אל תוסיף firebase_core/
 firebase_messaging בלי לוודא שהקובץ קיים.
 
+## אבטחה — קרא לפני שנוגעים ב-API
+
+כל endpoint מוגן. שני סוגי אישורים, כי יש שני סוגי קוראים:
+
+- **האפליקציה** — `/login` מחזיר session token (`secrets.token_urlsafe`, תקף
+  12 שעות), שנשלח כ-`Authorization: Bearer`. הסיסמה נשמרת כ-hash (scrypt +
+  salt) ומושווית ב-`compare_digest`. שינוי סיסמה מבטל את כל שאר הסשנים.
+- **הלוחות** — מפתח משותף ב-`X-Device-Key` (או `?key=`), כי לוח לא יכול
+  לעשות login אינטראקטיבי. נוצר אוטומטית בהרצה ראשונה ונשמר ב-`state.json`,
+  או נקבע דרך `HOMEGUARD_DEVICE_KEY`.
+
+`/health` הוא היחיד הפתוח. ה-WebSocket מקבל טוקן ב-`?token=` (ל-WebSocket אין
+דרך ניידת להוסיף כותרות) ונסגר עם 1008 **לפני** `accept()`.
+
+**אם מוסיפים route חדש — הוא חייב `Depends(require_app)` או
+`Depends(require_device)`.** יש בדיקה פרמטרית ב-`tests/test_auth.py` עם טבלת
+כל ה-routes; הוסיפו אליה שורה, אחרת אין מי שיתפוס route ששכחו להגן עליו.
+
+**סודות לא בקוד:** `esp32/secrets.h` (gitignored, יש `.example`) מחזיק WiFi,
+כתובת בקנד, מפתח מכשיר וקוד קודן. קודם הם היו literals בשלושת ה-`.ino`.
+הערכים הישנים עדיין בהיסטוריית הגיט — לא נוקו בכוונה (החלטת המשתמש; `free-tau`
+היא רשת ציבורית של האוניברסיטה, לא סוד אמיתי).
+
 ## מצב הבקנד (python/)
 
-FastAPI, בנוי ונבדק end-to-end (ראה `python/README.md` לפירוט מלא, ו-
-`python/simulate.py` — סקריפט סימולציה חי, לא unit tests עם mocking, שרץ
-נגד שרת אמיתי ובודק כל endpoint כולל lockout מלא עם המתנה אמיתית של 30
-שניות. 51/51 עברו, גם אחרי restart של הבקנד לוודא שזה לא בודק bytecode
-ישן): login+lockout, arm/disarm עם עיכוב יציאה, alerts לפי חיישן ספציפי,
-faces CRUD, WebSocket `/ws` ששולח את כל ה-state בזמן אמת, וזיהוי פנים
-עובד (OpenCV — Haar cascade + LBPH, **לא** dlib/`face_recognition`
-בכוונה, כדי להימנע מ-build נייטיבי עם CMake/Visual Studio על המכונה הזו
-שכבר סבלה מספיק מבעיות toolchain). `backend/models.py` משקף 1:1 את
-`app/lib/services/backend_service.dart` — אם משנים שדה בצד אחד, לשנות
-גם בשני.
+FastAPI, בנוי ונבדק. פירוט מלא ב-`python/README.md`. **שתי חבילות בדיקות
+בכוונה:**
 
-**פערים ידועים, לא תוקנו בכוונה** (נמצאו תוך כדי pass תיעוד מקיף, ראה
-`python/README.md` לפירוט): `/arm`/`/disarm` מעדכנים state מקומי ומפקדים
-על החומרה לא-אטומית; `report_state_from_esp32` לא יכול להחיל מחדש את ה-
-bypass של Home mode כי הוא לא מקבל את ה-mode; הודעת הלוג של
-`set_night_mode` מתארת auto-arm שלא ממומש בפועל.
+- `pytest` (`python/tests/`) — 97 בדיקות in-process מול ה-ASGI app דרך
+  `httpx.ASGITransport`. בלי שרת, בלי פורטים, ובלי המתנות אמיתיות (פקיעת
+  lockout ו-heartbeat מיושן נבדקים בהזזת timestamps). כל בדיקה מקבלת התקנה
+  נקייה דרך reload של מודול ה-state לתיקייה זמנית. זה מה שמריצים תוך כדי
+  עבודה.
+- `simulate.py` — 78 בדיקות מול uvicorn אמיתי דרך סוקט אמיתי, כולל המתנה
+  אמיתית של 30 שניות ל-lockout ועוד 35 ל-timeout של לוח. איטי, אבל בודק גם
+  את שרת ה-ASGI ואת ה-WebSocket. מריצים לפני שמאמינים שזה עובד.
+
+גם `ruff` (config ב-`pyproject.toml`). הכול רץ ב-CI (`.github/workflows/ci.yml`).
+
+**persistence:** `state.json` (gitignored) שומר hash סיסמה, מפתח מכשיר, פנים,
+הגדרות ולוג אירועים — כתיבה אטומית (temp + `os.replace`). **`alarm_state` לא
+נשמר בכוונה** — בקנד שהופעל מחדש לא באמת יודע אם הבית דרוך; לעלות `disarmed`
+ולתת לדיווח הבא של בקר הדלת לקבוע זה מתקן את עצמו, בעוד ש-`armed` ישן היה גורם
+לאפליקציה להציג מצב שאף אחד לא אימת.
+
+**liveness של לוחות:** כל לוח שולח `/esp32/heartbeat?board=<name>` כל 10 שניות;
+לוח נחשב offline אחרי 30 שניות שקט, ו-`/state` מחזיר מערך `boards`. זה החליף
+דגל `esp32_online` בודד ש**ננעל על true** — אחרי heartbeat אחד שום דבר לא החזיר
+אותו, אז לוח יכול היה למות והאפליקציה המשיכה להראות ONLINE.
+
+**זיהוי פנים:** YuNet (detection) + SFace (recognition), שני קבצי ONNX
+ב-`python/models/`, שניהם נטענים על ידי `opencv-contrib-python` שכבר היה
+בפרויקט — בלי dependency חדש ובלי build נייטיבי. זה החליף Haar cascade + LBPH.
+**אל תחליף ל-`insightface` או ל-`face_recognition`** — שניהם דורשים
+MSVC/CMake על Windows, בדיוק הכאב שהפרויקט הזה כבר איבד עליו ימים. אם קבצי
+ה-ONNX חסרים, השירות נופל אוטומטית חזרה ל-Haar+LBPH עם אזהרה
+(`FaceRecognitionService.backend_name` אומר מי פעיל).
+
+`backend/models.py` משקף 1:1 את `app/lib/services/backend_service.dart` — אם
+משנים שדה בצד אחד, לשנות גם בשני. יש בדיקה
+(`test_state_shape_matches_the_flutter_client`) שנועלת את צורת ה-wire.
+
+**פערים ידועים, לא ממומשים בכוונה:** `/arm`/`/disarm` לא אטומיים מול החומרה
+(אבל התגובה מחזירה `hardware: bool` והאפליקציה מציגה את זה); דריכה מהקודן
+הפיזי לא נושאת mode, אז נופלים למצב האחרון שהאפליקציה ביקשה, בברירת מחדל Away
+(המחמיר); `emergency_number`/`police_call_delay_seconds` נשמרים אבל אף אחד לא
+מחייג; `night_mode` נשמר אבל אין scheduler.
 
 הרצה: `python\venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 מתוך `python/`.

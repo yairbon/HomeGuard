@@ -7,12 +7,12 @@ there too.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel
 
 
-class AlarmState(str, Enum):
+class AlarmState(StrEnum):
     """Overall system state shown in the app and driving alert logic.
 
     `transitional` is the exit-delay window between an arm request and the
@@ -27,7 +27,7 @@ class AlarmState(str, Enum):
     triggered = "triggered"
 
 
-class ArmMode(str, Enum):
+class ArmMode(StrEnum):
     """Which arm profile was requested. `home` bypasses the vibration
     sensor (people moving around inside shouldn't trip it); `away`
     bypasses nothing. The actual bypass assignment happens in
@@ -38,7 +38,7 @@ class ArmMode(str, Enum):
     home = "home"
 
 
-class EventCategory(str, Enum):
+class EventCategory(StrEnum):
     """Tag on a SecurityEvent used by the app to pick an icon/filter for
     the activity log."""
 
@@ -49,7 +49,7 @@ class EventCategory(str, Enum):
     info = "info"
 
 
-class SensorType(str, Enum):
+class SensorType(StrEnum):
     """Identifies which of the three ESP32 boards a sensor reading or
     event refers to."""
 
@@ -88,6 +88,26 @@ class ApprovedFace(BaseModel):
     name: str
 
 
+class BoardStatus(BaseModel):
+    """Liveness of one of the three ESP32 boards, derived from when it last
+    called `/esp32/heartbeat`.
+
+    Exists because a single aggregate `esp32_online` flag couldn't express
+    "the vibration board is dead but the other two are fine" — and, worse,
+    the old flag latched on: once any board had ever checked in, nothing
+    ever set it back to False, so a board could lose power and the app would
+    keep showing it as online indefinitely.
+
+    `last_seen` is None for a board that hasn't reported at all since the
+    backend started, which reads differently in the UI from a board that was
+    online and went quiet.
+    """
+
+    name: str
+    online: bool
+    last_seen: datetime | None = None
+
+
 class LoginRequest(BaseModel):
     password: str
 
@@ -96,9 +116,15 @@ class LoginResponse(BaseModel):
     """Result of a login attempt. Lockout/attempts fields are populated
     on both success and failure so the app can always show the current
     lockout countdown or remaining-attempts count, not just on failure.
+
+    `token` is the session token the app must send as
+    `Authorization: Bearer <token>` on every subsequent request — it is the
+    entire point of logging in. None on failure, so a caller that didn't
+    authenticate has nothing to send and every protected route will reject it.
     """
 
     ok: bool
+    token: str | None = None
     locked_out: bool = False
     lockout_remaining_seconds: int = 0
     attempts_remaining: int = 0
@@ -161,7 +187,10 @@ class FullState(BaseModel):
     sensors: list[SensorReading]
     events: list[SecurityEvent]
     faces: list[ApprovedFace]
+    # Aggregate "is any board reachable", kept for the app's single
+    # connectivity badge; `boards` carries the per-board detail behind it.
     esp32_online: bool
+    boards: list[BoardStatus]
     camera_online: bool
     face_id_enabled: bool
     night_mode: bool

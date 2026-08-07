@@ -1,0 +1,115 @@
+name: CI
+
+# Runs on every push and PR. The point is that nobody has to remember to run
+# the checks by hand — this project's history includes real bugs that a test
+# run would have caught immediately (an endpoint reachable with no
+# credentials, a 500 on a corrupt upload, a sensor bypass silently lost).
+on:
+  push:
+  pull_request:
+
+# A new push to the same branch makes the previous run's result irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (lint + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            python/requirements.txt
+            python/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        # In-process against the ASGI app — no server to start, no ports, and
+        # no real sleeps (clocks are shifted instead of waited out).
+        run: pytest -q
+
+  backend-live:
+    name: Backend (live end-to-end)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: python/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start the backend
+        # Not a secret: this key exists only for the duration of this job, on
+        # a throwaway runner with no hardware attached. The real one is
+        # generated per install (see backend/security.py).
+        env:
+          HOMEGUARD_DEVICE_KEY: ci-device-key
+        run: |
+          python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+
+      - name: Run the live simulation
+        # Slower than the pytest suite (it waits out real 30-second lockouts
+        # and a real board-heartbeat timeout), but it exercises the actual
+        # uvicorn server and WebSocket transport the app talks to.
+        env:
+          HOMEGUARD_DEVICE_KEY: ci-device-key
+        run: python simulate.py
+
+  app:
+    name: App (analyze + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Must provide Dart >= the SDK constraint in app/pubspec.yaml.
+          flutter-version: "3.44.9"
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        # Warnings included: this is a small codebase with no existing
+        # warning debt, so keeping it at zero is cheap.
+        run: flutter analyze --fatal-infos --fatal-warnings
+
+      - name: Tests
+        run: flutter test
+
+  # Deliberately not built here: the Android APK and the three ESP32
+  # sketches. The APK needs the Android SDK/NDK (several GB of runner setup
+  # for a course project that builds locally through WSL2), and the sketches
+  # need arduino-cli plus the esp32 core. Both are verified by hand — see
+  # esp32/README.md for the arduino-cli invocation that compiles the boards.
