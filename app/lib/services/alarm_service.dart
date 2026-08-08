@@ -30,6 +30,12 @@ class AlarmService extends ChangeNotifier {
   AlarmService(this._backend) {
     _stateSub = _backend.alarmStateStream.listen((state) {
       final justTriggered = state == AlarmState.triggered && _state != AlarmState.triggered;
+      // Entering the entry delay is its own notification-worthy moment: it
+      // means a door just opened on an armed system. Waiting for the alarm
+      // to actually fire would waste the whole countdown the user could
+      // have used to disarm.
+      final justEnteredEntryDelay =
+          state == AlarmState.entryDelay && _state != AlarmState.entryDelay;
       final enteredTransitional = state == AlarmState.transitional && _state != AlarmState.transitional;
       _state = state;
       if (enteredTransitional) {
@@ -42,6 +48,8 @@ class AlarmService extends ChangeNotifier {
         NotificationService.showAlert(
           _events.isNotEmpty ? _events.first.message : 'Intrusion detected',
         );
+      } else if (justEnteredEntryDelay) {
+        NotificationService.showAlert('Door opened — disarm the system');
       }
       notifyListeners();
     });
@@ -57,6 +65,18 @@ class AlarmService extends ChangeNotifier {
       _isOnline = online;
       notifyListeners();
     });
+    _boardsSub = _backend.boardsStream.listen((boards) {
+      _boards = boards;
+      notifyListeners();
+    });
+    // Infrastructural failures (backend unreachable, session expired) are
+    // held as `lastError` rather than pushed straight to a snackbar, so the
+    // widget layer decides how to present them and can clear them on
+    // acknowledgement. See BackendService.errorStream for why these exist.
+    _errorSub = _backend.errorStream.listen((message) {
+      _lastError = message;
+      notifyListeners();
+    });
     _facesSub = _backend.facesStream.listen((faces) {
       _faces = faces;
       notifyListeners();
@@ -67,6 +87,18 @@ class AlarmService extends ChangeNotifier {
     });
     _faceIdSub = _backend.faceIdEnabledStream.listen((enabled) {
       _faceIdEnabled = enabled;
+      notifyListeners();
+    });
+    _faceDisarmSub = _backend.faceDisarmEnabledStream.listen((enabled) {
+      _faceDisarmEnabled = enabled;
+      notifyListeners();
+    });
+    // Unlike the exit-delay countdown, this is not ticked locally: the door
+    // controller owns the real timer and the backend re-broadcasts what's
+    // left, so the number shown always comes from the authority rather than
+    // a second clock that could drift away from it.
+    _entryDelaySub = _backend.entryDelayStream.listen((seconds) {
+      _entryDelaySecondsRemaining = seconds;
       notifyListeners();
     });
   }
@@ -86,17 +118,25 @@ class AlarmService extends ChangeNotifier {
   late final StreamSubscription<List<SecurityEvent>> _logSub;
   late final StreamSubscription<List<SensorReading>> _sensorSub;
   late final StreamSubscription<bool> _connectivitySub;
+  late final StreamSubscription<List<BoardStatus>> _boardsSub;
+  late final StreamSubscription<String> _errorSub;
   late final StreamSubscription<List<ApprovedFace>> _facesSub;
   late final StreamSubscription<bool> _cameraOnlineSub;
   late final StreamSubscription<bool> _faceIdSub;
+  late final StreamSubscription<bool> _faceDisarmSub;
+  late final StreamSubscription<int> _entryDelaySub;
 
   AlarmState _state = AlarmState.disarmed;
   List<SecurityEvent> _events = const [];
   List<SensorReading> _sensors = const [];
   bool _isOnline = true;
+  List<BoardStatus> _boards = const [];
+  String? _lastError;
   List<ApprovedFace> _faces = const [];
   bool _isCameraOnline = true;
   bool _faceIdEnabled = true;
+  bool _faceDisarmEnabled = false;
+  int _entryDelaySecondsRemaining = 0;
   int _armingSecondsRemaining = 0;
   Timer? _armingTimer;
 
@@ -107,9 +147,30 @@ class AlarmService extends ChangeNotifier {
   List<SecurityEvent> get events => _events;
   List<SensorReading> get sensors => _sensors;
   bool get isOnline => _isOnline;
+
+  /// Per-board liveness for the dashboard (see [BoardStatus]). Empty until
+  /// the first state frame arrives, or when talking to a backend that
+  /// predates per-board tracking.
+  List<BoardStatus> get boards => _boards;
+
+  /// Boards the backend has stopped hearing from — the ones worth calling
+  /// out on the dashboard. An empty list means everything is reporting.
+  List<BoardStatus> get offlineBoards => _boards.where((b) => !b.online).toList();
+
+  /// Most recent infrastructural failure, or null if none is outstanding.
+  /// Cleared via [clearError] once shown.
+  String? get lastError => _lastError;
   List<ApprovedFace> get faces => _faces;
   bool get isCameraOnline => _isCameraOnline;
   bool get faceIdEnabled => _faceIdEnabled;
+
+  /// Whether a recognized face may disarm the system (opt-in — see
+  /// [BackendService.faceDisarmEnabledStream]).
+  bool get faceDisarmEnabled => _faceDisarmEnabled;
+
+  /// Seconds left to disarm during [AlarmState.entryDelay], straight from
+  /// the backend rather than a local ticker.
+  int get entryDelaySecondsRemaining => _entryDelaySecondsRemaining;
   /// Just the subset of [events] relevant to the Camera/face-ID tab,
   /// filtered by category rather than tracked as a separate list.
   List<SecurityEvent> get faceIdEvents =>
@@ -124,6 +185,7 @@ class AlarmService extends ChangeNotifier {
   Future<void> addFace(String name) => _backend.addFace(name);
   Future<void> removeFace(String id) => _backend.removeFace(id);
   Future<void> setFaceIdEnabled(bool enabled) => _backend.setFaceIdEnabled(enabled);
+  Future<void> setFaceDisarmEnabled(bool enabled) => _backend.setFaceDisarmEnabled(enabled);
 
   /// Demo-only: picks one of the currently-monitored (non-bypassed)
   /// sensors and triggers it, so the alert flow can be seen without real
@@ -138,6 +200,14 @@ class AlarmService extends ChangeNotifier {
 
   /// Demo-only pass-through (see [BackendService.simulateFaceRecognition]).
   void simulateFaceRecognition() => _backend.simulateFaceRecognition();
+
+  /// Marks [lastError] as handled, so the same message isn't shown twice on
+  /// the next rebuild. Called by the widget that displayed it.
+  void clearError() {
+    if (_lastError == null) return;
+    _lastError = null;
+    notifyListeners();
+  }
 
   /// Starts (or restarts) the display-only 1-second countdown shown on
   /// [AlarmStatusIndicator] while [state] is transitional. Counts down
@@ -167,9 +237,13 @@ class AlarmService extends ChangeNotifier {
     _logSub.cancel();
     _sensorSub.cancel();
     _connectivitySub.cancel();
+    _boardsSub.cancel();
+    _errorSub.cancel();
     _facesSub.cancel();
     _cameraOnlineSub.cancel();
     _faceIdSub.cancel();
+    _faceDisarmSub.cancel();
+    _entryDelaySub.cancel();
     _armingTimer?.cancel();
     super.dispose();
   }

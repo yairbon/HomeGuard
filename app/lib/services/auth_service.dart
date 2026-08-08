@@ -80,14 +80,23 @@ class AuthService extends ChangeNotifier {
     });
   }
 
-  /// Signs the user out locally. There's no server-side session/token to
-  /// invalidate — the backend's auth model is just a password check with
-  /// a failed-attempt counter (see python/backend/state.py) — so logging
-  /// out is purely a local flag flip; the next login re-checks the
-  /// password against the backend as normal.
-  void logout() {
-    _isAuthenticated = false;
-    notifyListeners();
+  /// Signs the user out, revoking the session token on the backend as well
+  /// as clearing the local flag.
+  ///
+  /// The server-side revoke is the part that matters: the backend now issues
+  /// a real session token that stays valid for hours and can arm or disarm
+  /// the system on its own, so a logout that only flipped a local boolean
+  /// would leave a working credential behind. The local flag is cleared
+  /// regardless of whether the revoke call reaches the backend — the user
+  /// asked to sign out, and an unreachable server is not a reason to keep
+  /// them signed in.
+  Future<void> logout() async {
+    try {
+      await _backend.logout();
+    } finally {
+      _isAuthenticated = false;
+      notifyListeners();
+    }
   }
 
   /// Cancels the countdown timer so it doesn't keep firing (and calling

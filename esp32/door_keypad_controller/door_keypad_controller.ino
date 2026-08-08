@@ -25,15 +25,24 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 
-// --- Network settings ---
-const char* ssid = "Free-TAU";
-const char* password = "free-tau";
+// WiFi credentials, backend address, the shared device key and the keypad
+// PIN all live in secrets.h, which is gitignored. Copy
+// esp32/secrets.h.example into this folder as secrets.h and fill it in.
+// These used to be literals in this file, which meant the WiFi password and
+// the disarm PIN were committed to the repository in plain text.
+#include "secrets.h"
 
-// The Python backend's address. Update to the real IP of the machine
-// running uvicorn (see python/README.md). Port 8000 is uvicorn's default
-// in this project.
-const char* backendHost = "192.168.X.X";  // TODO: set to the real IP
-const int backendPort = 8000;
+// --- Network settings ---
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+
+// The Python backend's address — see secrets.h.
+const char* backendHost = BACKEND_HOST;
+const int backendPort = BACKEND_PORT;
+
+// How this board identifies itself to the backend's per-board liveness
+// tracking (see BOARD_NAMES in python/backend/state.py).
+const char* BOARD_NAME = "door_controller";
 
 // This board also runs its OWN server on port 80, so the backend can
 // send it /arm and /disarm commands (see python/backend/esp32_client.py).
@@ -62,7 +71,7 @@ State currentState = DISARMED;
 
 // --- Keypad & Security Variables ---
 String enteredPin = "";
-const String SECRET_PIN = "1234";
+const String SECRET_PIN = KEYPAD_PIN;  // from secrets.h
 // TODO: this reads the "keypad" from the Serial Monitor (type digits +
 // '*' to arm / '#' to submit a PIN) — a deliberate stand-in for testing
 // the state machine before the physical 4x4 keypad is wired up. Once it
@@ -120,6 +129,13 @@ void setup() {
   Serial.print("My IP: ");
   Serial.println(WiFi.localIP());
 
+  // WebServer discards every request header it wasn't explicitly told to
+  // keep, so this line is load-bearing: without it server.header("X-Device-Key")
+  // always returns "" and authorized() would reject every legitimate command
+  // from the backend.
+  const char* collectedHeaders[] = {"X-Device-Key"};
+  server.collectHeaders(collectedHeaders, 1);
+
   server.on("/arm", HTTP_POST, handleRemoteArm);
   server.on("/disarm", HTTP_POST, handleRemoteDisarm);
   server.begin();
@@ -158,24 +174,54 @@ char getSimulatedKey() {
 
 // ---- Backend reporting (new) ------------------------------------------
 
+// Backend URL builder, so the host/port concatenation isn't repeated in
+// every reporting function below.
+String backendUrl(const char* path) {
+  return "http://" + String(backendHost) + ":" + String(backendPort) + String(path);
+}
+
 // Tells the backend this board's authoritative armed/disarmed state, so
 // the app reflects reality even when arming/disarming happens at the
 // physical keypad rather than through the app. Safe to call even if the
 // backend already knows — it no-ops on its side if nothing changed.
+//
+// This is the single most security-sensitive message this board sends: a
+// forged "armed:false" would make the app show a disarmed system. Hence the
+// X-Device-Key header, which the backend requires on every /esp32/* route.
 void reportStateChange(bool armed) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot report state — WiFi disconnected");
     return;
   }
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) + "/esp32/state-change";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/state-change"));
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   String body = armed ? "{\"armed\":true}" : "{\"armed\":false}";
   int code = http.POST(body);
-  if (code <= 0) {
+  if (code == 401) {
+    Serial.println("State report REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
+  } else if (code <= 0) {
     Serial.printf("Error reporting state: %s\n", http.errorToString(code).c_str());
   }
+  http.end();
+}
+
+// Tells the backend the disarm countdown has started, and how long it runs.
+//
+// Without this the board ran the whole ENTRY_TIME_LIMIT window silently and
+// only reported the outcome, so the app jumped straight from ARMED to
+// TRIGGERED — someone watching remotely never saw that a person had walked
+// in, and the person walking in had no countdown on their phone. The duration
+// is sent rather than hardcoded on the backend so changing ENTRY_TIME_LIMIT
+// here stays correct everywhere.
+void reportEntryDelay() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(backendUrl("/esp32/entry-delay"));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  http.POST("{\"seconds\":" + String(ENTRY_TIME_LIMIT / 1000) + "}");
   http.end();
 }
 
@@ -184,9 +230,9 @@ void reportStateChange(bool armed) {
 void reportDoorAlert() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) +
-               "/esp32/sensor-event?sensor=door&reason=Door%20not%20disarmed%20in%20time";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/sensor-event?sensor=door&board=door_controller"
+                        "&reason=Door%20not%20disarmed%20in%20time"));
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
 }
@@ -198,15 +244,32 @@ void reportDoorAlert() {
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) + "/esp32/heartbeat";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
 }
 
 // ---- Remote control (new) ----------------------------------------------
-// Only reachable from the backend, which itself only calls this from the
-// app's own arm/disarm buttons — see esp32_client.py.
+// Called by the backend, which itself only calls it from the app's own
+// arm/disarm buttons — see esp32_client.py.
+
+// Verifies the caller presented the shared device key, replying 401 and
+// returning false if not.
+//
+// This board listens on port 80 for anything on the local network, and
+// /disarm unconditionally silences a sounding alarm — so without this check,
+// anyone who found this board's IP could disarm the system with a single
+// unauthenticated POST. The backend sends the key as X-Device-Key on every
+// command (see _post in python/backend/esp32_client.py).
+bool authorized() {
+  if (server.hasHeader("X-Device-Key") && server.header("X-Device-Key") == String(DEVICE_KEY)) {
+    return true;
+  }
+  Serial.println("\n[REMOTE] Rejected a command with a missing/wrong device key");
+  server.send(401, "text/plain", "Unauthorized");
+  return false;
+}
 
 // WebServer handler for POST /arm. Pulls the mode out of the JSON body
 // with a plain substring search instead of a real JSON parser — no JSON
@@ -218,6 +281,7 @@ void sendHeartbeat() {
 // (state.py bypasses the vibration sensor's alerts in Home mode
 // regardless of what this board reports).
 void handleRemoteArm() {
+  if (!authorized()) return;
   String body = server.arg("plain");
   bool isHomeMode = body.indexOf("home") >= 0;
   Serial.print("\n[REMOTE] Arm requested via app (");
@@ -241,6 +305,7 @@ void handleRemoteArm() {
 // mid-ALARM), so it unconditionally resets to DISARMED, clears any
 // partially-typed PIN, and cuts the buzzers.
 void handleRemoteDisarm() {
+  if (!authorized()) return;
   Serial.println("\n[REMOTE] Disarm requested via app");
   currentState = DISARMED;
   enteredPin = "";
@@ -347,6 +412,7 @@ void loop() {
         lastBeepTime = millis();
         isBuzzerCurrentlyOn = false;
         Serial.println("\nWARNING: Door opened! Enter PIN to disarm.");
+        reportEntryDelay();
       }
       break;
 

@@ -62,6 +62,7 @@ class HomeScreen extends StatelessWidget {
               _StatusHeadline(
                 state: alarm.state,
                 armingSecondsRemaining: alarm.armingSecondsRemaining,
+                entryDelaySecondsRemaining: alarm.entryDelaySecondsRemaining,
               ),
               const SizedBox(height: 28),
               // A single control-panel card groups sensor status and the
@@ -127,6 +128,15 @@ class HomeScreen extends StatelessWidget {
                   ],
                 ),
               ),
+              // Surfaced above recent activity, not buried in it: a board
+              // that stopped reporting is a hole in the system's coverage,
+              // and the previous single ONLINE badge could never show it —
+              // it latched on after the first heartbeat and stayed on even
+              // when a board lost power.
+              if (alarm.offlineBoards.isNotEmpty) ...[
+                const SizedBox(height: 20),
+                _OfflineBoardsBanner(boards: alarm.offlineBoards),
+              ],
               const SizedBox(height: 28),
               _RecentEvents(events: alarm.events),
               // Demo-only escape hatch: lets anyone see the full alert flow
@@ -151,6 +161,61 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
+/// Warning strip naming the ESP32 boards the backend has stopped hearing
+/// from.
+///
+/// Deliberately styled as a warning rather than an error: the system is still
+/// running and the other boards still report, but the named ones are no
+/// longer covering anything — which is exactly the failure an alarm system
+/// must not hide. Only rendered when at least one board is offline, so a
+/// healthy system shows nothing here.
+class _OfflineBoardsBanner extends StatelessWidget {
+  const _OfflineBoardsBanner({required this.boards});
+
+  final List<BoardStatus> boards;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: AppColors.transitional.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.transitional.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          HomeGuardIcon(HGIcon.armAway, size: 18, color: AppColors.transitional),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  boards.length == 1 ? 'SENSOR OFFLINE' : 'SENSORS OFFLINE',
+                  style: AppTheme.displayStyle(
+                    fontSize: 14,
+                    color: AppColors.transitional,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${boards.map((b) => b.label).join(', ')} '
+                  '${boards.length == 1 ? 'has' : 'have'} stopped reporting',
+                  style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Large, high-contrast status announcement shown below the ring.
 ///
 /// The ring communicates state visually (closed/broken loop, color,
@@ -159,10 +224,15 @@ class HomeScreen extends StatelessWidget {
 /// subtitle, instead of a small caption squeezed inside the ring's own
 /// bounding box where it used to compete with the glow for contrast.
 class _StatusHeadline extends StatelessWidget {
-  const _StatusHeadline({required this.state, required this.armingSecondsRemaining});
+  const _StatusHeadline({
+    required this.state,
+    required this.armingSecondsRemaining,
+    required this.entryDelaySecondsRemaining,
+  });
 
   final AlarmState state;
   final int armingSecondsRemaining;
+  final int entryDelaySecondsRemaining;
 
   /// One-line plain-language explanation of [state], shown under the
   /// badge. The transitional case is dynamic — it counts down alongside
@@ -179,6 +249,12 @@ class _StatusHeadline extends StatelessWidget {
         return armingSecondsRemaining > 0
             ? 'Exiting — arms in ${armingSecondsRemaining}s'
             : 'Exiting now';
+      case AlarmState.entryDelay:
+        // The most time-critical line in the app: somebody just opened the
+        // door on an armed system and this is the countdown they're racing.
+        return entryDelaySecondsRemaining > 0
+            ? 'Door opened — alarm in ${entryDelaySecondsRemaining}s'
+            : 'Door opened — enter your code';
     }
   }
 

@@ -12,9 +12,22 @@ class MockBackendService implements BackendService {
   final _eventLogController = StreamController<List<SecurityEvent>>.broadcast();
   final _sensorController = StreamController<List<SensorReading>>.broadcast();
   final _connectivityController = StreamController<bool>.broadcast();
+  final _boardsController = StreamController<List<BoardStatus>>.broadcast();
   final _facesController = StreamController<List<ApprovedFace>>.broadcast();
   final _cameraOnlineController = StreamController<bool>.broadcast();
   final _faceIdEnabledController = StreamController<bool>.broadcast();
+  final _faceDisarmEnabledController = StreamController<bool>.broadcast();
+  final _entryDelayController = StreamController<int>.broadcast();
+  // Never emitted on: the mock has no network to fail, so there is nothing
+  // infrastructural to report. Present only to satisfy the interface.
+  final _errorController = StreamController<String>.broadcast();
+
+  /// All three boards reported healthy, since there's no hardware to model.
+  static const _mockBoards = [
+    BoardStatus(name: 'ultrasonic', online: true),
+    BoardStatus(name: 'vibration', online: true),
+    BoardStatus(name: 'door_controller', online: true),
+  ];
 
   AlarmState _state = AlarmState.disarmed;
   final List<SecurityEvent> _events = [];
@@ -30,11 +43,15 @@ class MockBackendService implements BackendService {
     const ApprovedFace(id: '2', name: 'Yair Bonfil'),
   ];
   bool _faceIdEnabled = true;
+  // Matches the backend default: face-disarm is opt-in.
+  bool _faceDisarmEnabled = false;
   int _nextFaceId = 3;
 
   bool _nightMode = false;
   String _emergencyNumber = '';
   int _policeCallDelaySeconds = 60;
+  String _ntfyServer = 'https://ntfy.sh';
+  String _ntfyTopic = '';
 
   /// Sets up the in-memory state and, on the next microtask, publishes the
   /// initial values on the streams that need a first value (connectivity,
@@ -48,8 +65,11 @@ class MockBackendService implements BackendService {
     // the camera's own connection status separately.
     scheduleMicrotask(() {
       _connectivityController.add(true);
+      _boardsController.add(_mockBoards);
       _cameraOnlineController.add(true);
       _faceIdEnabledController.add(_faceIdEnabled);
+      _faceDisarmEnabledController.add(_faceDisarmEnabled);
+      _entryDelayController.add(0);
       _facesController.add(List.unmodifiable(_faces));
     });
   }
@@ -67,6 +87,12 @@ class MockBackendService implements BackendService {
   Stream<bool> get connectivityStream => _connectivityController.stream;
 
   @override
+  Stream<List<BoardStatus>> get boardsStream => _boardsController.stream;
+
+  @override
+  Stream<String> get errorStream => _errorController.stream;
+
+  @override
   Stream<List<ApprovedFace>> get facesStream => _facesController.stream;
 
   @override
@@ -74,6 +100,12 @@ class MockBackendService implements BackendService {
 
   @override
   Stream<bool> get faceIdEnabledStream => _faceIdEnabledController.stream;
+
+  @override
+  Stream<bool> get faceDisarmEnabledStream => _faceDisarmEnabledController.stream;
+
+  @override
+  Stream<int> get entryDelayStream => _entryDelayController.stream;
 
   /// Checks [password] against the in-memory password. The artificial
   /// delay simulates network latency so UI loading states (spinners) have
@@ -94,6 +126,12 @@ class MockBackendService implements BackendService {
     // backend, which is the actual authority on it.
     return LoginResult(ok: ok, attemptsRemaining: ok ? 3 : 2);
   }
+
+  /// No-op: the mock has no session to invalidate, since it never issued a
+  /// token. Present so [AuthService.logout] can call the same method against
+  /// either implementation.
+  @override
+  Future<void> logout() async {}
 
   /// Changes the stored password, provided [oldPassword] matches the
   /// current one and [newPassword] isn't blank. Returns whether the
@@ -231,6 +269,13 @@ class MockBackendService implements BackendService {
     _faceIdEnabledController.add(_faceIdEnabled);
   }
 
+  /// Mirrors the backend's opt-in face-disarm toggle.
+  @override
+  Future<void> setFaceDisarmEnabled(bool enabled) async {
+    _faceDisarmEnabled = enabled;
+    _faceDisarmEnabledController.add(enabled);
+  }
+
   @override
   Future<bool> getNightMode() async => _nightMode;
 
@@ -263,6 +308,28 @@ class MockBackendService implements BackendService {
   Future<void> setPoliceCallDelaySeconds(int seconds) async {
     await Future.delayed(const Duration(milliseconds: 200));
     _policeCallDelaySeconds = seconds;
+  }
+
+  @override
+  Future<NtfyConfig> getNtfyConfig() async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    return NtfyConfig(server: _ntfyServer, topic: _ntfyTopic);
+  }
+
+  @override
+  Future<void> setNtfyConfig(String server, String topic) async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    _ntfyServer = server.trim().isEmpty ? 'https://ntfy.sh' : server.trim();
+    _ntfyTopic = topic.trim();
+  }
+
+  /// Reports success whenever a topic is set. The mock has no network, so
+  /// nothing is actually sent — enough for UI work, and the real delivery
+  /// path is covered by the backend's own tests.
+  @override
+  Future<bool> sendTestNotification() async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    return _ntfyTopic.isNotEmpty;
   }
 
   /// Clears every sensor back to "ok" and not bypassed. Used on disarm so
@@ -318,8 +385,12 @@ class MockBackendService implements BackendService {
     _eventLogController.close();
     _sensorController.close();
     _connectivityController.close();
+    _boardsController.close();
+    _errorController.close();
     _facesController.close();
     _cameraOnlineController.close();
     _faceIdEnabledController.close();
+    _faceDisarmEnabledController.close();
+    _entryDelayController.close();
   }
 }

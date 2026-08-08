@@ -1,8 +1,20 @@
-fastapi
-uvicorn[standard]
-pydantic
-python-multipart
-websockets
-opencv-contrib-python
-numpy
-httpx
+# Pinned to the exact versions this backend was verified against.
+#
+# Previously unpinned, which meant `pip install -r requirements.txt` resolved
+# to whatever was newest that day. That is a live hazard here specifically:
+# the recognizer depends on OpenCV's contrib modules, and `cv2.face` (the
+# legacy LBPH fallback) is a contrib API that has moved between major
+# versions — a fresh install months from now could silently stop importing.
+#
+# Compatible-release (~=) rather than == so security patches still land, but
+# a major/minor bump has to be a deliberate edit. To move deliberately:
+# bump a line, run `pytest` and `python simulate.py`, and commit the result.
+
+fastapi~=0.141.1
+uvicorn[standard]~=0.52.1
+pydantic~=2.13.4
+python-multipart~=0.0.32
+websockets~=17.0.1
+opencv-contrib-python~=5.0.0.93
+numpy~=2.4.6
+httpx~=0.28.1

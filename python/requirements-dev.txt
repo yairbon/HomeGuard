@@ -1,0 +1,14 @@
+# Development/CI-only tooling. Not needed to run the backend.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# pytest-asyncio is required because the state layer is almost entirely
+# `async def` — its methods await broadcasts and schedule timer tasks, so
+# testing them means running them on a real event loop rather than mocking
+# one out.
+
+-r requirements.txt
+
+pytest~=9.0
+pytest-asyncio~=1.3
+ruff~=0.15

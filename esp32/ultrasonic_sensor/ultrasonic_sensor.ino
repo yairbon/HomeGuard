@@ -12,14 +12,24 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// --- הגדרות רשת ---
-const char* ssid = "Free-TAU";
-const char* password = "free-tau";
+// כל הסודות (SSID, סיסמה, כתובת הבקנד, מפתח המכשיר) יושבים ב-secrets.h,
+// שלא נכנס לגיט. העתק את esp32/secrets.h.example לתיקייה הזו בשם secrets.h
+// ומלא את הערכים. קודם הם היו כתובים כאן ישירות — כלומר נשמרו בהיסטוריית
+// הגיט בטקסט גלוי.
+#include "secrets.h"
 
-// כתובת שרת הפייתון (הבקנד). עדכן ל-IP האמיתי של המחשב שמריץ אותו
-// (uvicorn, פורט 8000 כברירת מחדל — ראה python/README.md).
-const char* backendHost = "192.168.X.X";  // TODO: לעדכן ל-IP האמיתי
-const int backendPort = 8000;
+// --- הגדרות רשת ---
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+
+// כתובת שרת הפייתון (הבקנד) — ראה secrets.h.
+const char* backendHost = BACKEND_HOST;
+const int backendPort = BACKEND_PORT;
+
+// שם הלוח הזה, כפי שהבקנד מזהה אותו. הבקנד עוקב אחרי כל לוח בנפרד
+// (ראה BOARD_NAMES ב-python/backend/state.py) כדי שהאפליקציה תוכל להראות
+// איזה לוח בדיוק מת, במקום דגל אחד משותף לשלושתם.
+const char* BOARD_NAME = "ultrasonic";
 
 // --- הגדרות פינים לחיישן האולטרה-סוני (HC-SR04) ---
 const int trigPin = 14;
@@ -78,9 +88,18 @@ float getDistance() {
   return duration * 0.034 / 2;
 }
 
+// בסיס ה-URL של הבקנד, מורכב פעם אחת במקום בכל קריאה.
+String backendUrl(const char* path) {
+  return "http://" + String(backendHost) + ":" + String(backendPort) + String(path);
+}
+
 // שולח דיווח פריצה לבקנד. ה-endpoint האמיתי מצפה ל-POST עם
 // sensor ו-reason כ-query parameters (לא body) — ראה
 // python/backend/main.py, esp32_sensor_event().
+//
+// כותרת X-Device-Key היא החובה החדשה: בלעדיה הבקנד מחזיר 401. זה מה
+// שמונע ממישהו אחר ברשת לזייף דיווח פריצה (או, גרוע מכך, לזייף דיווח
+// "המערכת נוטרלה").
 void sendAlert() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send alert — WiFi disconnected");
@@ -88,12 +107,14 @@ void sendAlert() {
   }
 
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) +
-               "/esp32/sensor-event?sensor=ultrasonic&reason=Ultrasonic%20sensor%20breached";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/sensor-event?sensor=ultrasonic&board=ultrasonic"
+                        "&reason=Ultrasonic%20sensor%20breached"));
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   int httpResponseCode = http.POST("");  // גוף ריק — כל המידע ב-query string
 
-  if (httpResponseCode > 0) {
+  if (httpResponseCode == 401) {
+    Serial.println("Alert REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
+  } else if (httpResponseCode > 0) {
     Serial.printf("Alert sent successfully. Server responded: %d\n", httpResponseCode);
   } else {
     Serial.printf("Error sending alert: %s\n", http.errorToString(httpResponseCode).c_str());
@@ -101,14 +122,15 @@ void sendAlert() {
   http.end();
 }
 
-// שולח פינג "אני חי" לבקנד (ראו הסבר על ה-heartbeat למעלה). בניגוד
-// ל-sendAlert, לא בודקים כאן את קוד התגובה — אם זה נכשל, פשוט ננסה שוב
-// בסבב הבא (10 שניות), אין צורך בטיפול מיוחד בכישלון חד-פעמי.
+// שולח פינג "אני חי" לבקנד (ראו הסבר על ה-heartbeat למעלה). מדווח את שם
+// הלוח (board=), כדי שהבקנד יידע מי בדיוק מדבר. בניגוד ל-sendAlert, לא
+// בודקים כאן את קוד התגובה — אם זה נכשל, פשוט ננסה שוב בסבב הבא (10
+// שניות), אין צורך בטיפול מיוחד בכישלון חד-פעמי.
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "http://" + String(backendHost) + ":" + String(backendPort) + "/esp32/heartbeat";
-  http.begin(url);
+  http.begin(backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
 }

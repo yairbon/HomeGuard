@@ -1,0 +1,330 @@
+"""Face-disarm, the entry-delay window, and the night-mode schedule.
+
+All three replace behaviour that was previously either absent or dishonest:
+recognizing a face did nothing, the entry countdown was invisible to the app,
+and the night-mode switch was stored but never acted on while the UI claimed
+it auto-armed.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+
+from backend.models import AlarmState, ArmMode, SensorType
+
+from .test_alarm_flow import arm_now
+
+# ---- Face disarm -----------------------------------------------------------
+
+
+async def test_face_disarm_is_off_by_default(state):
+    """The safe default. Enabling it lowers disarming from "knows the PIN or
+    password" to "has a photo of a resident", so it must be a deliberate
+    choice rather than something a user gets without asking.
+    """
+    assert state.face_disarm_enabled is False
+
+    await arm_now(state, ArmMode.away)
+    await state.log_face_recognized("Guy Bar")
+    assert state.alarm_state == AlarmState.armed
+
+
+async def test_recognized_face_disarms_when_enabled(state):
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+
+    disarmed = await state.log_face_recognized("Guy Bar")
+    assert disarmed is True
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_recognized_face_clears_a_sounding_alarm(state):
+    """Disarming matters most once the alarm is already going off — that's
+    the moment someone is standing at their own door being shouted at."""
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(SensorType.door, "door opened")
+    assert state.alarm_state == AlarmState.triggered
+
+    assert await state.log_face_recognized("Yair Bonfil") is True
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_recognized_face_disarms_during_entry_delay(state):
+    """The normal case: you walk in, the countdown starts, the camera sees
+    you before it runs out."""
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(25)
+    assert state.alarm_state == AlarmState.entryDelay
+
+    assert await state.log_face_recognized("Guy Bar") is True
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_recognition_while_disarmed_is_only_logged(state):
+    """Nothing to disarm, so this is purely an audit entry — and must not
+    produce a spurious "Disarmed by Face ID" record."""
+    await state.set_face_disarm_enabled(True)
+    assert await state.log_face_recognized("Guy Bar") is False
+    assert state.alarm_state == AlarmState.disarmed
+    assert not any("Disarmed by Face ID" in e.message for e in state.events)
+
+
+async def test_face_disarm_is_recorded_in_the_log(state):
+    """Who turned the alarm off, and how, is exactly what an activity log is
+    for."""
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+    await state.log_face_recognized("Guy Bar")
+
+    messages = [e.message for e in state.events]
+    assert any("Disarmed by Face ID: Guy Bar" in m for m in messages)
+
+
+async def test_toggling_face_disarm_is_itself_logged(state):
+    """Changing what it takes to disarm the alarm is a security event."""
+    await state.set_face_disarm_enabled(True)
+    assert any("Face ID disarm enabled" in e.message for e in state.events)
+
+
+async def test_face_disarm_setting_survives_a_restart(monkeypatch, tmp_path):
+    import importlib
+    from pathlib import Path
+
+    from .conftest import DEVICE_KEY
+
+    state_file = Path(tmp_path) / "fd-state.json"
+    monkeypatch.setenv("HOMEGUARD_STATE_FILE", str(state_file))
+    monkeypatch.setenv("HOMEGUARD_DEVICE_KEY", DEVICE_KEY)
+
+    from backend import state as state_module
+
+    importlib.reload(state_module)
+    await state_module.state.set_face_disarm_enabled(True)
+
+    importlib.reload(state_module)
+    assert state_module.state.face_disarm_enabled is True
+
+
+# ---- Entry delay -----------------------------------------------------------
+
+
+async def test_entry_delay_only_starts_from_armed(state):
+    """A door opening on a disarmed system is just a door opening."""
+    await state.begin_entry_delay(25)
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_entry_delay_exposes_a_countdown(state):
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(25)
+
+    assert state.alarm_state == AlarmState.entryDelay
+    # Derived from a deadline, so it's within a second of the requested value.
+    assert 23 <= state.entry_delay_seconds_remaining <= 25
+
+
+async def test_entry_delay_countdown_is_zero_in_other_states(state):
+    await arm_now(state, ArmMode.away)
+    assert state.entry_delay_seconds_remaining == 0
+
+
+async def test_entry_delay_escalates_to_the_alarm(state):
+    """When the controller's countdown expires it sends its door alert, and
+    that has to be able to escalate from `entryDelay` — not just from
+    `armed`."""
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(25)
+    await state.trigger_alert(SensorType.door, "not disarmed in time")
+    assert state.alarm_state == AlarmState.triggered
+
+
+async def test_disarming_clears_the_entry_countdown(state):
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(25)
+    await state.disarm()
+
+    assert state.alarm_state == AlarmState.disarmed
+    assert state.entry_delay_seconds_remaining == 0
+
+
+async def test_entry_delay_route_requires_the_device_key(client):
+    assert (await client.post("/esp32/entry-delay", json={"seconds": 25})).status_code == 401
+
+
+async def test_entry_delay_route_works(auth_client, device_headers, state):
+    await state.arm(ArmMode.away)
+    state._arming_task.cancel()
+    state.alarm_state = AlarmState.armed
+
+    response = await auth_client.post(
+        "/esp32/entry-delay", json={"seconds": 25}, headers=device_headers
+    )
+    assert response.status_code == 200
+
+    body = (await auth_client.get("/state")).json()
+    assert body["alarm_state"] == "entryDelay"
+    assert body["entry_delay_seconds_remaining"] > 0
+
+
+# ---- Night-mode schedule ---------------------------------------------------
+
+
+async def test_night_mode_off_does_nothing(state):
+    """The scheduler must be inert unless the user turned it on."""
+    assert state.night_mode is False
+    await state._night_mode_tick(datetime(2026, 8, 7, 23, 0))
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_night_mode_arms_at_the_configured_hour(state):
+    """The behaviour the UI has always claimed and never had."""
+    await state.set_night_mode(True)
+    await state._night_mode_tick(datetime(2026, 8, 7, 23, 0))
+
+    # arm() starts the exit delay rather than jumping straight to armed.
+    assert state.alarm_state == AlarmState.transitional
+    assert any("Night mode — arming automatically" in e.message for e in state.events)
+
+
+async def test_night_mode_disarms_at_the_configured_hour(state):
+    await state.set_night_mode(True)
+    await arm_now(state, ArmMode.home)
+    await state._night_mode_tick(datetime(2026, 8, 8, 7, 0))
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_night_mode_never_silences_a_live_alarm(state):
+    """The most important restraint here. If the alarm is going off at 06:59,
+    the schedule reaching 07:00 must not turn it off — only a human decides
+    that an alert is over.
+    """
+    await state.set_night_mode(True)
+    await arm_now(state, ArmMode.home)
+    await state.trigger_alert(SensorType.door, "break-in")
+    assert state.alarm_state == AlarmState.triggered
+
+    await state._night_mode_tick(datetime(2026, 8, 8, 7, 0))
+    assert state.alarm_state == AlarmState.triggered
+
+
+async def test_night_mode_does_not_interrupt_an_entry_delay(state):
+    """Someone walking in at exactly 07:00 should get their countdown, not a
+    surprise auto-disarm that hides the entry from the log."""
+    await state.set_night_mode(True)
+    await arm_now(state, ArmMode.home)
+    await state.begin_entry_delay(25)
+
+    await state._night_mode_tick(datetime(2026, 8, 8, 7, 0))
+    assert state.alarm_state == AlarmState.entryDelay
+
+
+async def test_night_mode_only_acts_on_the_hour(state):
+    """Otherwise a deliberate 23:30 disarm would be undone a minute later,
+    and again every minute until midnight."""
+    await state.set_night_mode(True)
+    await state._night_mode_tick(datetime(2026, 8, 7, 23, 30))
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_night_mode_does_not_rearm_an_armed_system(state):
+    """Arming is only attempted from `disarmed`, so hitting the arm hour
+    while already armed is a no-op rather than a restarted exit delay."""
+    await state.set_night_mode(True)
+    await arm_now(state, ArmMode.away)
+    await state._night_mode_tick(datetime(2026, 8, 7, 23, 0))
+    assert state.alarm_state == AlarmState.armed
+
+
+async def test_night_mode_hours_are_configurable_and_clamped(state):
+    await state.set_night_mode_hours(1, 9)
+    assert (state.night_mode_arm_hour, state.night_mode_disarm_hour) == (1, 9)
+
+    # Out-of-range values are clamped rather than rejected, so an older or
+    # buggy client can't put the schedule into an impossible state.
+    await state.set_night_mode_hours(99, -5)
+    assert (state.night_mode_arm_hour, state.night_mode_disarm_hour) == (23, 0)
+
+
+async def test_night_mode_uses_the_configured_hours(state):
+    await state.set_night_mode(True)
+    await state.set_night_mode_hours(1, 9)
+
+    await state._night_mode_tick(datetime(2026, 8, 7, 23, 0))
+    assert state.alarm_state == AlarmState.disarmed  # no longer the arm hour
+
+    await state._night_mode_tick(datetime(2026, 8, 8, 1, 0))
+    assert state.alarm_state == AlarmState.transitional
+
+
+# ---- Escalation ------------------------------------------------------------
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    """Captures pushes (see test_notifications.py for the same pattern)."""
+    calls: list[dict] = []
+
+    async def fake_send(server, topic, title, message, priority, tags):
+        calls.append({"title": title, "message": message, "priority": priority})
+
+    from backend import notifier
+
+    monkeypatch.setattr(notifier, "_send", fake_send)
+    return calls
+
+
+async def test_escalation_fires_if_the_alarm_is_not_cleared(state, sent, monkeypatch):
+    """`emergency_number` and `police_call_delay_seconds` previously drove
+    nothing at all — stored settings with no code behind them, while the UI
+    said the number would be auto-called."""
+    await state.set_ntfy("https://ntfy.example", "topic")
+    await state.set_emergency_number("100")
+    await state.set_police_call_delay(0)  # fire immediately
+
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(SensorType.door, "break-in")
+
+    import asyncio
+
+    await asyncio.sleep(0.05)
+
+    escalations = [c for c in sent if "NOT CLEARED" in c["title"]]
+    assert len(escalations) == 1
+    assert "Call 100" in escalations[0]["message"]
+    assert escalations[0]["priority"] == "urgent"
+
+
+async def test_disarming_in_time_cancels_the_escalation(state, sent):
+    """Acknowledging the alarm is exactly what should stop the follow-up."""
+    import asyncio
+
+    await state.set_ntfy("https://ntfy.example", "topic")
+    await state.set_police_call_delay(1)
+
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(SensorType.door, "break-in")
+    await state.disarm()
+    await asyncio.sleep(1.2)
+
+    assert not any("NOT CLEARED" in c["title"] for c in sent)
+
+
+async def test_escalation_without_a_contact_still_notifies(state, sent):
+    """No number configured is not a reason to stay silent about an alarm
+    nobody has dealt with."""
+    import asyncio
+
+    await state.set_ntfy("https://ntfy.example", "topic")
+    await state.set_police_call_delay(0)
+
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(SensorType.door, "break-in")
+    await asyncio.sleep(0.05)
+
+    escalations = [c for c in sent if "NOT CLEARED" in c["title"]]
+    assert len(escalations) == 1
+    assert "Call" not in escalations[0]["message"]

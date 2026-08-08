@@ -2,18 +2,35 @@
 (ultrasonic sensor, vibration sensor, door/keypad controller) and face
 recognition, and serves the Flutter app. See README.md in this directory
 for how to run it, and esp32/ for the three board sketches.
+
+Every route here is behind one of two credentials — see `require_app` and
+`require_device` below, and `security.py` for what those credentials are and
+why there are two of them. The only unauthenticated routes are `/health`
+(liveness, returns no state) and `/login` (which is how you get a credential
+in the first place).
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
 import random
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import esp32_client
+from . import esp32_client, notifier
 from .face_recognition_service import FaceRecognitionService
 from .models import (
     AddFaceRequest,
@@ -26,8 +43,12 @@ from .models import (
     LoginResponse,
     SensorType,
     SetEmergencyNumberRequest,
+    SetEntryDelayRequest,
+    SetFaceDisarmEnabledRequest,
     SetFaceIdEnabledRequest,
+    SetNightModeHoursRequest,
     SetNightModeRequest,
+    SetNtfyRequest,
     SetPoliceCallDelayRequest,
     TriggerAlertRequest,
 )
@@ -36,38 +57,132 @@ from .state import state
 logging.basicConfig(level=logging.INFO)
 
 # This file lives at python/backend/main.py, so two levels up is python/ —
-# where faces/ (training photos) and models/ (the Haar cascade) live,
-# siblings of backend/ rather than nested inside it.
+# where faces/ (training photos) and models/ (the detector/recognizer model
+# files) live, siblings of backend/ rather than nested inside it.
 BASE_DIR = Path(__file__).resolve().parent.parent
-# Created once at import time (not per-request) since loading the cascade
-# and training the recognizer are relatively expensive — and so a missing
-# cascade file fails the app at startup instead of on the first camera
-# request.
+# Created once at import time (not per-request) since loading the models and
+# training the recognizer are relatively expensive — and so a missing model
+# file fails the app at startup instead of on the first camera request.
 faces = FaceRecognitionService(
     faces_dir=BASE_DIR / "faces",
-    cascade_path=BASE_DIR / "models" / "haarcascade_frontalface_default.xml",
+    models_dir=BASE_DIR / "models",
 )
 
-app = FastAPI(title="HomeGuard Backend")
 
-# Local dev / same-network app access only — this isn't exposed to the
-# internet, so a permissive CORS policy is fine here.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Starts the board-liveness monitor once the event loop is running, and
+    stops it cleanly on shutdown.
+
+    The monitor can't be started from `AppState.__init__` because that runs
+    at import time, before there's a loop to schedule a task on.
+    """
+    state.start_monitor()
+    yield
+    await state.stop_monitor()
+    await notifier.aclose()
+
+
+app = FastAPI(title="HomeGuard Backend", lifespan=lifespan)
+
+# The app is a native Android client, which is not a browser and so is not
+# subject to CORS at all — these origins exist only for the FastAPI `/docs`
+# page and any local browser-based debugging. Restricted to localhost rather
+# than `*` because a wildcard here, combined with credentialed requests from
+# a browser, would let any web page the user visits drive this API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---- Authentication dependencies -----------------------------------------------
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    """Pulls the token out of an `Authorization: Bearer <token>` header,
+    returning None for a missing or non-Bearer header rather than raising —
+    callers decide what a missing credential means."""
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return token.strip() or None
+
+
+async def require_app(authorization: str | None = Header(default=None)) -> str:
+    """Dependency for routes the *app* calls. Rejects anything without a
+    live session token from `/login`, and returns the token so handlers that
+    need to know who's calling (currently `/change-password`, which spares
+    the caller's own session when revoking the others) can use it.
+
+    401 with a `WWW-Authenticate` header, per RFC 9110 — the status that
+    means "you didn't authenticate", as opposed to 403's "you did, but you
+    still can't".
+    """
+    token = _bearer_token(authorization)
+    if not state.tokens.is_valid(token):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid session token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token
+
+
+async def require_device(
+    x_device_key: str | None = Header(default=None),
+    key: str | None = Query(default=None),
+) -> None:
+    """Dependency for routes the *ESP32 boards* call. Accepts the shared
+    device key either as an `X-Device-Key` header or as a `?key=` query
+    parameter.
+
+    Both forms are supported because the sketches already build their sensor
+    reports as fixed query-string URLs (see `/esp32/sensor-event`), so a query
+    parameter costs them nothing, while the header keeps the key out of access
+    logs for the boards that POST a JSON body anyway. Compared with
+    `hmac.compare_digest` to avoid leaking the key through response timing.
+    """
+    presented = x_device_key or key or ""
+    if not hmac.compare_digest(presented, state.device_key):
+        raise HTTPException(status_code=401, detail="Missing or invalid device key")
+
+
+async def require_app_or_device(
+    authorization: str | None = Header(default=None),
+    x_device_key: str | None = Header(default=None),
+    key: str | None = Query(default=None),
+) -> None:
+    """Dependency for routes either kind of caller legitimately uses.
+
+    Only `/camera/recognize` needs this: frames come from a camera worker
+    (device key) during normal operation, but the app posts frames too when
+    testing face enrollment from the phone.
+    """
+    if state.tokens.is_valid(_bearer_token(authorization)):
+        return
+    presented = x_device_key or key or ""
+    if hmac.compare_digest(presented, state.device_key):
+        return
+    raise HTTPException(status_code=401, detail="Missing or invalid credentials")
+
+
 @app.get("/health")
 async def health():
     """Bare liveness check — used to confirm the backend process is up
-    and reachable, independent of any app/ESP32/camera state."""
+    and reachable, independent of any app/ESP32/camera state.
+
+    Deliberately unauthenticated and deliberately empty: it reveals only that
+    something is listening, which a port scan would establish anyway.
+    """
     return {"ok": True}
 
 
-@app.get("/state", response_model=FullState)
+@app.get("/state", response_model=FullState, dependencies=[Depends(require_app)])
 async def get_state():
     """Full state snapshot over plain HTTP. The app calls this once on
     startup (before/instead of the WebSocket being connected); after
@@ -81,32 +196,51 @@ async def get_state():
 
 @app.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest):
-    """Attempts login with the given password. Always returns the
-    current lockout/attempts-remaining fields alongside `ok` — even on
-    success — so the app has fresh values without a second round trip
-    (e.g. right after a lockout expires, or right before it triggers).
+    """Attempts login with the given password and, on success, mints the
+    session token every other route requires.
+
+    Always returns the current lockout/attempts-remaining fields alongside
+    `ok` — even on success — so the app has fresh values without a second
+    round trip (e.g. right after a lockout expires, or right before it
+    triggers).
     """
-    ok = await state.login(body.password)
+    token = await state.login(body.password)
     return LoginResponse(
-        ok=ok,
+        ok=token is not None,
+        token=token,
         locked_out=state.is_locked_out,
         lockout_remaining_seconds=state.lockout_remaining_seconds,
         attempts_remaining=state.attempts_remaining,
     )
 
 
+@app.post("/logout")
+async def logout(token: str = Depends(require_app)):
+    """Revokes the caller's own session token. Without this, signing out in
+    the app only cleared a local flag while the token stayed valid on the
+    server until it expired hours later."""
+    state.tokens.revoke(token)
+    return {"ok": True}
+
+
 @app.post("/change-password")
-async def change_password(body: ChangePasswordRequest):
+async def change_password(body: ChangePasswordRequest, token: str = Depends(require_app)):
     """Changes the login password; see AppState.change_password for the
-    validation rules (old password must match, new one can't be blank)."""
-    ok = await state.change_password(body.old_password, body.new_password)
+    validation rules and for why every *other* session is revoked.
+
+    Requires a valid session as well as the old password: this route used to
+    be reachable by anyone and enforced no attempt limit, which made it an
+    unthrottled oracle for guessing the password that `/login`'s 3-attempt
+    lockout was supposed to protect.
+    """
+    ok = await state.change_password(body.old_password, body.new_password, current_token=token)
     return {"ok": ok}
 
 
 # ---- Arm / disarm -------------------------------------------------------------
 
 
-@app.post("/arm")
+@app.post("/arm", dependencies=[Depends(require_app)])
 async def arm(body: ArmRequest):
     """Starts arming: updates our own local state first (so the app gets
     an immediate `transitional` response/broadcast), then separately
@@ -115,23 +249,25 @@ async def arm(body: ArmRequest):
     local state still proceeds through its own exit-delay timer to
     `armed` regardless, so the app's view can end up ahead of what the
     real hardware is doing. The controller's own state reports (via
-    /esp32/state-change) are what ultimately reconcile this.
+    /esp32/state-change) are what ultimately reconcile this. `hardware`
+    in the response says whether the board actually acknowledged, so the
+    app can surface the difference instead of assuming success.
     """
     await state.arm(body.mode)
-    await esp32_client.send_arm(body.mode)
-    return {"ok": True}
+    reached = await esp32_client.send_arm(body.mode)
+    return {"ok": True, "hardware": reached}
 
 
-@app.post("/disarm")
+@app.post("/disarm", dependencies=[Depends(require_app)])
 async def disarm():
     """Disarms: same local-state-then-hardware-command pattern (and same
     caveat about the two not being atomic) as `arm` above."""
     await state.disarm()
-    await esp32_client.send_disarm()
-    return {"ok": True}
+    reached = await esp32_client.send_disarm()
+    return {"ok": True, "hardware": reached}
 
 
-@app.post("/trigger-alert")
+@app.post("/trigger-alert", dependencies=[Depends(require_app)])
 async def trigger_alert(body: TriggerAlertRequest):
     """Demo/testing entry point — mirrors the app's "simulate intrusion"
     button. Real sensor triggers come through /esp32/sensor-event.
@@ -143,13 +279,13 @@ async def trigger_alert(body: TriggerAlertRequest):
 # ---- Faces --------------------------------------------------------------------
 
 
-@app.get("/faces", response_model=list[ApprovedFace])
+@app.get("/faces", response_model=list[ApprovedFace], dependencies=[Depends(require_app)])
 async def list_faces():
     """Lists approved faces (id + name only, no photos)."""
     return state.faces
 
 
-@app.post("/faces", response_model=ApprovedFace)
+@app.post("/faces", response_model=ApprovedFace, dependencies=[Depends(require_app)])
 async def add_face(body: AddFaceRequest):
     """Creates a new approved-face record by name. This only creates the
     record — it has no training photos yet, so recognition won't match it
@@ -158,7 +294,7 @@ async def add_face(body: AddFaceRequest):
     return await state.add_face(body.name)
 
 
-@app.delete("/faces/{face_id}")
+@app.delete("/faces/{face_id}", dependencies=[Depends(require_app)])
 async def remove_face(face_id: str):
     """Removes an approved face entirely: deletes its trained photos from
     disk and retrains the recognizer (`faces.remove_face`), and drops its
@@ -172,7 +308,7 @@ async def remove_face(face_id: str):
     return {"ok": True}
 
 
-@app.post("/faces/{face_id}/photo")
+@app.post("/faces/{face_id}/photo", dependencies=[Depends(require_app)])
 async def upload_face_photo(face_id: str, photo: UploadFile):
     """Adds one training photo for an existing approved face. 404s if
     `face_id` isn't a known approved face (guards against uploading
@@ -180,40 +316,59 @@ async def upload_face_photo(face_id: str, photo: UploadFile):
     deleted). 422s if no face could be detected in the uploaded image —
     a common user-facing case (bad angle/lighting/no face at all), hence
     the more specific "unprocessable entity" status rather than a generic
-    error. Retrains the recognizer synchronously right after (a small,
-    CPU-bound `cv2` call) so the new photo is usable immediately; fine at
-    this dataset size, but would become a blocking cost worth moving off
-    the event loop if the face set ever grew large.
+    error. Retrains the recognizer synchronously right after so the new
+    photo is usable immediately; fine at this dataset size, but would
+    become a blocking cost worth moving off the event loop if the face set
+    ever grew large.
     """
     if not any(f.id == face_id for f in state.faces):
         raise HTTPException(status_code=404, detail="No approved face with that id")
     image_bytes = await photo.read()
-    detected = faces.register_face(face_id, image_bytes)
+    try:
+        detected = faces.register_face(face_id, image_bytes)
+    except ValueError as exc:
+        # The upload wasn't a decodable image at all (truncated, corrupt, or
+        # not an image). Same 422 family as "no face found" — the request was
+        # well-formed, its payload wasn't usable — rather than letting the
+        # ValueError escape as an opaque 500.
+        raise HTTPException(status_code=422, detail=f"Unreadable image: {exc}") from exc
     if not detected:
         raise HTTPException(status_code=422, detail="No face detected in that photo")
     faces.retrain()
     return {"ok": True}
 
 
-@app.post("/face-id-enabled")
+@app.post("/face-id-enabled", dependencies=[Depends(require_app)])
 async def set_face_id_enabled(body: SetFaceIdEnabledRequest):
     """Toggles whether /camera/recognize performs recognition at all."""
     await state.set_face_id_enabled(body.enabled)
     return {"ok": True}
 
 
+@app.post("/face-disarm-enabled", dependencies=[Depends(require_app)])
+async def set_face_disarm_enabled(body: SetFaceDisarmEnabledRequest):
+    """Toggles whether a recognized face is allowed to disarm the system.
+
+    Distinct from /face-id-enabled: that one controls whether recognition
+    runs, this controls whether a match may turn the alarm off. Off by
+    default — see AppState.log_face_recognized for the liveness caveat that
+    makes this a convenience feature rather than a security one.
+    """
+    await state.set_face_disarm_enabled(body.enabled)
+    return {"ok": True}
+
+
 # ---- Settings -----------------------------------------------------------------
 
 
-@app.post("/settings/night-mode")
+@app.post("/settings/night-mode", dependencies=[Depends(require_app)])
 async def set_night_mode(body: SetNightModeRequest):
-    """Toggles night mode (see AppState.set_night_mode for a note on the
-    auto-arm behavior this implies but doesn't yet implement)."""
+    """Toggles night mode."""
     await state.set_night_mode(body.enabled)
     return {"ok": True}
 
 
-@app.post("/settings/emergency-number")
+@app.post("/settings/emergency-number", dependencies=[Depends(require_app)])
 async def set_emergency_number(body: SetEmergencyNumberRequest):
     """Sets the number that would be auto-dialed on a triggered alarm
     (see AppState.set_emergency_number — that auto-dial itself isn't
@@ -222,7 +377,31 @@ async def set_emergency_number(body: SetEmergencyNumberRequest):
     return {"ok": True}
 
 
-@app.post("/settings/police-call-delay")
+@app.post("/settings/night-mode-hours", dependencies=[Depends(require_app)])
+async def set_night_mode_hours(body: SetNightModeHoursRequest):
+    """Sets when night mode arms and disarms (whole hours, 0-23)."""
+    await state.set_night_mode_hours(body.arm_hour, body.disarm_hour)
+    return {"ok": True}
+
+
+@app.post("/settings/ntfy", dependencies=[Depends(require_app)])
+async def set_ntfy(body: SetNtfyRequest):
+    """Configures push notifications (see backend/notifier.py) — the channel
+    that makes an alert reach the phone with the app closed."""
+    await state.set_ntfy(body.server, body.topic)
+    return {"ok": True}
+
+
+@app.post("/settings/ntfy/test", dependencies=[Depends(require_app)])
+async def test_ntfy():
+    """Sends a test push, so the topic can be verified before a real
+    break-in depends on it. `ok: false` means no topic is configured;
+    delivery itself isn't waited on."""
+    sent = await state.send_test_notification()
+    return {"ok": sent}
+
+
+@app.post("/settings/police-call-delay", dependencies=[Depends(require_app)])
 async def set_police_call_delay(body: SetPoliceCallDelayRequest):
     """Sets the delay (seconds) before the not-yet-implemented
     auto-dial-emergency-number behavior would fire."""
@@ -231,18 +410,25 @@ async def set_police_call_delay(body: SetPoliceCallDelayRequest):
 
 
 # ---- ESP32 -------------------------------------------------------------------
-# Three separate boards call into these (see esp32/*/README.md for which):
+# Three separate boards call into these (see esp32/README.md for which):
 # ultrasonic + vibration sensor boards call heartbeat + sensor-event only;
 # the door/keypad controller (the arm/disarm authority) calls all three.
+#
+# All of them require the shared device key (see `require_device`). Without
+# it, anything that could reach the network could forge a sensor breach — or,
+# worse, forge a `/esp32/state-change` claiming the system is disarmed.
 
 
-@app.post("/esp32/heartbeat")
-async def esp32_heartbeat():
-    """Called periodically by the boards just to mark connectivity as
-    alive; carries no other data. See AppState.set_esp32_online for the
-    caveat that this is one shared flag for all three boards.
+@app.post("/esp32/heartbeat", dependencies=[Depends(require_device)])
+async def esp32_heartbeat(board: str = Query(...)):
+    """Called every 10 seconds by each board to report that it's alive.
+
+    `board` identifies which one, so the app can show all three separately.
+    It's required rather than optional: an unnamed heartbeat would have to be
+    attributed to some default board, which would show a board as online that
+    might in fact be the dead one.
     """
-    await state.set_esp32_online(True)
+    await state.note_board_seen(board)
     return {"ok": True}
 
 
@@ -254,20 +440,36 @@ async def esp32_heartbeat():
 # expects `POST /esp32/sensor-event?sensor=door&reason=...`, not a JSON
 # body — simpler for the ESP32 firmware, which can just append query
 # params to a fixed URL instead of building/serializing a JSON payload.
-@app.post("/esp32/sensor-event")
-async def esp32_sensor_event(sensor: SensorType, reason: str):
+@app.post("/esp32/sensor-event", dependencies=[Depends(require_device)])
+async def esp32_sensor_event(
+    sensor: SensorType, reason: str, board: str | None = Query(default=None)
+):
     """Reports a sensor firing, from the ultrasonic/vibration/door
-    boards. Marks the ESP32 flag online (a successful call proves at
-    least one board is reachable) and forwards to
-    AppState.trigger_alert, which itself no-ops unless the system is
-    currently armed and the reporting sensor isn't bypassed.
+    boards. Marks the reporting board alive (a successful call proves it's
+    reachable) and forwards to AppState.trigger_alert, which itself no-ops
+    unless the system is currently armed and the reporting sensor isn't
+    bypassed.
     """
-    await state.set_esp32_online(True)
+    await state.note_board_seen(board or sensor.value)
     await state.trigger_alert(sensor, reason)
     return {"ok": True}
 
 
-@app.post("/esp32/state-change")
+@app.post("/esp32/entry-delay", dependencies=[Depends(require_device)])
+async def esp32_entry_delay(body: SetEntryDelayRequest):
+    """Called by the door controller when it starts its disarm countdown.
+
+    Without this the board ran that window silently and reported only the
+    outcome, so the app jumped from ARMED straight to TRIGGERED — no
+    countdown, no warning, no chance for someone watching remotely to see
+    that a person had just walked in.
+    """
+    await state.note_board_seen("door_controller")
+    await state.begin_entry_delay(body.seconds)
+    return {"ok": True}
+
+
+@app.post("/esp32/state-change", dependencies=[Depends(require_device)])
 async def esp32_state_change(body: Esp32StateChangeRequest):
     """Called only by the door/keypad controller (the arm/disarm
     authority) whenever its own armed state changes, whether from the
@@ -275,7 +477,7 @@ async def esp32_state_change(body: Esp32StateChangeRequest):
     AppState.report_state_from_esp32 for why this cancels any in-progress
     local arming countdown.
     """
-    await state.set_esp32_online(True)
+    await state.note_board_seen("door_controller")
     await state.report_state_from_esp32(body.armed)
     return {"ok": True}
 
@@ -283,7 +485,7 @@ async def esp32_state_change(body: Esp32StateChangeRequest):
 # ---- Camera / face recognition -------------------------------------------------
 
 
-@app.post("/camera/recognize")
+@app.post("/camera/recognize", dependencies=[Depends(require_app_or_device)])
 async def recognize_frame(photo: UploadFile):
     """Runs face recognition on a single camera frame. Marks the camera
     online unconditionally (a frame arrived, whether or not it matched),
@@ -299,7 +501,15 @@ async def recognize_frame(photo: UploadFile):
         return {"matched": False}
 
     image_bytes = await photo.read()
-    face_id = faces.recognize(image_bytes)
+    try:
+        face_id = faces.recognize(image_bytes)
+    except ValueError as exc:
+        # A corrupt or non-image frame is a bad request, not a server fault.
+        # This used to escape as a 500 with a traceback — and it was masked
+        # for a long time because the old recognizer checked "am I trained?"
+        # before it ever tried to decode, so an undecodable frame only blew
+        # up once at least one face had been enrolled.
+        raise HTTPException(status_code=422, detail=f"Unreadable image: {exc}") from exc
     if face_id is None:
         return {"matched": False}
 
@@ -311,7 +521,7 @@ async def recognize_frame(photo: UploadFile):
     return {"matched": True, "face_id": match.id, "name": match.name}
 
 
-@app.post("/debug/simulate-face-recognition")
+@app.post("/debug/simulate-face-recognition", dependencies=[Depends(require_app)])
 async def simulate_face_recognition():
     """Demo/testing entry point — mirrors the app's "simulate recognition"
     button. Picks a random approved face, same idea as /trigger-alert for
@@ -328,15 +538,24 @@ async def simulate_face_recognition():
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """Real-time push channel: accepts the connection, registers it for
-    AppState._broadcast, sends one initial snapshot immediately (so the
-    app doesn't have to wait for the next state change to get data), then
-    just blocks reading incoming text until the client disconnects. The
-    `finally` ensures `unregister` always runs — even if `receive_text`
-    raises something other than WebSocketDisconnect — so a dropped
-    connection can never linger in the broadcast set.
+async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(default=None)):
+    """Real-time push channel: authenticates, accepts the connection,
+    registers it for AppState._broadcast, sends one initial snapshot
+    immediately (so the app doesn't have to wait for the next state change to
+    get data), then just blocks reading incoming text until the client
+    disconnects.
+
+    The token arrives as a query parameter rather than an `Authorization`
+    header because the browser WebSocket API — and therefore
+    `web_socket_channel` on the app side — provides no portable way to set
+    headers on the handshake. The connection is refused with code 1008
+    ("policy violation") *before* `accept()`, so an unauthenticated client is
+    never registered for broadcasts and never receives a single state frame.
     """
+    if not state.tokens.is_valid(token):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     await state.register(websocket)
     try:

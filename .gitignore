@@ -6,3 +6,14 @@ Desktop.ini
 
 # WSL2 build scratch, if ever run from the repo root by mistake
 /build/
+
+# Per-board ESP32 config: real WiFi credentials, device key and keypad PIN.
+# Only esp32/secrets.h.example is committed — see it for the setup steps.
+esp32/*/secrets.h
+
+# Backend runtime state (password hash, device key, faces, event log).
+python/state.json
+python/state.json.tmp
+
+# Review/verification virtualenv
+python/.venv-review/

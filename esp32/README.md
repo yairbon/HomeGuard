@@ -17,18 +17,49 @@ Board 3 is different: it owns arm/disarm (it has the keypad), so it both
 sends reports to the backend *and* receives commands from it (the app's
 arm/disarm buttons reach this board through the backend).
 
-## Before flashing
+## Before flashing — `secrets.h`
 
-Each sketch has two placeholders near the top to fill in:
+Copy `secrets.h.example` into **each of the three sketch folders** as
+`secrets.h` and fill in the real values:
 
-```cpp
-const char* ssid = "Free-TAU";      // your WiFi network
-const char* password = "free-tau";  // your WiFi password
-const char* backendHost = "192.168.X.X";  // the IP of the machine running the Python backend
+```
+esp32/ultrasonic_sensor/secrets.h
+esp32/vibration_sensor/secrets.h
+esp32/door_keypad_controller/secrets.h
 ```
 
-Find the backend machine's IP with `ipconfig` (Windows) on that machine,
-on the same WiFi network as the boards.
+Three copies rather than one shared file because the Arduino IDE compiles one
+sketch folder at a time and only looks for headers inside that folder.
+
+`secrets.h` is gitignored; only the `.example` is committed. These values —
+the WiFi password, the device key, and the keypad PIN — used to be literals
+in the `.ino` files, which meant they were committed to this repository in
+plain text.
+
+What goes in it:
+
+| Setting | Where to get it |
+|---|---|
+| `WIFI_SSID` / `WIFI_PASSWORD` | your network |
+| `BACKEND_HOST` | `ipconfig` on the machine running the backend, same WiFi as the boards |
+| `DEVICE_KEY` | printed by the backend at startup, or set via `HOMEGUARD_DEVICE_KEY` |
+| `KEYPAD_PIN` | your choice; only the door controller uses it |
+
+### The device key
+
+Every `/esp32/*` call now sends `X-Device-Key`, and the backend returns 401
+without it. This is what stops anything else on the network from forging a
+sensor breach — or forging a "system disarmed" report, which would make the
+app show a false all-clear.
+
+It works in the other direction too: the backend sends the same key to the
+door controller's `/arm` and `/disarm`, and the sketch rejects commands
+without it. That board listens on port 80 and `/disarm` silences a sounding
+alarm, so an unauthenticated POST from anyone who found its IP would
+otherwise be enough to defeat the system.
+
+If a board logs `REJECTED (401)`, its `DEVICE_KEY` doesn't match the
+backend's.
 
 ## Wiring up two-way communication with the door controller
 
@@ -49,8 +80,16 @@ simulates the timing itself), they just won't reach real hardware.
 The keypad is currently simulated through the Serial Monitor —
 intentional, so the state machine could be tested before the real 4x4
 keypad is wired. Type digits + `*` to arm, digits + `#` to submit a PIN
-(secret PIN is `1234`, change `SECRET_PIN` in the sketch). Swap in the
+(the PIN is whatever you set as `KEYPAD_PIN` in `secrets.h`). Swap in the
 `Keypad` library once the physical keypad's pin mapping is known.
+
+## Heartbeats
+
+Each board pings `/esp32/heartbeat?board=<name>` every 10 seconds, using the
+name the backend knows it by (`ultrasonic`, `vibration`, `door_controller` —
+see `BOARD_NAMES` in `python/backend/state.py`). The backend marks a board
+offline after 30 seconds of silence and the app names it on the dashboard, so
+a board that loses power is visible rather than silently uncovered.
 
 ## Verifying changes still compile
 

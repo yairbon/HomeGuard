@@ -7,27 +7,35 @@ there too.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel
 
 
-class AlarmState(str, Enum):
+class AlarmState(StrEnum):
     """Overall system state shown in the app and driving alert logic.
 
     `transitional` is the exit-delay window between an arm request and the
     system actually becoming `armed` (see AppState._finish_arming) — it
     exists so the app can show a countdown instead of jumping straight to
     "armed" while the user is still walking out.
+
+    `entryDelay` is its mirror image: someone opened the door on an armed
+    system and has a limited time to disarm before the alarm sounds. The door
+    controller has always had this window (its ENTRY_DELAY state), but it only
+    ever reported the *outcome*, so the app jumped straight from ARMED to
+    TRIGGERED and never showed the countdown the person walking in is actually
+    racing.
     """
 
     disarmed = "disarmed"
     transitional = "transitional"
     armed = "armed"
+    entryDelay = "entryDelay"
     triggered = "triggered"
 
 
-class ArmMode(str, Enum):
+class ArmMode(StrEnum):
     """Which arm profile was requested. `home` bypasses the vibration
     sensor (people moving around inside shouldn't trip it); `away`
     bypasses nothing. The actual bypass assignment happens in
@@ -38,7 +46,7 @@ class ArmMode(str, Enum):
     home = "home"
 
 
-class EventCategory(str, Enum):
+class EventCategory(StrEnum):
     """Tag on a SecurityEvent used by the app to pick an icon/filter for
     the activity log."""
 
@@ -49,7 +57,7 @@ class EventCategory(str, Enum):
     info = "info"
 
 
-class SensorType(str, Enum):
+class SensorType(StrEnum):
     """Identifies which of the three ESP32 boards a sensor reading or
     event refers to."""
 
@@ -88,6 +96,26 @@ class ApprovedFace(BaseModel):
     name: str
 
 
+class BoardStatus(BaseModel):
+    """Liveness of one of the three ESP32 boards, derived from when it last
+    called `/esp32/heartbeat`.
+
+    Exists because a single aggregate `esp32_online` flag couldn't express
+    "the vibration board is dead but the other two are fine" — and, worse,
+    the old flag latched on: once any board had ever checked in, nothing
+    ever set it back to False, so a board could lose power and the app would
+    keep showing it as online indefinitely.
+
+    `last_seen` is None for a board that hasn't reported at all since the
+    backend started, which reads differently in the UI from a board that was
+    online and went quiet.
+    """
+
+    name: str
+    online: bool
+    last_seen: datetime | None = None
+
+
 class LoginRequest(BaseModel):
     password: str
 
@@ -96,9 +124,15 @@ class LoginResponse(BaseModel):
     """Result of a login attempt. Lockout/attempts fields are populated
     on both success and failure so the app can always show the current
     lockout countdown or remaining-attempts count, not just on failure.
+
+    `token` is the session token the app must send as
+    `Authorization: Bearer <token>` on every subsequent request — it is the
+    entire point of logging in. None on failure, so a caller that didn't
+    authenticate has nothing to send and every protected route will reject it.
     """
 
     ok: bool
+    token: str | None = None
     locked_out: bool = False
     lockout_remaining_seconds: int = 0
     attempts_remaining: int = 0
@@ -132,8 +166,26 @@ class SetFaceIdEnabledRequest(BaseModel):
     enabled: bool
 
 
+class SetFaceDisarmEnabledRequest(BaseModel):
+    """Body for /face-disarm-enabled. Separate from SetFaceIdEnabledRequest
+    because the two toggles mean very different things: face *ID* is whether
+    recognition runs at all, face *disarm* is whether a match is allowed to
+    turn the alarm off."""
+
+    enabled: bool
+
+
 class SetNightModeRequest(BaseModel):
     enabled: bool
+
+
+class SetNightModeHoursRequest(BaseModel):
+    """When night mode arms and disarms, as whole hours (0-23). Clamped
+    server-side rather than validated here, so an out-of-range value from an
+    older client degrades instead of 422-ing."""
+
+    arm_hour: int
+    disarm_hour: int
 
 
 class SetEmergencyNumberRequest(BaseModel):
@@ -141,6 +193,31 @@ class SetEmergencyNumberRequest(BaseModel):
 
 
 class SetPoliceCallDelayRequest(BaseModel):
+    seconds: int
+
+
+class SetNtfyRequest(BaseModel):
+    """Body for /settings/ntfy — where to push alerts so they arrive even
+    when the app isn't running. See backend/notifier.py.
+
+    `server` defaults to the public ntfy.sh so the feature works with nothing
+    but a topic name; point it at a self-hosted instance to keep alerts off a
+    third-party server. An empty `topic` disables pushing entirely.
+    """
+
+    server: str = "https://ntfy.sh"
+    topic: str = ""
+
+
+class SetEntryDelayRequest(BaseModel):
+    """Body the door controller POSTs to /esp32/entry-delay the moment it
+    detects the door opening on an armed system.
+
+    `seconds` is how long its own countdown will run before it sounds the
+    alarm, so the app can mirror that number rather than hardcoding a guess
+    that would drift if the sketch's ENTRY_TIME_LIMIT ever changed.
+    """
+
     seconds: int
 
 
@@ -158,12 +235,30 @@ class FullState(BaseModel):
     """Snapshot pushed over the WebSocket on connect and after any change."""
 
     alarm_state: AlarmState
+    # Seconds left to disarm before the alarm sounds. Only non-zero while
+    # `alarm_state` is `entryDelay`; the door controller owns the real timer,
+    # this mirrors it so the app can show a countdown.
+    entry_delay_seconds_remaining: int = 0
     sensors: list[SensorReading]
     events: list[SecurityEvent]
     faces: list[ApprovedFace]
+    # Aggregate "is any board reachable", kept for the app's single
+    # connectivity badge; `boards` carries the per-board detail behind it.
     esp32_online: bool
+    boards: list[BoardStatus]
     camera_online: bool
     face_id_enabled: bool
+    # Whether a recognized face disarms the system. Off by default — SFace has
+    # no liveness detection, so this is convenience, not security.
+    face_disarm_enabled: bool
     night_mode: bool
+    # Whole hours (0-23) at which night mode arms and disarms.
+    night_mode_arm_hour: int
+    night_mode_disarm_hour: int
     emergency_number: str
     police_call_delay_seconds: int
+    # Where alerts are pushed so they arrive with the app closed. The topic
+    # name doubles as the only access control on a public ntfy server, so
+    # treat it as a secret — see backend/notifier.py.
+    ntfy_server: str
+    ntfy_topic: str
