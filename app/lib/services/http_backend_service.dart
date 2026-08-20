@@ -113,6 +113,14 @@ class HttpBackendService implements BackendService {
   @override
   Stream<String> get errorStream => _errorController.stream;
 
+  @override
+  String? get cameraFrameUrl => _token == null ? null : '$baseUrl/camera/latest';
+  @override
+  Map<String, String> get cameraFrameHeaders =>
+      _token == null ? const {} : {'Authorization': 'Bearer $_token'};
+  @override
+  String? get cameraStreamUrl => _token == null ? null : '$baseUrl/camera/stream';
+
   // ---- WebSocket: receiving live state -------------------------------------
 
   /// Opens the WebSocket connection to the backend's `/ws` endpoint and

@@ -98,6 +98,15 @@ class MockBackendService implements BackendService {
   @override
   Stream<bool> get cameraOnlineStream => _cameraOnlineController.stream;
 
+  // No real backend to fetch a frame from — the camera screen falls back to
+  // its placeholder icon whenever this is null.
+  @override
+  String? get cameraFrameUrl => null;
+  @override
+  Map<String, String> get cameraFrameHeaders => const {};
+  @override
+  String? get cameraStreamUrl => null;
+
   @override
   Stream<bool> get faceIdEnabledStream => _faceIdEnabledController.stream;
 

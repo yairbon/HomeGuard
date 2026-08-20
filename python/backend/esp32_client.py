@@ -87,3 +87,14 @@ async def send_arm(mode: ArmMode) -> bool:
 async def send_disarm() -> bool:
     """Tell the door controller to disarm immediately."""
     return await _post("/disarm")
+
+
+async def send_trigger_alarm() -> bool:
+    """Tell the door controller to sound its siren immediately.
+
+    Its buzzers otherwise only react to its own local door sensor + keypad
+    state machine — a breach reported by a *different* board (ultrasonic,
+    vibration) reaches the app fine but never reaches the door controller's
+    hardware. This is how state.trigger_alert() closes that gap.
+    """
+    return await _post("/trigger-alarm")

@@ -7,6 +7,12 @@
 // הוא פשוט מדווח לבקנד כל אימות פריצה, וה-Backend (state.py,
 // trigger_alert) מחליט אם זה משנה — הוא מתעלם מהדיווח אם המערכת
 // לא דרוכה. ככה הלוח הזה לא צריך לדעת שום דבר על שאר המערכת.
+//
+// בכל אתחול (reset/power-up) הלוח מכייל את עצמו: לוקח את 10 הקריאות
+// התקינות הראשונות מהחיישן וממוצע אותן כבסיס (DEFAULT_DISTANCE), במקום
+// להניח 200 ס"מ קבוע. ככה מיקום התקנה סופי ששונה מעט מהתכנון המקורי
+// (למשל 150 ס"מ מקיר, לא 200) לא דורש שינוי קוד — רק אתחול מחדש
+// כשהחיישן כבר במקומו הסופי.
 // ============================================================
 
 #include <WiFi.h>
@@ -36,9 +42,12 @@ const int trigPin = 14;
 const int echoPin = 12;
 
 // --- הגדרות לוגיקת זיהוי ---
-const float DEFAULT_DISTANCE = 200.0; // המרחק הרגיל לקיר ממול (בסנטימטרים)
-const float TOLERANCE = 30.0;         // טווח סטייה מותר כדי להתעלם מרעשים קטנים
-const int REQUIRED_BREACHES = 8;      // כמה קריאות חריגות *ברצף* נדרשות כדי להזעיק
+// לא const יותר: 200 הוא רק ברירת מחדל למקרה שהכיול באתחול נכשל
+// (ראה calibrateBaseline). הערך האמיתי נקבע מחדש בכל reset.
+float DEFAULT_DISTANCE = 200.0;       // המרחק הרגיל לקיר ממול (בסנטימטרים)
+const float TOLERANCE = 10.0;         // טווח סטייה מותר כדי להתעלם מרעשים קטנים
+const int REQUIRED_BREACHES = 5;      // כמה קריאות חריגות *ברצף* נדרשות כדי להזעיק
+const int CALIBRATION_SAMPLES = 10;   // כמה קריאות תקינות לוקחים בכיול האתחול
 int consecutiveBreaches = 0;          // המונה הנוכחי
 
 // --- Heartbeat: מדווח לבקנד כל 10 שניות שהלוח הזה חי, כדי שהאפליקציה
@@ -53,6 +62,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
+
+  delay(200); // רגע להתייצבות אחרי power-up, לפני הדגימה הראשונה
+  calibrateBaseline();
 
   // התחברות ל-WiFi
   WiFi.begin(ssid, password);
@@ -86,6 +98,40 @@ float getDistance() {
   // מהירות הקול היא בערך 0.034 ס"מ למיקרו-שנייה. מחלקים ב-2 כי
   // המדידה כוללת את הזמן שלוקח לקול ללכת ולחזור (מסלול כפול).
   return duration * 0.034 / 2;
+}
+
+// כיול אוטומטי של מרחק הבסיס בכל אתחול: לוקחים CALIBRATION_SAMPLES
+// קריאות *תקינות* (מדלגים על 0/timeout, כמו בלולאה הרגילה) וממוצעים
+// אותן, במקום להניח 200 ס"מ קבוע מראש. ככה אם המיקום הסופי של החיישן
+// שונה מעט מהתכנון (למשל 150 ס"מ מקיר, לא 200), הסף מתאים את עצמו
+// אוטומטית — פשוט נותנים ל-reset אחד לקרות אחרי שהחיישן כבר במקומו.
+void calibrateBaseline() {
+  Serial.println("Calibrating baseline distance...");
+  float sum = 0;
+  int collected = 0;
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 50; // תקרת ביטחון - לא נתקעים לנצח אם אין הד בכלל
+
+  while (collected < CALIBRATION_SAMPLES && attempts < MAX_ATTEMPTS) {
+    float d = getDistance();
+    attempts++;
+    if (d > 0) {
+      collected++;
+      sum += d;
+      Serial.printf("  sample %d/%d: %.1f cm\n", collected, CALIBRATION_SAMPLES, d);
+    }
+    delay(60); // מרווח קצר בין דגימות, שהד קודם ידעך לפני הבאה
+  }
+
+  if (collected > 0) {
+    DEFAULT_DISTANCE = sum / collected;
+    Serial.printf("Baseline calibrated: %.1f cm (from %d readings)\n", DEFAULT_DISTANCE, collected);
+  } else {
+    // אף קריאה תקינה לא התקבלה (למשל שום דבר בטווח האפקטיבי של החיישן) -
+    // נשארים עם ברירת המחדל המקורית (200) במקום 0, שהיה גורם לכל קריאה
+    // עתידית להיחשב חריגה (0 < DEFAULT_DISTANCE - TOLERANCE תמיד אמת).
+    Serial.println("WARNING: calibration got no valid reading — keeping default 200cm.");
+  }
 }
 
 // בסיס ה-URL של הבקנד, מורכב פעם אחת במקום בכל קריאה.
@@ -169,5 +215,5 @@ void loop() {
     lastHeartbeat = millis();
   }
 
-  delay(100); // דוגמים את החיישן עשר פעמים בשנייה
+  delay(67); // דוגמים את החיישן ~15 פעמים בשנייה (פי 1.5 מהר יותר מ-100ms)
 }

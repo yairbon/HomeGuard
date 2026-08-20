@@ -26,6 +26,8 @@ PROTECTED_ROUTES = [
     ("post", "/change-password", {"old_password": PASSWORD, "new_password": "x"}),
     ("get", "/faces", None),
     ("post", "/faces", {"name": "x"}),
+    ("get", "/camera/latest", None),
+    ("get", "/camera/stream", None),
     ("post", "/face-id-enabled", {"enabled": True}),
     ("post", "/settings/night-mode", {"enabled": True}),
     ("post", "/settings/emergency-number", {"number": "100"}),
