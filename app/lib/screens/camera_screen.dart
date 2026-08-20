@@ -1,17 +1,28 @@
+import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/alarm_service.dart';
+import '../services/backend_service.dart';
+import '../services/mjpeg_stream.dart';
 import '../theme/app_theme.dart';
 import '../widgets/event_tile.dart';
 import '../widgets/homeguard_icons.dart';
 
-/// Camera tab: shows the (placeholder) front-entrance feed, current Face ID
-/// and camera-online status, and the most recent face-identification
-/// events.
+/// Camera tab: shows the front-entrance feed, current Face ID and
+/// camera-online status, and the most recent face-identification events.
 ///
-/// There is no real video stream wired up — [_FeedPlaceholder] just shows a
-/// static icon plus a live/offline badge driven by [AlarmService].
+/// The "feed" is [_FeedPlaceholder], which holds a persistent connection to
+/// `GET /camera/stream` (see [BackendService.cameraStreamUrl]) — a
+/// multipart/x-mixed-replace MJPEG stream the backend proxies from the
+/// ESP32-CAM's own /stream endpoint — parsed frame-by-frame via
+/// [MjpegStreamClient]. An earlier version of this screen polled a single-
+/// JPEG snapshot endpoint every couple hundred milliseconds instead; this
+/// replaced that once there was an actual reason to want more than ~2fps.
+/// Falls back to a static icon when there's no camera source to connect to
+/// (offline, or [MockBackendService], which has no real backend at all).
 class CameraScreen extends StatelessWidget {
   const CameraScreen({super.key});
 
@@ -148,16 +159,54 @@ class _FaceDisarmToggle extends StatelessWidget {
   }
 }
 
-/// Stand-in for the live camera feed, since no real video stream is wired
-/// up: a bordered box with a camera icon, a LIVE/OFFLINE status badge, and
-/// a caption naming the camera and its connection state.
-class _FeedPlaceholder extends StatelessWidget {
+/// The camera feed box: a bordered container showing the live MJPEG stream
+/// (or a camera icon when there's nothing to show), a LIVE/OFFLINE status
+/// badge, and a caption naming the camera and its connection state.
+class _FeedPlaceholder extends StatefulWidget {
   const _FeedPlaceholder({required this.isOnline});
 
   final bool isOnline;
 
-  /// Renders the placeholder box, switching its badge and caption text
-  /// based on [isOnline].
+  @override
+  State<_FeedPlaceholder> createState() => _FeedPlaceholderState();
+}
+
+class _FeedPlaceholderState extends State<_FeedPlaceholder> {
+  MjpegStreamClient? _stream;
+  StreamSubscription<Uint8List>? _frameSub;
+
+  // Only ever the single newest frame, never a queue: at 25-30fps a
+  // producer that outruns the decoder would grow a buffered list without
+  // bound, and a stale frame has no value in a live security feed anyway.
+  // Held in a ValueNotifier rather than State so a new frame repaints only
+  // the image itself, not the badge/caption/border around it — setState
+  // here would rebuild the whole card 30 times a second.
+  final _latestFrame = ValueNotifier<Uint8List?>(null);
+
+  @override
+  void initState() {
+    super.initState();
+    _connect();
+  }
+
+  void _connect() {
+    final backend = context.read<BackendService>();
+    final url = backend.cameraStreamUrl;
+    if (url == null) return;
+    final stream = MjpegStreamClient(streamUrl: url, headers: backend.cameraFrameHeaders);
+    _stream = stream;
+    _frameSub = stream.frames.listen((frame) => _latestFrame.value = frame);
+    stream.connect();
+  }
+
+  @override
+  void dispose() {
+    _frameSub?.cancel();
+    _stream?.dispose();
+    _latestFrame.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return AspectRatio(
@@ -168,36 +217,56 @@ class _FeedPlaceholder extends StatelessWidget {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: AppColors.surfaceRaised),
         ),
-        child: Stack(
-          children: [
-            Center(
-              child: HomeGuardIcon(
-                HGIcon.camera,
-                size: 48,
-                color: AppColors.textMuted.withValues(alpha: 0.4),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              RepaintBoundary(
+                child: ValueListenableBuilder<Uint8List?>(
+                  valueListenable: _latestFrame,
+                  builder: (context, frame, _) {
+                    if (frame == null) return _cameraIcon();
+                    return Image.memory(
+                      frame,
+                      fit: BoxFit.cover,
+                      // Holds the previous frame while the next one decodes,
+                      // instead of flashing empty between every frame.
+                      gaplessPlayback: true,
+                    );
+                  },
+                ),
               ),
-            ),
-            Positioned(
-              top: 10,
-              right: 10,
-              child: _Badge(
-                text: isOnline ? 'LIVE' : 'OFFLINE',
-                color: isOnline ? AppColors.alarm : AppColors.textMuted,
-                dot: isOnline,
+              Positioned(
+                top: 10,
+                right: 10,
+                child: _Badge(
+                  text: widget.isOnline ? 'LIVE' : 'OFFLINE',
+                  color: widget.isOnline ? AppColors.alarm : AppColors.textMuted,
+                  dot: widget.isOnline,
+                ),
               ),
-            ),
-            Positioned(
-              bottom: 10,
-              left: 10,
-              right: 10,
-              child: Text(
-                isOnline ? 'ESP32-CAM · front entrance' : 'ESP32-CAM · waiting for connection',
-                style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+              Positioned(
+                bottom: 10,
+                left: 10,
+                right: 10,
+                child: Text(
+                  widget.isOnline
+                      ? 'ESP32-CAM · front entrance'
+                      : 'ESP32-CAM · waiting for connection',
+                  style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
+    );
+  }
+
+  Widget _cameraIcon() {
+    return Center(
+      child: HomeGuardIcon(HGIcon.camera, size: 48, color: AppColors.textMuted.withValues(alpha: 0.4)),
     );
   }
 }

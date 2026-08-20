@@ -56,6 +56,24 @@ const int DOOR_SENSOR_PIN = 4;  // Magnetic Reed Switch
 const int BUZZER_1_PIN = 23;    // Buzzer 1
 const int BUZZER_2_PIN = 22;    // Buzzer 2
 
+// --- Physical keypad (3x4: digits 1-9, *, 0, #) ---
+// Rows are driven OUTPUT (idle HIGH, pulled LOW one at a time while
+// scanning); columns are read INPUT_PULLUP (idle HIGH, read LOW when the
+// active row's pulse reaches them through a pressed key). None of these
+// are strapping pins except R3=12 (MTDI) — that one only matters at boot,
+// and this board's own bring-up test showed it doesn't block flashing in
+// practice, so it's left as wired rather than asking for a rewire.
+// Order confirmed against the physical wiring (right-to-left on the
+// connector): R1=25 R2=13 R3=12 R4=27, C1=26 C2=33 C3=14.
+const int ROW_PINS[4] = {25, 13, 12, 27};
+const int COL_PINS[3] = {26, 33, 14};
+const char KEYPAD_LAYOUT[4][3] = {
+  {'1', '2', '3'},
+  {'4', '5', '6'},
+  {'7', '8', '9'},
+  {'*', '0', '#'}
+};
+
 // --- State Machine Definitions ---
 enum State {
   DISARMED,
@@ -72,11 +90,11 @@ State currentState = DISARMED;
 // --- Keypad & Security Variables ---
 String enteredPin = "";
 const String SECRET_PIN = KEYPAD_PIN;  // from secrets.h
-// TODO: this reads the "keypad" from the Serial Monitor (type digits +
-// '*' to arm / '#' to submit a PIN) — a deliberate stand-in for testing
-// the state machine before the physical 4x4 keypad is wired up. Once it
-// is, swap getSimulatedKey() for the Keypad library reading the real
-// matrix (pin mapping isn't set yet, so not guessing it here).
+// The physical 3x4 matrix is now wired (see ROW_PINS/COL_PINS above) and
+// read by getPhysicalKey() below. getSimulatedKey() (Serial Monitor input)
+// is kept as a fallback, not removed — see getKey() — so the state machine
+// stays testable from a desk even without the physical keypad in hand, and
+// so a wiring mistake on one row/column doesn't block testing the rest.
 
 // --- Sensor & Timer Variables ---
 bool isDoorOpen = false;
@@ -106,6 +124,16 @@ void setup() {
   pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
   pinMode(BUZZER_1_PIN, OUTPUT);
   pinMode(BUZZER_2_PIN, OUTPUT);
+
+  // Keypad: rows idle HIGH (driven), columns read with internal pull-ups so
+  // no external resistors are needed.
+  for (int r = 0; r < 4; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], HIGH);
+  }
+  for (int c = 0; c < 3; c++) {
+    pinMode(COL_PINS[c], INPUT_PULLUP);
+  }
 
   // Ensure buzzers are quiet on boot
   silenceBuzzers();
@@ -138,6 +166,7 @@ void setup() {
 
   server.on("/arm", HTTP_POST, handleRemoteArm);
   server.on("/disarm", HTTP_POST, handleRemoteDisarm);
+  server.on("/trigger-alarm", HTTP_POST, handleRemoteTriggerAlarm);
   server.begin();
   Serial.println("Remote control server started.");
 
@@ -170,6 +199,57 @@ char getSimulatedKey() {
     }
   }
   return '\0';
+}
+
+// Scans the physical 3x4 matrix: drives one row LOW at a time (all others
+// idle HIGH) and checks which column reads LOW — that intersection is the
+// key currently pressed. Returns '\0' when nothing is pressed, same
+// contract as getSimulatedKey(), so callers don't need to care which
+// source produced a keypress.
+//
+// Debounced by requiring a full release (key reads '\0') before the same
+// key can register again, plus a minimum gap between presses — without
+// this, a single physical press would be read dozens of times across
+// consecutive loop() iterations (loop has no fixed delay) and flood
+// enteredPin with repeated digits.
+const unsigned long KEYPAD_DEBOUNCE_MS = 200;
+unsigned long lastKeyTime = 0;
+bool keyWasDown = false;
+
+char getPhysicalKey() {
+  char found = '\0';
+  for (int r = 0; r < 4 && found == '\0'; r++) {
+    for (int rr = 0; rr < 4; rr++) {
+      digitalWrite(ROW_PINS[rr], rr == r ? LOW : HIGH);
+    }
+    delayMicroseconds(50); // let the line settle before sampling columns
+    for (int c = 0; c < 3; c++) {
+      if (digitalRead(COL_PINS[c]) == LOW) {
+        found = KEYPAD_LAYOUT[r][c];
+        break;
+      }
+    }
+  }
+  for (int rr = 0; rr < 4; rr++) digitalWrite(ROW_PINS[rr], HIGH); // back to idle
+
+  if (found == '\0') {
+    keyWasDown = false;
+    return '\0';
+  }
+  if (keyWasDown || millis() - lastKeyTime < KEYPAD_DEBOUNCE_MS) {
+    return '\0'; // still holding the previous press, or debounce window open
+  }
+  keyWasDown = true;
+  lastKeyTime = millis();
+  return found;
+}
+
+// Tries the physical keypad first, falls back to Serial input — see the
+// comment above SECRET_PIN for why both stay live at once.
+char getKey() {
+  char physical = getPhysicalKey();
+  if (physical != '\0') return physical;
+  return getSimulatedKey();
 }
 
 // ---- Backend reporting (new) ------------------------------------------
@@ -314,6 +394,22 @@ void handleRemoteDisarm() {
   server.send(200, "text/plain", "OK");
 }
 
+// WebServer handler for POST /trigger-alarm. Called by the backend when a
+// *different* board (ultrasonic, vibration) reports a breach while armed —
+// this board's own buzzers otherwise only react to its own door sensor and
+// keypad, so without this, a breach seen anywhere else in the house shows
+// up in the app but stays silent here. No state guard, same reasoning as
+// handleRemoteDisarm: trust the backend's decision over whatever this board
+// locally thinks the state is.
+void handleRemoteTriggerAlarm() {
+  if (!authorized()) return;
+  Serial.println("\n[REMOTE] Alarm triggered remotely (another sensor reported a breach)");
+  currentState = ALARM;
+  enteredPin = "";
+  lastBeepTime = millis();
+  server.send(200, "text/plain", "OK");
+}
+
 // Main loop: services the remote-control WebServer, polls the physical
 // door sensor and the simulated keypad, advances the arm/disarm state
 // machine below, and sends a periodic heartbeat.
@@ -337,8 +433,8 @@ void loop() {
     lastDoorState = currentDoorState;
   }
 
-  // 2. Read the SIMULATED keypad
-  char input = getSimulatedKey();
+  // 2. Read a keypress — physical keypad first, Serial Monitor as fallback
+  char input = getKey();
 
   // If a number is typed, hide it with an asterisk
   if (input >= '0' && input <= '9') {
@@ -439,6 +535,13 @@ void loop() {
               silenceBuzzers();
               Serial.println("Correct PIN. System DISARMED.");
               reportStateChange(false);
+              // Without this break, execution falls through to the
+              // accelerating-beep logic below (still inside this case,
+              // same loop() pass) — by then enough time has elapsed since
+              // lastBeepTime that it immediately turns the buzzers back
+              // on, undoing silenceBuzzers() above. Disarming is done;
+              // nothing after this point should run this iteration.
+              break;
             } else {
               enteredPin = "";
               Serial.println("Wrong PIN. Keep trying!");
@@ -510,3 +613,4 @@ void loop() {
     lastHeartbeat = millis();
   }
 }
+

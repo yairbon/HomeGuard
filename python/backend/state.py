@@ -742,6 +742,18 @@ class AppState:
             message=reason,
         )
         self._start_escalation(reason)
+
+        # The door controller's buzzers only react to its own local door
+        # sensor + keypad — they don't know a different board just tripped.
+        # Skipped when the door itself is the source: its entryDelay->ALARM
+        # transition already sounds the siren locally before this runs (see
+        # reportDoorAlert() in the sketch), so this would just be a redundant
+        # round trip to a board that's already alarming.
+        if source != SensorType.door:
+            from . import esp32_client  # deferred: esp32_client imports `state`
+
+            await esp32_client.send_trigger_alarm()
+
         await self._broadcast()
 
     def _start_escalation(self, reason: str) -> None:

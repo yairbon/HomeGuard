@@ -226,6 +226,24 @@ abstract class BackendService {
   /// offline independently of each other.
   Stream<bool> get cameraOnlineStream;
 
+  /// The backend's `/camera/latest` URL — the most recent frame a camera
+  /// worker uploaded, served as a JPEG — or null when there's no way to
+  /// authenticate a request right now (not logged in yet) or no real
+  /// backend to ask at all ([MockBackendService]). Callers should append a
+  /// cache-busting query parameter before each fetch: the URL is otherwise
+  /// identical between refreshes, and Image.network caches by URL.
+  String? get cameraFrameUrl;
+
+  /// Headers a request to [cameraFrameUrl] needs to authenticate.
+  Map<String, String> get cameraFrameHeaders;
+
+  /// The backend's `/camera/stream` URL — a continuous MJPEG multipart
+  /// stream proxied from the ESP32-CAM's own /stream endpoint, replacing
+  /// the poll-a-JPEG-repeatedly approach [cameraFrameUrl] used. Same
+  /// null-when-unavailable contract as [cameraFrameUrl]; same
+  /// [cameraFrameHeaders] authenticate a request to it too.
+  String? get cameraStreamUrl;
+
   /// Emits whether face-ID recognition is currently enabled.
   Stream<bool> get faceIdEnabledStream;
 

@@ -148,6 +148,35 @@ async def test_recognize_short_circuits_when_face_id_is_disabled(auth_client):
     assert response.json()["matched"] is False
 
 
+async def test_latest_camera_frame_404s_before_any_frame_arrives(auth_client):
+    response = await auth_client.get("/camera/latest")
+    assert response.status_code == 404
+
+
+async def test_latest_camera_frame_returns_the_most_recent_upload(auth_client):
+    """Also covers the face-ID-disabled path: /camera/latest has to work
+    even when recognition itself is off, since a user might want the live
+    view without paying the recognition cost (see the short-circuit test
+    above) — the frame is cached before that check runs, not after."""
+    await auth_client.post("/face-id-enabled", json={"enabled": False})
+    frame = _png(64, 64)
+    await auth_client.post(
+        "/camera/recognize", files={"photo": ("frame.jpg", frame, "image/jpeg")}
+    )
+    response = await auth_client.get("/camera/latest")
+    assert response.status_code == 200
+    assert response.content == frame
+    assert response.headers["content-type"] == "image/jpeg"
+
+
+async def test_camera_stream_503s_when_not_configured(auth_client):
+    """HOMEGUARD_CAMERA_STREAM_URL is unset in tests (no real ESP32-CAM to
+    proxy) — the route has to fail cleanly rather than try to connect to
+    an empty URL."""
+    response = await auth_client.get("/camera/stream")
+    assert response.status_code == 503
+
+
 async def test_face_ids_are_never_recycled(auth_client):
     """A recycled id would silently attach a new person to the previous
     holder's training photos on disk."""

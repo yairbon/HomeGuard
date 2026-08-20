@@ -3,8 +3,9 @@
   "configurations": [
     {
       "name": "homeguard-web",
-      "runtimeExecutable": "flutter",
+      "runtimeExecutable": "C:/dev/flutter/bin/flutter.bat",
       "runtimeArgs": ["run", "-d", "web-server", "--web-port", "8765"],
+      "cwd": "app",
       "port": 8765
     }
   ]
