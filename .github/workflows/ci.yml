@@ -67,11 +67,20 @@ jobs:
         env:
           HOMEGUARD_DEVICE_KEY: ci-device-key
         run: |
-          python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 &
+          python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
+          echo "UVICORN_PID=$!" >> "$GITHUB_ENV"
+          # `exit 0` on success rather than `break`: with `break`, a run that
+          # exhausted all 30 attempts ended on `sleep 1`, so the loop — and
+          # the whole step — exited 0 and the job reported a backend that had
+          # never bound as started. `bash -e` does not help, because a failing
+          # left-hand side of `&&` is exempt from it.
           for _ in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8000/health && break
+            curl -sf http://127.0.0.1:8000/health && exit 0
             sleep 1
           done
+          echo "::error::the backend never became ready"
+          cat uvicorn.log
+          exit 1
 
       - name: Run the live simulation
         # Slower than the pytest suite (it waits out real 30-second lockouts
@@ -80,6 +89,68 @@ jobs:
         env:
           HOMEGUARD_DEVICE_KEY: ci-device-key
         run: python simulate.py
+
+      - name: Check the backend is still alive
+        # A server that died partway through turns simulate.py's checks into a
+        # bare httpx.ConnectError with no server-side cause anywhere on the
+        # page. Catch it here instead, while the log is still worth printing.
+        run: kill -0 "$UVICORN_PID"
+
+      - name: Backend log
+        # `always()` so the log is available on the failing run, which is the
+        # only run anyone reads it on.
+        if: always()
+        run: cat uvicorn.log
+
+  firmware:
+    name: Firmware (compile all four sketches)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s -- 0.35.3
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Cache the esp32 core
+        # The core install is ~700 MB of SoC variants and toolchains, so a
+        # cold run costs several minutes; cached it is closer to one. Keyed on
+        # the pinned version below, so a core bump invalidates it deliberately
+        # rather than a release reddening CI for reasons unrelated to the
+        # change under test.
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino-esp32-3.3.11
+
+      - name: Install the esp32 core
+        run: |
+          arduino-cli config init --additional-urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.11
+
+      - name: Generate placeholder secrets
+        # secrets.h is gitignored (it holds the WiFi password, the device key
+        # and the keypad PIN), so every sketch's #include fails without this.
+        # The committed template defines every symbol the four sketches need.
+        run: |
+          for dir in esp32/*/; do
+            [ -f "$dir/$(basename "$dir").ino" ] && cp esp32/secrets.h.example "$dir/secrets.h"
+          done
+
+      - name: Compile
+        # The ESP32-CAM is a different board with a different FQBN — building
+        # it as a plain esp32 silently produces firmware that cannot drive the
+        # camera. See esp32/README.md.
+        run: |
+          for sketch in ultrasonic_sensor vibration_sensor door_keypad_controller; do
+            echo "--- $sketch"
+            arduino-cli compile --fqbn esp32:esp32:esp32 "esp32/$sketch"
+          done
+          echo "--- esp32_cam"
+          arduino-cli compile --fqbn esp32:esp32:esp32cam esp32/esp32_cam
 
   app:
     name: App (analyze + tests)
@@ -108,8 +179,15 @@ jobs:
       - name: Tests
         run: flutter test
 
-  # Deliberately not built here: the Android APK and the three ESP32
-  # sketches. The APK needs the Android SDK/NDK (several GB of runner setup
-  # for a course project that builds locally through WSL2), and the sketches
-  # need arduino-cli plus the esp32 core. Both are verified by hand — see
-  # esp32/README.md for the arduino-cli invocation that compiles the boards.
+  # Deliberately not built here: the Android APK. It needs the Android
+  # SDK/NDK — several GB of runner setup for a course project that builds
+  # locally through WSL2 (see CLAUDE.md for why native Windows builds don't
+  # work on the dev machine). Verified by hand with `/flutter-build`.
+  #
+  # The four ESP32 sketches used to be in this list too, on the grounds that
+  # they were "verified by hand". They were not: `vibration_sensor/secrets.h`
+  # had gone missing on the dev machine, so that sketch could not be compiled
+  # at all and nobody noticed — which is exactly what a manual gate looks
+  # like once it lapses. Hence the `firmware` job above. It runs in parallel
+  # with the other three, so it only lengthens the critical path on a cache
+  # miss.

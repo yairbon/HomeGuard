@@ -1,17 +1,18 @@
 // ==========================================
-// HomeGuard - Door & Keypad Controller (board 3 of 3)
+// HomeGuard - Door & Keypad Controller (board 3 of 4)
 // Features: Real Door Sensor, Serial Keypad, Configurable Silent Delay,
 // Accelerating Beeps, Alternating Siren, WiFi + Backend Integration
 // ==========================================
 //
 // This is the arm/disarm AUTHORITY: it's the board with the keypad, so
 // it's the one that decides whether the system is armed. The other two
-// boards (ultrasonic, vibration) are dumb sensor-push clients that don't
-// know or care about arm state at all — the backend decides whether
-// their reports matter. This board is different: it needs to both SEND
-// reports (state changes, door-breach alerts) and RECEIVE commands (the
-// app arming/disarming remotely), so it runs a small WebServer in
-// addition to being a WiFi client.
+// sensor boards (ultrasonic, vibration) are dumb sensor-push clients that
+// don't know or care about arm state at all — the backend decides whether
+// their reports matter — and the fourth board (esp32_cam) only pushes
+// frames and serves its own stream. This board is different: it needs to
+// both SEND reports (state changes, door-breach alerts) and RECEIVE
+// commands (the app arming/disarming remotely), so it runs a small
+// WebServer in addition to being a WiFi client.
 //
 // Everything under "STATE MACHINE LOGIC" below is unchanged from the
 // original draft — it already worked. What's new: WiFi connection, the
@@ -409,7 +410,7 @@ void reportEntryDelay() {
 }
 
 // Reports the door-breach-timeout alarm, same pattern as the other two
-// boards use for their own sensors.
+// sensor boards use for their own sensors.
 void reportDoorAlert() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
@@ -421,7 +422,8 @@ void reportDoorAlert() {
 }
 
 // Sends a periodic "I'm alive" ping to the backend (same pattern as the
-// other two boards) so the app can show this board as online. Doesn't
+// other two sensor boards; the camera board sends none, because its frame
+// pushes already are one) so the app can show this board as online. Doesn't
 // check the response code — a missed heartbeat just gets retried on the
 // next interval, no special handling needed for a one-off failure.
 void sendHeartbeat() {

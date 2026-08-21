@@ -40,7 +40,10 @@ winget install --id Google.AndroidStudio -e --accept-package-agreements --accept
 # 3. Flutter SDK (official stable channel)
 Write-Host "== Cloning Flutter SDK ==" -ForegroundColor Cyan
 if (-not (Test-Path $FlutterDir)) {
-    git clone -b stable https://github.com/flutter/flutter.git $FlutterDir
+    # Pinned to match CI (.github/workflows/ci.yml). Cloning "stable" gives a
+    # fresh machine whatever stable is that day, and the analyzer can then
+    # disagree with CI in either direction. Bump both together.
+    git clone -b 3.44.9 --depth 1 https://github.com/flutter/flutter.git $FlutterDir
 } else {
     Write-Host "Flutter already present at $FlutterDir, skipping clone."
 }

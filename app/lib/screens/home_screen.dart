@@ -29,6 +29,13 @@ class HomeScreen extends StatelessWidget {
     // branches below and read more clearly at each call site.
     final canArm = alarm.state == AlarmState.disarmed;
     final canDisarm = alarm.state != AlarmState.disarmed;
+    // Read once; it used to be evaluated twice in this build (and recomputed
+    // by filtering the whole board list each time).
+    final offlineBoards = alarm.offlineBoards;
+    // Everything below the app bar is a readout of what the backend last
+    // said. Without a live link that's history, not status, so it gets said
+    // out loud and shown dimmed rather than presented as current.
+    final linked = alarm.isBackendLinked;
 
     return Scaffold(
       appBar: AppBar(
@@ -36,7 +43,9 @@ class HomeScreen extends StatelessWidget {
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 16),
-            child: Center(child: _ConnectivityBadge(isOnline: alarm.isOnline)),
+            child: Center(
+              child: _ConnectivityBadge(isOnline: alarm.isOnline, linked: linked),
+            ),
           ),
         ],
       ),
@@ -51,18 +60,35 @@ class HomeScreen extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
           child: Column(
             children: [
-              Center(
-                child: AlarmStatusIndicator(
-                  state: alarm.state,
-                  sensors: alarm.sensors,
-                  armingSecondsRemaining: alarm.armingSecondsRemaining,
+              if (!linked) ...[
+                const _NoLinkBanner(),
+                const SizedBox(height: 18),
+              ],
+              // Dimmed together as one block: the ring and the headline are
+              // the two things a glance actually lands on, and when they're
+              // stale they should look it. The controls below stay at full
+              // strength — a disarm attempt with no link fails loudly (see
+              // AlarmService.lastError) rather than silently, so there's no
+              // reason to discourage trying.
+              Opacity(
+                opacity: linked ? 1 : 0.45,
+                child: Column(
+                  children: [
+                    Center(
+                      child: AlarmStatusIndicator(
+                        state: alarm.state,
+                        sensors: alarm.sensors,
+                        armingSecondsRemaining: alarm.armingSecondsRemaining,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    _StatusHeadline(
+                      state: alarm.state,
+                      armingSecondsRemaining: alarm.armingSecondsRemaining,
+                      entryDelaySecondsRemaining: alarm.entryDelaySecondsRemaining,
+                    ),
+                  ],
                 ),
-              ),
-              const SizedBox(height: 18),
-              _StatusHeadline(
-                state: alarm.state,
-                armingSecondsRemaining: alarm.armingSecondsRemaining,
-                entryDelaySecondsRemaining: alarm.entryDelaySecondsRemaining,
               ),
               const SizedBox(height: 28),
               // A single control-panel card groups sensor status and the
@@ -133,9 +159,9 @@ class HomeScreen extends StatelessWidget {
               // and the previous single ONLINE badge could never show it —
               // it latched on after the first heartbeat and stayed on even
               // when a board lost power.
-              if (alarm.offlineBoards.isNotEmpty) ...[
+              if (offlineBoards.isNotEmpty) ...[
                 const SizedBox(height: 20),
-                _OfflineBoardsBanner(boards: alarm.offlineBoards),
+                _OfflineBoardsBanner(boards: offlineBoards),
               ],
               const SizedBox(height: 28),
               _RecentEvents(events: alarm.events),
@@ -195,17 +221,13 @@ class _OfflineBoardsBanner extends StatelessWidget {
               children: [
                 Text(
                   boards.length == 1 ? 'SENSOR OFFLINE' : 'SENSORS OFFLINE',
-                  style: AppTheme.displayStyle(
-                    fontSize: 14,
-                    color: AppColors.transitional,
-                    letterSpacing: 1.2,
-                  ),
+                  style: AppTheme.displayBanner.copyWith(color: AppColors.transitional),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   '${boards.map((b) => b.label).join(', ')} '
                   '${boards.length == 1 ? 'has' : 'have'} stopped reporting',
-                  style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+                  style: AppTheme.monoDetail.copyWith(color: AppColors.textMuted),
                 ),
               ],
             ),
@@ -273,12 +295,7 @@ class _StatusHeadline extends StatelessWidget {
       children: [
         Text(
           alarmStateLabel(state),
-          style: AppTheme.displayStyle(
-            fontSize: 34,
-            fontWeight: FontWeight.w800,
-            color: color,
-            letterSpacing: 3,
-          ),
+          style: AppTheme.displayHeadline.copyWith(color: color),
         ),
         const SizedBox(height: 6),
         Container(width: 36, height: 3, color: color),
@@ -344,7 +361,7 @@ class _ArmModeCard extends StatelessWidget {
                 const SizedBox(height: 8),
                 Text(
                   title,
-                  style: AppTheme.displayStyle(fontSize: 15, color: fg, letterSpacing: 0.5),
+                  style: AppTheme.displayCardTitle.copyWith(color: fg),
                 ),
                 const SizedBox(height: 4),
                 Text(
@@ -363,31 +380,98 @@ class _ArmModeCard extends StatelessWidget {
   }
 }
 
-/// Small AppBar indicator (dot + "ONLINE"/"OFFLINE" label) reflecting
-/// [AlarmService.isOnline] — whether the backend/ESP32 connection is up.
-class _ConnectivityBadge extends StatelessWidget {
-  const _ConnectivityBadge({required this.isOnline});
+/// Strip across the top of the dashboard for when the app has lost its live
+/// link to the backend.
+///
+/// Deliberately a full-width, worded statement rather than a subtler cue: the
+/// failure it describes is invisible by nature. Every number on the screen
+/// still looks perfectly plausible — it just stopped changing — so the only
+/// thing that can distinguish "the house is quiet" from "the app went deaf"
+/// is the app saying which one it is.
+class _NoLinkBanner extends StatelessWidget {
+  const _NoLinkBanner();
 
-  /// Current connectivity state to display.
-  final bool isOnline;
-
-  /// Renders the dot + label pair, colored safe-green when online and
-  /// alarm-red when offline.
   @override
   Widget build(BuildContext context) {
-    final color = isOnline ? AppColors.safe : AppColors.alarm;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: AppColors.transitional.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.transitional.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          HomeGuardIcon(HGIcon.info, size: 18, color: AppColors.transitional),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'NO LIVE CONNECTION',
+                  style: AppTheme.displayBanner.copyWith(color: AppColors.transitional),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Showing the last state received — retrying',
+                  style: AppTheme.monoDetail.copyWith(color: AppColors.textMuted),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Small AppBar indicator (dot + status word) for the system's connectivity.
+///
+/// Three states, not two. [linked] is whether *this app* is hearing the
+/// backend; [isOnline] is the backend's own view of whether any ESP32 board
+/// is reporting. Only the second one used to be shown, which meant a dropped
+/// WebSocket left the last-received `esp32_online: true` on screen as a green
+/// ONLINE dot for as long as the reconnects kept failing — the dashboard
+/// frozen underneath it, and nothing anywhere saying so.
+class _ConnectivityBadge extends StatelessWidget {
+  const _ConnectivityBadge({required this.isOnline, required this.linked});
+
+  /// The backend's report on the ESP32 boards. Meaningless while [linked] is
+  /// false, since it can only be as fresh as the last frame received.
+  final bool isOnline;
+
+  /// Whether the app currently has a live link to the backend.
+  final bool linked;
+
+  /// Renders the dot + label pair: amber and hollow when there's no link at
+  /// all, then safe-green/alarm-red for the boards' own status.
+  @override
+  Widget build(BuildContext context) {
+    final color = !linked
+        ? AppColors.transitional
+        : (isOnline ? AppColors.safe : AppColors.alarm);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Container(
           width: 8,
           height: 8,
-          decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            // Hollow while unlinked, so the difference reads even in a
+            // grayscale screenshot or to someone who can't separate the amber
+            // from the green.
+            color: linked ? color : Colors.transparent,
+            border: linked ? null : Border.all(color: color, width: 1.5),
+          ),
         ),
         const SizedBox(width: 6),
         Text(
-          isOnline ? 'ONLINE' : 'OFFLINE',
-          style: AppTheme.monoStyle(fontSize: 10, color: color, letterSpacing: 1),
+          !linked ? 'NO LINK' : (isOnline ? 'ONLINE' : 'OFFLINE'),
+          style: AppTheme.monoBadge.copyWith(color: color),
         ),
       ],
     );
@@ -420,12 +504,7 @@ class _RecentEvents extends StatelessWidget {
           children: [
             Text(
               'RECENT ACTIVITY',
-              style: AppTheme.displayStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: AppColors.textMuted,
-                letterSpacing: 1.5,
-              ),
+              style: AppTheme.displayEyebrow.copyWith(color: AppColors.textMuted),
             ),
             TextButton(
               onPressed: () => Navigator.of(context).push(

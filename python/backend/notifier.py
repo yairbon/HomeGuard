@@ -33,6 +33,8 @@ import logging
 
 import httpx
 
+from .http_clients import build_client
+
 logger = logging.getLogger("notifier")
 
 # Short, because this runs on the alert path. A slow or unreachable ntfy
@@ -40,7 +42,9 @@ logger = logging.getLogger("notifier")
 # — see `notify` for how that's guaranteed.
 _TIMEOUT = 5.0
 
-_client = httpx.AsyncClient(timeout=_TIMEOUT, trust_env=False)
+# The one client here that genuinely uses TLS — and the reason the trust store
+# is built once in http_clients.py and shared, rather than three times.
+_client = build_client(timeout=_TIMEOUT)
 
 # Strong references to in-flight `notify()` tasks. See `notify` for why the
 # alternative — letting the loop's weak reference be the only one — can drop

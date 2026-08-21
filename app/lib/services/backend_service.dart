@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// The states the alarm can be in. Mirrors `AlarmState` in
 /// python/backend/models.py.
 ///
@@ -115,11 +117,23 @@ class LoginResult {
   final int lockoutRemainingSeconds;
   final int attemptsRemaining;
 
+  /// False when the login request never reached the backend at all.
+  ///
+  /// Without this axis a failed *request* was indistinguishable from a
+  /// rejected *password*: the unreachable case came back as
+  /// `LoginResult(ok: false)`, [attemptsRemaining] defaulted to 0, and the
+  /// login screen told the user "Wrong password (0 attempt(s) left)" — an
+  /// accusation about their password and a fabricated lockout warning, when
+  /// the actual problem was a backend URL that nothing was listening on.
+  /// Same reason [KeypadPinResult] carries one.
+  final bool reachable;
+
   const LoginResult({
     required this.ok,
     this.lockedOut = false,
     this.lockoutRemainingSeconds = 0,
     this.attemptsRemaining = 0,
+    this.reachable = true,
   });
 }
 
@@ -155,6 +169,31 @@ class KeypadPinResult {
   });
 }
 
+/// Outcome of enrolling a face — creating the record *and* giving it a photo
+/// to actually recognise with.
+///
+/// Split out because the two halves fail differently and the user needs to
+/// know which happened. Previously the app only ever did the first half:
+/// `POST /faces` creates a record with no training photos, and nothing in
+/// `app/` ever called `/faces/{id}/photo`. So every face added from the phone
+/// appeared in the list under a caption promising it would be "recognized as
+/// a resident", and could never match anything at all.
+enum EnrollFaceOutcome {
+  /// Record created and a photo attached — the face can now be recognised.
+  enrolled,
+
+  /// No camera frame was available. The record is deliberately not created,
+  /// so there is no inert leftover to clean up.
+  noFrame,
+
+  /// A frame arrived but the backend found no face in it. The record *was*
+  /// created; the user should retry the photo rather than re-adding the name.
+  noFaceInFrame,
+
+  /// The backend couldn't be reached, or refused the request.
+  failed,
+}
+
 /// Push-notification target: an ntfy server and topic.
 ///
 /// On the public ntfy.sh the topic name is the only thing keeping strangers
@@ -170,6 +209,53 @@ class NtfyConfig {
   /// Whether push notifications are actually on. Pushing is opt-in: no topic
   /// means the backend never sends anything.
   bool get enabled => topic.isNotEmpty;
+}
+
+/// Every backend-stored setting the settings screen edits, read in one go.
+///
+/// This used to be four independent getters ([BackendService.getSettings]'s
+/// predecessors), each of which fetched the whole of `/state` — four
+/// requests, each carrying the entire event log, to read four scalars. Worse,
+/// each swallowed transport failures and substituted its own default, so an
+/// unreachable backend rendered as a *loaded* settings screen showing a blank
+/// emergency number and a blank ntfy topic. One tap on save then wrote those
+/// blanks back, silently switching off the only alert channel that works with
+/// the app closed. Returning this as a single nullable value makes "we never
+/// heard back" impossible to mistake for "the answers are all empty".
+class AppSettings {
+  const AppSettings({
+    required this.nightMode,
+    required this.nightModeArmHour,
+    required this.nightModeDisarmHour,
+    required this.emergencyNumber,
+    required this.policeCallDelaySeconds,
+    required this.ntfy,
+  });
+
+  /// Whether night mode (auto-arm overnight) is enabled.
+  final bool nightMode;
+
+  /// Whole hours (0-23) at which night mode arms and disarms.
+  ///
+  /// The backend has carried these in every state frame since night mode
+  /// gained a real scheduler, and shipped a `/settings/night-mode-hours`
+  /// route to change them — but nothing in the app read either, so the window
+  /// was frozen at the server defaults of 23:00-07:00 and the toggle said
+  /// only "automatically arm overnight" without ever naming a time. A shift
+  /// worker enabling it got the house armed around them at 23:00 with no way
+  /// to move it.
+  final int nightModeArmHour;
+  final int nightModeDisarmHour;
+
+  /// The configured emergency contact number (empty string if unset).
+  final String emergencyNumber;
+
+  /// How long after a triggered alert the backend escalates if nobody has
+  /// cleared it.
+  final int policeCallDelaySeconds;
+
+  /// Where the backend pushes alerts so they arrive with this app closed.
+  final NtfyConfig ntfy;
 }
 
 /// Everything the app needs from the backend. HttpBackendService talks to
@@ -236,7 +322,29 @@ abstract class BackendService {
 
   /// Emits whether *any* ESP32 board is currently reachable — the single
   /// badge on the dashboard. See [boardsStream] for which specific boards.
+  ///
+  /// Note what this is *not*: it is the backend's opinion of the boards, so
+  /// it can only ever arrive over a working connection. See
+  /// [backendLinkStream] for whether this app can hear the backend at all.
   Stream<bool> get connectivityStream;
+
+  /// Emits whether this app currently has a live link to the backend — i.e.
+  /// whether anything on the dashboard is still being updated.
+  ///
+  /// Deliberately separate from [connectivityStream]: that one relays the
+  /// backend's `esp32_online` ("the boards are talking to the backend"),
+  /// which says nothing about whether *we* are talking to the backend.
+  /// Nothing used to report that, so when the WebSocket dropped, the
+  /// dashboard froze on its last values — sensors OK, system disarmed —
+  /// behind a green ONLINE dot, indefinitely and with no reconnect visible
+  /// to the user. On an alarm panel a frozen readout that still claims to be
+  /// live is the worst of both worlds: it looks exactly like a quiet house.
+  ///
+  /// Implementations emit false as soon as the link drops (and while
+  /// reconnecting) and true again on the first frame received after a
+  /// successful connect — a frame arriving is the only real proof the link
+  /// works end to end.
+  Stream<bool> get backendLinkStream;
 
   /// Emits the status of each of the three ESP32 boards whenever any of them
   /// changes (see [BoardStatus]).
@@ -259,7 +367,26 @@ abstract class BackendService {
   Stream<List<ApprovedFace>> get facesStream;
 
   /// Registers a new approved face under [name] for the face-ID flow.
-  Future<void> addFace(String name);
+  /// Registers a new approved face under [name], returning its backend id —
+  /// or null if the call failed.
+  ///
+  /// The id matters because a face record on its own is inert: recognition
+  /// matches against training photos, and a record with none can never match
+  /// anything. Prefer [AlarmService.enrollFace] over calling this directly,
+  /// unless you genuinely want a nameplate with no face behind it.
+  Future<String?> addFace(String name);
+
+  /// Attaches a training photo to an existing approved face. Returns whether
+  /// the backend accepted it — it rejects a frame with no detectable face
+  /// (422), which is a normal outcome worth showing the user, not an error.
+  Future<bool> addFacePhoto(String id, Uint8List jpeg);
+
+  /// The most recent frame any camera uploaded, or null if none has arrived
+  /// or the request failed.
+  ///
+  /// Read from the backend's cache rather than the live MJPEG stream, so
+  /// enrolling a face doesn't require the camera screen to be open.
+  Future<Uint8List?> captureCameraFrame();
 
   /// Removes the approved face with the given [id].
   Future<void> removeFace(String id);
@@ -271,22 +398,19 @@ abstract class BackendService {
   /// offline independently of each other.
   Stream<bool> get cameraOnlineStream;
 
-  /// The backend's `/camera/latest` URL — the most recent frame a camera
-  /// worker uploaded, served as a JPEG — or null when there's no way to
-  /// authenticate a request right now (not logged in yet) or no real
-  /// backend to ask at all ([MockBackendService]). Callers should append a
-  /// cache-busting query parameter before each fetch: the URL is otherwise
-  /// identical between refreshes, and Image.network caches by URL.
-  String? get cameraFrameUrl;
-
-  /// Headers a request to [cameraFrameUrl] needs to authenticate.
+  /// Headers a request to [cameraStreamUrl] needs to authenticate.
   Map<String, String> get cameraFrameHeaders;
 
   /// The backend's `/camera/stream` URL — a continuous MJPEG multipart
-  /// stream proxied from the ESP32-CAM's own /stream endpoint, replacing
-  /// the poll-a-JPEG-repeatedly approach [cameraFrameUrl] used. Same
-  /// null-when-unavailable contract as [cameraFrameUrl]; same
-  /// [cameraFrameHeaders] authenticate a request to it too.
+  /// stream proxied from the ESP32-CAM's own /stream endpoint — or null when
+  /// there's no way to authenticate a request right now (not logged in yet)
+  /// or no real backend to ask at all ([MockBackendService]).
+  ///
+  /// This replaced a `cameraFrameUrl` pointing at `/camera/latest`, which
+  /// the screen polled a couple of times a second. That getter outlived its
+  /// last call site and was carried on all three of these classes for
+  /// nothing; it's gone now. [cameraFrameHeaders] kept its name because it
+  /// is still what authenticates a request to this URL.
   String? get cameraStreamUrl;
 
   /// Emits whether face-ID recognition is currently enabled.
@@ -315,34 +439,29 @@ abstract class BackendService {
   Future<void> simulateFaceRecognition();
 
   // Settings — loaded once by SettingsScreen, no need to stream these
-  /// Whether night mode (auto-arm overnight) is currently enabled.
-  Future<bool> getNightMode();
+  /// Reads every backend-stored setting in a single request, or null if the
+  /// backend couldn't be reached (see [AppSettings] for why that distinction
+  /// is load-bearing rather than a nicety).
+  Future<AppSettings?> getSettings();
 
   /// Enables/disables night mode.
   Future<void> setNightMode(bool enabled);
 
-  /// The configured emergency contact number (empty string if unset).
-  Future<String> getEmergencyNumber();
+  /// Sets the hours night mode arms and disarms at. Both are whole hours in
+  /// 0-23; the backend clamps rather than rejecting.
+  Future<void> setNightModeHours(int armHour, int disarmHour);
 
   /// Sets the emergency contact [number].
   Future<void> setEmergencyNumber(String number);
 
-  /// How long, in seconds, the system waits after a triggered alert
-  /// before auto-dialing the emergency number.
-  Future<int> getPoliceCallDelaySeconds();
-
   /// Sets the police-call delay, in [seconds].
   Future<void> setPoliceCallDelaySeconds(int seconds);
 
-  /// Where the backend pushes alerts so they arrive with this app closed —
-  /// the ntfy server URL and topic name (see `python/backend/notifier.py`).
+  /// Sets the push target — the ntfy server URL and topic name (see
+  /// `python/backend/notifier.py`). An empty [topic] disables pushing.
   ///
-  /// This exists because the app's own notifications only fire while its
-  /// process is alive: swipe it away and a break-in produces nothing. An
-  /// empty topic means pushing is off.
-  Future<NtfyConfig> getNtfyConfig();
-
-  /// Sets the push target. An empty [topic] disables pushing.
+  /// Pushing exists because the app's own notifications only fire while its
+  /// process is alive: swipe it away and a break-in produces nothing.
   Future<void> setNtfyConfig(String server, String topic);
 
   /// Sends a test push so the user can confirm the topic works before

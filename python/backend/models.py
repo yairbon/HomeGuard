@@ -58,7 +58,7 @@ class EventCategory(StrEnum):
 
 
 class SensorType(StrEnum):
-    """Identifies which of the three ESP32 boards a sensor reading or
+    """Identifies which of the three sensor boards a sensor reading or
     event refers to."""
 
     ultrasonic = "ultrasonic"
@@ -97,8 +97,9 @@ class ApprovedFace(BaseModel):
 
 
 class BoardStatus(BaseModel):
-    """Liveness of one of the three ESP32 boards, derived from when it last
-    called `/esp32/heartbeat`.
+    """Liveness of one of the three heartbeating ESP32 boards, derived from
+    when it last called `/esp32/heartbeat`. (The fourth board, the ESP32-CAM,
+    doesn't heartbeat — it reports through `camera_online` instead.)
 
     Exists because a single aggregate `esp32_online` flag couldn't express
     "the vibration board is dead but the other two are fine" — and, worse,

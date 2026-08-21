@@ -236,6 +236,83 @@ async def test_state_shape_matches_the_flutter_client(auth_client):
     assert set(body["boards"][0]) == {"name", "online", "last_seen"}
 
 
+# ---- Keeping the event loop free -------------------------------------------
+
+
+async def test_recognition_runs_off_the_event_loop(auth_client, app_module, monkeypatch):
+    """Recognition is ~21ms of OpenCV per frame and the ESP32-CAM pushes two
+    frames a second, all of it on the single event loop that also broadcasts
+    alarm state, answers the boards and holds every app's WebSocket.
+
+    The stall is exaggerated here so the result is decidable rather than
+    timing-dependent: with the call back on the loop, no tick gets through at
+    all.
+    """
+    import asyncio
+    import time
+
+    def blocking_recognize(image_bytes):
+        time.sleep(0.3)
+        return None
+
+    monkeypatch.setattr(app_module.faces, "recognize", blocking_recognize)
+
+    ticks = 0
+
+    async def tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    try:
+        response = await auth_client.post(
+            "/camera/recognize", files={"photo": ("frame.jpg", _png(8, 8), "image/jpeg")}
+        )
+    finally:
+        ticker.cancel()
+
+    assert response.status_code == 200
+    assert ticks >= 5, f"the loop stalled for the whole recognition ({ticks} ticks)"
+
+
+async def test_two_enrolments_never_rebuild_the_recognizer_at_once(
+    auth_client, app_module, monkeypatch
+):
+    """Moving `retrain` into a worker thread created concurrency that the
+    event loop used to prevent, and two rebuilds must not overlap: `train`
+    repopulates the embedding map in place (so a reader can hit "dictionary
+    changed size during iteration") and the cv2 detector/recognizer objects
+    underneath are shared and stateful. The lock is what keeps that from
+    happening; this pins it.
+    """
+    import asyncio
+    import time
+
+    in_flight = 0
+    peak = 0
+
+    def tracking_retrain():
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        time.sleep(0.05)
+        in_flight -= 1
+
+    monkeypatch.setattr(app_module.faces, "register_face", lambda face_id, data: True)
+    monkeypatch.setattr(app_module.faces, "retrain", tracking_retrain)
+
+    face = (await auth_client.post("/faces", json={"name": "Concurrent"})).json()
+    photo = {"photo": ("frame.png", _png(8, 8), "image/png")}
+    responses = await asyncio.gather(
+        *(auth_client.post(f"/faces/{face['id']}/photo", files=photo) for _ in range(3))
+    )
+
+    assert all(r.status_code == 200 for r in responses)
+    assert peak == 1, f"{peak} rebuilds ran at the same time"
+
+
 async def test_websocket_requires_a_token(app_module):
     """An unauthenticated socket must be refused before `accept()`, so it is
     never registered for broadcasts and never receives a single state frame —

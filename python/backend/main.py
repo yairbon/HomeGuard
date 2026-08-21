@@ -1,7 +1,7 @@
-"""HomeGuard backend — unifies communication with the three ESP32 boards
-(ultrasonic sensor, vibration sensor, door/keypad controller) and face
-recognition, and serves the Flutter app. See README.md in this directory
-for how to run it, and esp32/ for the three board sketches.
+"""HomeGuard backend — unifies communication with the four ESP32 boards
+(ultrasonic sensor, vibration sensor, door/keypad controller, ESP32-CAM) and
+face recognition, and serves the Flutter app. See README.md in this directory
+for how to run it, and esp32/ for the four board sketches.
 
 Every route here is behind one of two credentials — see `require_app` and
 `require_device` below, and `security.py` for what those credentials are and
@@ -12,6 +12,7 @@ in the first place).
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
@@ -37,6 +38,7 @@ from starlette.responses import StreamingResponse
 
 from . import esp32_client, notifier
 from .face_recognition_service import FaceRecognitionService
+from .http_clients import build_client
 from .models import (
     AddFaceRequest,
     ApprovedFace,
@@ -58,7 +60,7 @@ from .models import (
     SetPoliceCallDelayRequest,
     TriggerAlertRequest,
 )
-from .state import state
+from .state import BOARD_FOR_SENSOR, state
 
 logging.basicConfig(level=logging.INFO)
 
@@ -74,6 +76,24 @@ faces = FaceRecognitionService(
     models_dir=BASE_DIR / "models",
 )
 
+# Serializes every call into `faces`.
+#
+# Needed because those calls now run in worker threads (`asyncio.to_thread`)
+# instead of on the event loop, and the event loop was the thing that used to
+# guarantee they never overlapped. They cannot safely overlap: `retrain`
+# rebuilds the embedding map in place, so a recognition running concurrently
+# can iterate a dict that is being repopulated ("dictionary changed size
+# during iteration"), and the underlying cv2 detector/recognizer objects are
+# shared, stateful and not thread-safe — `_detect` calls `setInputSize` on the
+# shared detector immediately before using it, so two differently-sized frames
+# in flight at once is a genuine race, not a theoretical one.
+#
+# Recognition is ~21ms and the camera sends 2 frames a second, so serializing
+# costs nothing that matters. The point of the threads is to keep the *event
+# loop* free (it is also pushing alarm state to every connected app), not to
+# run recognitions in parallel.
+_recognizer_lock = asyncio.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,7 +106,13 @@ async def lifespan(app: FastAPI):
     state.start_monitor()
     yield
     await state.stop_monitor()
+    # Every outbound client this process owns, closed on the way out. Leaving
+    # them to the garbage collector means sockets to the door controller and
+    # the camera that nothing ever tore down, plus httpx's "client was never
+    # closed" warnings on every shutdown.
     await notifier.aclose()
+    await esp32_client.aclose()
+    await _cam_stream_client.aclose()
 
 
 app = FastAPI(title="HomeGuard Backend", lifespan=lifespan)
@@ -308,8 +334,13 @@ async def remove_face(face_id: str):
     (recognizer storage vs. app-facing state) with no shared transaction,
     but both are called unconditionally, so this face is fully forgotten
     either way.
+
+    `faces.remove_face` deletes files and then retrains, which is measurably
+    slow (~10ms per enrolled photo — half a second at 50), so it runs in a
+    worker thread under [_recognizer_lock] rather than on the event loop.
     """
-    faces.remove_face(face_id)
+    async with _recognizer_lock:
+        await asyncio.to_thread(faces.remove_face, face_id)
     await state.remove_face(face_id)
     return {"ok": True}
 
@@ -322,25 +353,30 @@ async def upload_face_photo(face_id: str, photo: UploadFile):
     deleted). 422s if no face could be detected in the uploaded image —
     a common user-facing case (bad angle/lighting/no face at all), hence
     the more specific "unprocessable entity" status rather than a generic
-    error. Retrains the recognizer synchronously right after so the new
-    photo is usable immediately; fine at this dataset size, but would
-    become a blocking cost worth moving off the event loop if the face set
-    ever grew large.
+    error. Retrains the recognizer right after so the new photo is usable
+    immediately.
+
+    Both steps run in a worker thread, and both under the same hold of
+    [_recognizer_lock] so nothing can recognize against a half-rebuilt model
+    in between. `retrain` re-embeds every enrolled photo — measured at ~10ms
+    each, so 556ms at 50 photos — which is far too long to spend on the event
+    loop that is also pushing alarm state to every connected app.
     """
     if not any(f.id == face_id for f in state.faces):
         raise HTTPException(status_code=404, detail="No approved face with that id")
     image_bytes = await photo.read()
-    try:
-        detected = faces.register_face(face_id, image_bytes)
-    except ValueError as exc:
-        # The upload wasn't a decodable image at all (truncated, corrupt, or
-        # not an image). Same 422 family as "no face found" — the request was
-        # well-formed, its payload wasn't usable — rather than letting the
-        # ValueError escape as an opaque 500.
-        raise HTTPException(status_code=422, detail=f"Unreadable image: {exc}") from exc
-    if not detected:
-        raise HTTPException(status_code=422, detail="No face detected in that photo")
-    faces.retrain()
+    async with _recognizer_lock:
+        try:
+            detected = await asyncio.to_thread(faces.register_face, face_id, image_bytes)
+        except ValueError as exc:
+            # The upload wasn't a decodable image at all (truncated, corrupt,
+            # or not an image). Same 422 family as "no face found" — the
+            # request was well-formed, its payload wasn't usable — rather than
+            # letting the ValueError escape as an opaque 500.
+            raise HTTPException(status_code=422, detail=f"Unreadable image: {exc}") from exc
+        if not detected:
+            raise HTTPException(status_code=422, detail="No face detected in that photo")
+        await asyncio.to_thread(faces.retrain)
     return {"ok": True}
 
 
@@ -438,9 +474,11 @@ async def set_police_call_delay(body: SetPoliceCallDelayRequest):
 
 
 # ---- ESP32 -------------------------------------------------------------------
-# Three separate boards call into these (see esp32/README.md for which):
+# Three of the four boards call into these (see esp32/README.md for which):
 # ultrasonic + vibration sensor boards call heartbeat + sensor-event only;
-# the door/keypad controller (the arm/disarm authority) calls all three.
+# the door/keypad controller (the arm/disarm authority) calls all four routes.
+# The fourth board, the ESP32-CAM, talks to /camera/* instead and never
+# appears here.
 #
 # All of them require the shared device key (see `require_device`). Without
 # it, anything that could reach the network could forge a sensor breach — or,
@@ -451,10 +489,12 @@ async def set_police_call_delay(body: SetPoliceCallDelayRequest):
 async def esp32_heartbeat(board: str = Query(...)):
     """Called every 10 seconds by each board to report that it's alive.
 
-    `board` identifies which one, so the app can show all three separately.
-    It's required rather than optional: an unnamed heartbeat would have to be
-    attributed to some default board, which would show a board as online that
-    might in fact be the dead one.
+    `board` identifies which one, so the app can show each of the three
+    heartbeating boards separately. It's required rather than optional: an
+    unnamed heartbeat would have to be attributed to some default board, which
+    would show a board as online that might in fact be the dead one. A name
+    that isn't one of the three is accepted and then ignored — see
+    AppState.note_board_seen.
     """
     await state.note_board_seen(board)
     return {"ok": True}
@@ -477,8 +517,15 @@ async def esp32_sensor_event(
     reachable) and forwards to AppState.trigger_alert, which itself no-ops
     unless the system is currently armed and the reporting sensor isn't
     bypassed.
+
+    The board name is looked up from the sensor when the caller didn't send
+    one. It used to fall back to `sensor.value` directly, which is right for
+    two of the three and wrong for the important one: the door sensor belongs
+    to `door_controller`, so a door breach recorded liveness under the name
+    "door" — a key no board is called and `board_statuses` never reads. The
+    fallback therefore marked nothing at all online.
     """
-    await state.note_board_seen(board or sensor.value)
+    await state.note_board_seen(board or BOARD_FOR_SENSOR[sensor])
     await state.trigger_alert(sensor, reason)
     return {"ok": True}
 
@@ -530,7 +577,7 @@ async def recognize_frame(photo: UploadFile):
     label map) so a face that was deleted from state, but whose trained
     photos linger for any reason, doesn't get reported as a match.
     """
-    await state.set_camera_online(True)
+    await state.note_camera_frame()
 
     # Read (and cache for /camera/latest) before the face-ID toggle check
     # below — the live view should keep working even with recognition
@@ -544,7 +591,13 @@ async def recognize_frame(photo: UploadFile):
         return {"matched": False}
 
     try:
-        face_id = faces.recognize(image_bytes)
+        # ~21ms of OpenCV per frame, and the ESP32-CAM pushes two frames a
+        # second — 4% of this process's only event loop, spent where it also
+        # has to broadcast alarm state, answer the boards and hold every
+        # WebSocket. The lock is what keeps a concurrent enrolment from
+        # rebuilding the model underneath this; see [_recognizer_lock].
+        async with _recognizer_lock:
+            face_id = await asyncio.to_thread(faces.recognize, image_bytes)
     except ValueError as exc:
         # A corrupt or non-image frame is a bad request, not a server fault.
         # This used to escape as a 500 with a traceback — and it was masked
@@ -589,7 +642,13 @@ CAMERA_STREAM_URL = os.environ.get("HOMEGUARD_CAMERA_STREAM_URL", "")
 # the single most common way a naive port of this pattern breaks), and a
 # small connection cap (the ESP32-CAM's own tiny web server can only serve
 # one or two concurrent stream clients anyway).
-_cam_stream_client = httpx.AsyncClient(
+#
+# Separate profile, shared trust store: `build_client` is what stops this from
+# parsing the system CA bundle a third time at import, and it also supplies
+# the `trust_env=False` this client was missing — the camera is a LAN IP, and
+# an HTTP_PROXY in the environment would send the stream request to a proxy
+# with no route to it.
+_cam_stream_client = build_client(
     timeout=httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0),
     limits=httpx.Limits(max_connections=4, max_keepalive_connections=0),
 )

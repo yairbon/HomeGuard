@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -18,9 +16,9 @@ class LoginScreen extends StatefulWidget {
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
-/// State for [LoginScreen]. Owns the password field's controller/focus
-/// state and a local timer that keeps the lockout countdown text repainting
-/// once per second.
+/// State for [LoginScreen]. Owns the password field's controller and
+/// obscure/visibility state; the lockout countdown is watched straight off
+/// [AuthService] (see [build]).
 class _LoginScreenState extends State<LoginScreen> {
   /// Backs the password [TextFormField].
   final _passwordController = TextEditingController();
@@ -33,16 +31,10 @@ class _LoginScreenState extends State<LoginScreen> {
   /// the field's visibility-eye suffix icon.
   bool _obscure = true;
 
-  /// Local 1-second repaint timer, active only while [AuthService.isLockedOut]
-  /// is true. See [_ensureTicker] for why this exists.
-  Timer? _ticker;
-
-  /// Releases the text controller and stops the countdown ticker so it
-  /// doesn't keep firing (and calling setState) after this widget is gone.
+  /// Releases the text controller.
   @override
   void dispose() {
     _passwordController.dispose();
-    _ticker?.cancel();
     super.dispose();
   }
 
@@ -56,45 +48,20 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
-  /// Makes sure a 1-second repaint [Timer] is running while the account is
-  /// locked out, so the "try again in Ns" countdown in [build] visibly
-  /// ticks down instead of only updating whenever some other state change
-  /// happens to trigger a rebuild.
-  ///
-  /// Called on every [build], so the `_ticker == null` guard is what stops
-  /// it from spawning a new competing [Timer.periodic] on every single
-  /// rebuild while still locked out — without it we'd leak a fresh timer
-  /// each time [AuthService] notifies listeners.
-  ///
-  /// The timer cancels and clears itself as soon as `auth.isLockedOut` goes
-  /// false, so it doesn't keep ticking (and calling setState) once the
-  /// lockout ends.
-  ///
-  /// Note: [AuthService] already runs its own per-second countdown
-  /// internally (`AuthService._startCountdown`) that calls
-  /// `notifyListeners()`, which on its own would already rebuild this
-  /// screen via `context.watch<AuthService>()` below. This local ticker's
-  /// `setState` may therefore be redundant with that — flagging it here
-  /// rather than changing the behavior.
-  void _ensureTicker(AuthService auth) {
-    if (auth.isLockedOut && _ticker == null) {
-      _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() {});
-        if (!auth.isLockedOut) {
-          _ticker?.cancel();
-          _ticker = null;
-        }
-      });
-    }
-  }
-
   /// Builds the login form: an animated shield badge, a title, a
   /// status/error line, the password field, and the submit button — all of
   /// which react to the watched [AuthService]'s checking/error/lockout state.
+  ///
+  /// This screen used to run its own `Timer.periodic` calling `setState`
+  /// every second so the lockout countdown would visibly tick. That was a
+  /// second timer *and* a second full-screen rebuild on top of the one
+  /// `AuthService._startCountdown` already caused via `notifyListeners()` —
+  /// the old code's own comment said as much. Now the service ticks a
+  /// [ValueNotifier] and only notifies on real transitions, and the one
+  /// [Text] that shows the number subscribes to it directly.
   @override
   Widget build(BuildContext context) {
     final auth = context.watch<AuthService>();
-    _ensureTicker(auth);
     final locked = auth.isLockedOut;
 
     return Scaffold(
@@ -138,19 +105,22 @@ class _LoginScreenState extends State<LoginScreen> {
                   const SizedBox(height: 20),
                   Text(
                     'HOMEGUARD',
-                    style: AppTheme.displayStyle(
-                      fontSize: 38,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 4,
-                    ),
+                    style: AppTheme.displayBrand,
                   ),
                   const SizedBox(height: 8),
-                  Text(
-                    locked
-                        ? 'Locked out — try again in ${auth.lockoutRemaining.inSeconds}s'
-                        : 'Enter the system password to continue',
-                    style: TextStyle(color: locked ? AppColors.alarm : AppColors.textMuted),
-                  ),
+                  if (locked)
+                    ValueListenableBuilder<int>(
+                      valueListenable: auth.lockoutSecondsRemaining,
+                      builder: (context, seconds, _) => Text(
+                        'Locked out — try again in ${seconds}s',
+                        style: const TextStyle(color: AppColors.alarm),
+                      ),
+                    )
+                  else
+                    Text(
+                      'Enter the system password to continue',
+                      style: TextStyle(color: AppColors.textMuted),
+                    ),
                   const SizedBox(height: 40),
                   TextFormField(
                     controller: _passwordController,

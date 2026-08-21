@@ -384,3 +384,76 @@ async def test_an_expired_lockout_cannot_be_cleared_early(state):
 
     assert state.is_locked_out is True
     assert state.attempts_remaining == 0
+
+
+# ---- Keeping the event loop free -------------------------------------------
+
+
+async def _count_loop_ticks_during(coro):
+    """Runs `coro` while a second task ticks every 10ms, and returns how many
+    ticks got through.
+
+    The whole backend is one event loop — it also holds every app's WebSocket
+    and answers all four boards — so "did this run off the loop?" is a
+    behavioural question, not a stylistic one, and this is what asks it.
+    """
+    import asyncio
+
+    ticks = 0
+
+    async def tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    try:
+        result = await coro
+    finally:
+        ticker.cancel()
+    return result, ticks
+
+
+async def test_login_does_not_block_the_event_loop(state, monkeypatch):
+    """scrypt is deliberately expensive — ~50ms per verification, and
+    `change_password` pays it twice (~150ms). Run on the event loop, that is
+    150ms in which no alarm state reaches any connected phone, on a path that
+    by design allows three attempts before any lockout applies.
+    """
+    import time
+
+    from backend import state as state_module
+
+    def slow_verify(password, stored):
+        time.sleep(0.2)  # stands in for scrypt, exaggerated so it's decidable
+        return True
+
+    monkeypatch.setattr(state_module, "verify_password", slow_verify)
+
+    token, ticks = await _count_loop_ticks_during(state.login("homeguard"))
+
+    assert token is not None
+    assert ticks >= 5, f"the loop stalled for the whole verification ({ticks} ticks)"
+
+
+async def test_changing_the_password_does_not_block_the_event_loop(state, monkeypatch):
+    import time
+
+    from backend import state as state_module
+
+    def slow_verify(password, stored):
+        time.sleep(0.1)
+        return True
+
+    def slow_hash(password):
+        time.sleep(0.1)
+        return "scrypt$00$00"
+
+    monkeypatch.setattr(state_module, "verify_password", slow_verify)
+    monkeypatch.setattr(state_module, "hash_password", slow_hash)
+
+    ok, ticks = await _count_loop_ticks_during(state.change_password(PASSWORD, "new-one"))
+
+    assert ok is True
+    assert ticks >= 5, f"the loop stalled for the whole change ({ticks} ticks)"

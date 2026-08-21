@@ -17,6 +17,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 from fastapi import WebSocket
 
@@ -40,6 +41,23 @@ MAX_LOGIN_ATTEMPTS = 3
 LOCKOUT_DURATION = timedelta(seconds=30)
 ARMING_EXIT_DELAY = timedelta(seconds=3)
 
+# How long past the door controller's own entry-delay deadline the backend
+# waits before raising the alarm itself. See `_entry_delay_watchdog`: the
+# controller is meant to report the outcome, and this is the fallback for when
+# it can't. Small, but not zero — the board's report has to cross a WiFi hop,
+# and beating it to the punch would mean logging an alarm for an entry that
+# was in fact disarmed a few hundred milliseconds earlier.
+ENTRY_DELAY_GRACE = timedelta(seconds=5)
+
+# Bounds on the "alarm not cleared" escalation delay. The lower bound is the
+# real one: `_escalate_after_delay` sleeps this many seconds, and
+# `asyncio.sleep()` with a negative argument returns *immediately*, so a
+# negative setting fired the "nobody has dealt with this alarm" escalation in
+# the same breath as the alarm itself. The upper bound is just a sanity cap —
+# an escalation an hour later is already well past useful.
+MIN_POLICE_CALL_DELAY = 0
+MAX_POLICE_CALL_DELAY = 3600
+
 # A board is considered offline once this long has passed with no heartbeat.
 # The sketches ping every 10 seconds, so this tolerates two consecutive
 # missed pings before reporting a problem — long enough not to flicker on one
@@ -55,11 +73,35 @@ BOARD_MONITOR_INTERVAL = 5.0
 # for hour-granularity scheduling and costs essentially nothing.
 NIGHT_MODE_CHECK_INTERVAL = 60.0
 
-# Names the three sketches identify themselves with on /esp32/heartbeat.
-# Kept as plain strings (not a SensorType) because the door controller is not
-# a sensor — it's the arm/disarm authority that also happens to own the door
-# reed switch.
+# Names the three heartbeating sketches identify themselves with on
+# /esp32/heartbeat. (There are four boards; the fourth, the ESP32-CAM, only
+# pushes frames to /camera/recognize and never heartbeats.) Kept as plain
+# strings (not a SensorType) because the door controller is not a sensor —
+# it's the arm/disarm authority that also happens to own the door reed switch.
+#
+# Also the allow-list for `note_board_seen`: `board` arrives as a query string
+# from the network, so without this check `_board_last_seen` was a dict an
+# authenticated-but-buggy (or hostile) caller could grow without bound, one
+# key per name it invented.
 BOARD_NAMES = ("ultrasonic", "vibration", "door_controller")
+
+# Which board owns each sensor, for reports that don't name one. Only the door
+# is a surprise: the door reed switch hangs off the *controller*, so a door
+# event means "door_controller was heard from", not a board called "door".
+# `/esp32/sensor-event` used to fall back to the sensor's own name, which for
+# the door meant recording liveness under a key nothing ever reads — the
+# fallback silently marked nothing online at all.
+BOARD_FOR_SENSOR = {
+    SensorType.ultrasonic: "ultrasonic",
+    SensorType.vibration: "vibration",
+    SensorType.door: "door_controller",
+}
+
+# How long to wait before logging the same recognised face again. Chosen to be
+# long enough that a person lingering in front of the camera produces one entry
+# rather than one every 500 ms, and short enough that genuinely separate
+# arrivals are still recorded separately.
+FACE_LOG_COOLDOWN = timedelta(seconds=60)
 
 # Keeping every event forever would grow without bound in a process meant to
 # run for weeks. The app's log screen only ever shows a scrollback anyway.
@@ -95,6 +137,42 @@ def is_valid_keypad_pin(pin: object) -> bool:
     )
 
 
+_T = TypeVar("_T")
+
+
+def _scalar(data: dict, key: str, default: _T) -> _T:
+    """`data.get(key, default)` that also rejects a value of the wrong type.
+
+    `state.json` is a plain file a user may well have opened and edited, and
+    plain `.get(key, default)` only defends against a *missing* key: a present
+    one holding `null` came back as `None` and was assigned straight onto the
+    attribute. That loaded fine and then failed somewhere else entirely — a
+    single `"emergency_number": null` made `snapshot()` raise a Pydantic
+    ValidationError on the first `/state` call and on every WebSocket connect,
+    so the app could display nothing at all, with a traceback pointing at the
+    model rather than at the file that caused it.
+    """
+    value = data.get(key, default)
+    if isinstance(default, bool):
+        # Checked before the int branch below, because `bool` *is* an `int` in
+        # Python and `isinstance(True, int)` is True — without this order,
+        # `"night_mode": 1` would be accepted for a bool field and
+        # `"police_call_delay_seconds": true` would be accepted as 1 second.
+        return value if isinstance(value, bool) else default
+    if isinstance(default, int):
+        return value if isinstance(value, int) and not isinstance(value, bool) else default
+    return value if isinstance(value, type(default)) else default
+
+
+def _clamp_police_call_delay(seconds: int) -> int:
+    """Keeps the escalation delay inside [MIN_POLICE_CALL_DELAY,
+    MAX_POLICE_CALL_DELAY]. Applied both when the app sets it and when it is
+    read back off disk, since a hand-edited file reaches
+    `_escalate_after_delay` by exactly the same route the setter does.
+    """
+    return max(MIN_POLICE_CALL_DELAY, min(MAX_POLICE_CALL_DELAY, seconds))
+
+
 DEFAULT_PASSWORD = "homeguard"
 STATE_FILE = Path(
     os.environ.get("HOMEGUARD_STATE_FILE", Path(__file__).resolve().parent.parent / "state.json")
@@ -115,7 +193,15 @@ class AppState:
         [_load]). The defaults here are what a brand-new install gets: the
         password "homeguard" and two pre-approved faces.
         """
-        self._password_hash = hash_password(DEFAULT_PASSWORD)
+        # Left empty on purpose — the default password is hashed in [_load],
+        # and only if nothing was persisted. scrypt is deliberately expensive
+        # (~50ms, see security.py), and every install that has ever been
+        # started overwrites this value a few lines later, so hashing it here
+        # burned that 50ms on every single process start to produce a string
+        # nobody would ever read. `verify_password` treats "" as a malformed
+        # hash and refuses every login, so a code path that somehow skipped
+        # `_load` fails closed rather than open.
+        self._password_hash = ""
         self.alarm_state = AlarmState.disarmed
         self.sensors: list[SensorReading] = [
             SensorReading(type=SensorType.ultrasonic, label="Ultrasonic sensor", ok=True),
@@ -128,7 +214,20 @@ class AppState:
             ApprovedFace(id="2", name="Yair Bonfil"),
         ]
         self._next_face_id = 3  # ids "1"/"2" are taken by the seed faces above
-        self.camera_online = False
+        # When the last camera frame arrived. `camera_online` is *derived*
+        # from this rather than being a stored flag, for exactly the reason
+        # the per-board `esp32_online` flag was replaced by
+        # `_board_last_seen`: a boolean set to True by an arriving frame has
+        # nothing to set it back. The ESP32-CAM sends no heartbeat (by
+        # design — see esp32/README.md), so frames are the only liveness
+        # signal there is, and a camera that lost power kept the app showing
+        # a live badge over a frozen last frame indefinitely.
+        self._camera_last_frame_at: datetime | None = None
+        # Last time each recognised face was written to the event log, for the
+        # per-person rate limit in `log_face_recognized`. Not persisted: it is
+        # a debouncing detail, and a restart logging one extra sighting is
+        # harmless.
+        self._face_last_logged: dict[str, datetime] = {}
         self.face_id_enabled = True
         # Off by default and deliberately so — see log_face_recognized for
         # why letting a face turn the alarm off is a security trade-off.
@@ -170,6 +269,9 @@ class AppState:
         self._night_mode_task: asyncio.Task | None = None
         # Pending "alarm still not cleared" follow-up; cancelled by disarm.
         self._escalation_task: asyncio.Task | None = None
+        # Fallback timer for an entry delay the door controller never reports
+        # the outcome of; see [_entry_delay_watchdog].
+        self._entry_delay_task: asyncio.Task | None = None
         # Which mode the system was last armed in. Needed so a state report
         # from the door controller can reapply Home mode's sensor bypass —
         # the controller only reports armed/disarmed, never the mode.
@@ -191,14 +293,22 @@ class AppState:
         """Overlays the persisted state file (if any) onto the defaults set
         in `__init__`, then makes sure a device key exists.
 
-        Every field is read defensively with `.get(...)` and a fallback,
-        because this file is plain JSON on disk that a user may well have
-        opened and edited. A malformed or partial file degrades to defaults
-        rather than preventing the backend from starting — an alarm system
-        that won't boot because its config file has a typo is worse than one
-        that boots with a default password and says so.
+        Every field is read defensively through [_scalar], because this file
+        is plain JSON on disk that a user may well have opened and edited. A
+        malformed or partial file degrades to defaults rather than preventing
+        the backend from starting — an alarm system that won't boot because
+        its config file has a typo is worse than one that boots with a default
+        password and says so.
+
+        That promise used to hold only for files that failed to *parse*. Two
+        kinds of valid JSON still broke it: a non-object at the top level
+        (`[]`, `null`, `"hello"`) went straight into `data.get(...)` and raised
+        AttributeError out of `__init__`, so the backend did not start at all;
+        and a present-but-null scalar was assigned as `None`, which loaded
+        quietly and then made `snapshot()` raise on the first `/state` request.
+        Both are handled below.
         """
-        data: dict = {}
+        data: object = {}
         if STATE_FILE.exists():
             try:
                 data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -206,21 +316,35 @@ class AppState:
                 logger.warning(
                     "Could not read state file %s (%s) — using defaults.", STATE_FILE, exc
                 )
+        if not isinstance(data, dict):
+            logger.warning(
+                "State file %s is valid JSON but not an object (%s) — using defaults.",
+                STATE_FILE,
+                type(data).__name__,
+            )
+            data = {}
 
-        self._password_hash = data.get("password_hash") or self._password_hash
-        self.face_id_enabled = data.get("face_id_enabled", self.face_id_enabled)
-        self.face_disarm_enabled = data.get("face_disarm_enabled", self.face_disarm_enabled)
-        self.night_mode = data.get("night_mode", self.night_mode)
-        self.night_mode_arm_hour = data.get("night_mode_arm_hour", self.night_mode_arm_hour)
-        self.night_mode_disarm_hour = data.get(
-            "night_mode_disarm_hour", self.night_mode_disarm_hour
+        # The one place the default password is hashed, and only on an install
+        # that has never been started; see the note in `__init__`.
+        self._password_hash = _scalar(data, "password_hash", "") or hash_password(DEFAULT_PASSWORD)
+        self.face_id_enabled = _scalar(data, "face_id_enabled", self.face_id_enabled)
+        self.face_disarm_enabled = _scalar(data, "face_disarm_enabled", self.face_disarm_enabled)
+        self.night_mode = _scalar(data, "night_mode", self.night_mode)
+        # Clamped on the way in as well as in the setters: a hand-edited hour
+        # of 99 gives a night-mode schedule that can never fire, and a negative
+        # escalation delay fires it instantly (see MIN_POLICE_CALL_DELAY).
+        self.night_mode_arm_hour = max(
+            0, min(23, _scalar(data, "night_mode_arm_hour", self.night_mode_arm_hour))
         )
-        self.emergency_number = data.get("emergency_number", self.emergency_number)
-        self.police_call_delay_seconds = data.get(
-            "police_call_delay_seconds", self.police_call_delay_seconds
+        self.night_mode_disarm_hour = max(
+            0, min(23, _scalar(data, "night_mode_disarm_hour", self.night_mode_disarm_hour))
         )
-        self.ntfy_server = data.get("ntfy_server") or self.ntfy_server
-        self.ntfy_topic = data.get("ntfy_topic", self.ntfy_topic)
+        self.emergency_number = _scalar(data, "emergency_number", self.emergency_number)
+        self.police_call_delay_seconds = _clamp_police_call_delay(
+            _scalar(data, "police_call_delay_seconds", self.police_call_delay_seconds)
+        )
+        self.ntfy_server = _scalar(data, "ntfy_server", "") or self.ntfy_server
+        self.ntfy_topic = _scalar(data, "ntfy_topic", self.ntfy_topic)
         # Re-validated on load rather than trusted: this is the one persisted
         # field that gets relayed to hardware, and state.json is a plain file
         # a user may well have opened and edited.
@@ -248,7 +372,10 @@ class AppState:
         numeric_ids = [int(f.id) for f in self.faces if f.id.isdigit()]
         self._next_face_id = max(numeric_ids, default=0) + 1
 
-        self.device_key = resolve_device_key(data.get("device_key"))
+        # `_scalar` rather than `.get`, because a non-string here would be
+        # handed to `hmac.compare_digest` on every /esp32/* request, which
+        # raises TypeError — every board locked out, with a 500 apiece.
+        self.device_key = resolve_device_key(_scalar(data, "device_key", "") or None)
         # Written back unconditionally: on a first run this is what saves the
         # freshly generated key, and on later runs it's a cheap no-op rewrite.
         self._persist()
@@ -277,7 +404,12 @@ class AppState:
             "password_hash": self._password_hash,
             "device_key": self.device_key,
             "faces": [f.model_dump() for f in self.faces],
-            "events": [json.loads(e.model_dump_json()) for e in self.events[:MAX_EVENTS]],
+            # `model_dump(mode="json")`, not `json.loads(model_dump_json())`:
+            # the latter serialized every event to a JSON string only to parse
+            # it straight back into the dict needed here, and then serialized
+            # the lot again below. `_persist` runs on the alarm path, so that
+            # doubled work was being paid at the worst possible moment.
+            "events": [e.model_dump(mode="json") for e in self.events[:MAX_EVENTS]],
             "face_id_enabled": self.face_id_enabled,
             "face_disarm_enabled": self.face_disarm_enabled,
             "night_mode": self.night_mode,
@@ -292,7 +424,12 @@ class AppState:
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             temp = STATE_FILE.with_suffix(".json.tmp")
-            temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            # Not pretty-printed. Indenting a 200-entry event log costs both
+            # time and a quarter more bytes on a file that is rewritten on
+            # every settings change and every alert; `_load` parses either
+            # form identically, and anyone reading it by hand can pipe it
+            # through a formatter.
+            temp.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(temp, STATE_FILE)
         except OSError as exc:
             # A read-only or full disk shouldn't take the alarm down; the
@@ -348,8 +485,17 @@ class AppState:
 
     # ---- Board liveness ------------------------------------------------------
 
+    @property
+    def camera_online(self) -> bool:
+        """Whether a camera has sent a frame recently enough to count as
+        live. Uses the same window as the boards' heartbeats, so "gone
+        quiet" means the same thing everywhere in the UI."""
+        if self._camera_last_frame_at is None:
+            return False
+        return datetime.now() - self._camera_last_frame_at < BOARD_TIMEOUT
+
     def board_statuses(self) -> list[BoardStatus]:
-        """Current online/offline status of each of the three boards,
+        """Current online/offline status of each board in [BOARD_NAMES],
         computed fresh from their last-heartbeat timestamps every time this
         is called. Boards never heard from this run report `last_seen=None`
         and `online=False`.
@@ -382,7 +528,19 @@ class AppState:
         online, not on every heartbeat — three boards pinging every 10
         seconds would otherwise mean a full-state push to every connected app
         six times a minute for no reason.
+
+        Unknown names are ignored rather than recorded. `board` is a query
+        string off the network, and `_board_last_seen` is a dict that nothing
+        ever prunes, so accepting arbitrary keys meant an authenticated caller
+        (a mistyped `BOARD_NAME` in a sketch is enough) could grow it without
+        bound in a process meant to run for weeks — and none of those keys
+        could ever be read back, since `board_statuses` only ever looks up
+        [BOARD_NAMES].
         """
+        if board not in BOARD_NAMES:
+            logger.warning("Ignoring contact from unknown board %r", board)
+            return
+
         was_online = self.esp32_online
         known = board in self._board_last_seen
         previously = (
@@ -405,18 +563,30 @@ class AppState:
         previous = [(b.name, b.online) for b in self.board_statuses()]
         while True:
             await asyncio.sleep(BOARD_MONITOR_INTERVAL)
-            current = [(b.name, b.online) for b in self.board_statuses()]
-            if current != previous:
-                # strict=True: both lists come from board_statuses(), so a
-                # length mismatch would mean the board set changed under us —
-                # worth raising rather than silently truncating the log.
-                for (name, was), (_, now_online) in zip(previous, current, strict=True):
-                    if was and not now_online:
-                        self._log(f"Board offline: {name}", EventCategory.info)
-                    elif not was and now_online:
-                        self._log(f"Board online: {name}", EventCategory.info)
-                previous = current
-                await self._broadcast()
+            try:
+                current = [(b.name, b.online) for b in self.board_statuses()]
+                if current != previous:
+                    # strict=True: both lists come from board_statuses(), so a
+                    # length mismatch would mean the board set changed under
+                    # us — worth raising rather than silently truncating the
+                    # log.
+                    for (name, was), (_, now_online) in zip(previous, current, strict=True):
+                        if was and not now_online:
+                            self._log(f"Board offline: {name}", EventCategory.info)
+                        elif not was and now_online:
+                            self._log(f"Board online: {name}", EventCategory.info)
+                    previous = current
+                    await self._broadcast()
+            except Exception:
+                # Same guard, and for the same reason, as `_night_mode_loop`.
+                # A single raise here used to end the task permanently, and
+                # `start_monitor` only creates one when `_monitor_task is
+                # None` — a *dead* task is not None, so nothing would ever
+                # restart it. Board liveness would then freeze for the rest of
+                # the process: every board stuck at whatever it last was, a
+                # dead one still showing ONLINE in the app, and not even a log
+                # line at the moment it happened.
+                logger.exception("Board liveness check failed")
 
     def start_monitor(self) -> None:
         """Starts the background loops — board liveness and the night-mode
@@ -430,10 +600,25 @@ class AppState:
             self._night_mode_task = asyncio.create_task(self._night_mode_loop())
 
     async def stop_monitor(self) -> None:
-        """Cancels the background loops on shutdown and waits for them to
-        actually finish, so neither can outlive the app and log into a
-        closing event loop."""
-        for name in ("_monitor_task", "_night_mode_task"):
+        """Cancels every background task on shutdown and waits for each to
+        actually finish, so none can outlive the app and log into a closing
+        event loop.
+
+        The list is not just the two loops. `_arming_task`,
+        `_escalation_task` and `_entry_delay_task` are one-shot timers, but a
+        shutdown lands mid-countdown often enough (restarting the backend
+        while the house is arming is the normal way to deploy a change), and a
+        pending one would wake up on a loop that is already closing —
+        "Task was destroyed but it is pending!" at best, and at worst a
+        `trigger_alert` broadcasting into torn-down WebSockets.
+        """
+        for name in (
+            "_monitor_task",
+            "_night_mode_task",
+            "_arming_task",
+            "_escalation_task",
+            "_entry_delay_task",
+        ):
             task = getattr(self, name)
             if task is None:
                 continue
@@ -559,7 +744,13 @@ class AppState:
         # that was in fact accepting logins.
         self._clear_expired_lockout()
 
-        if not verify_password(password, self._password_hash):
+        # Off the event loop: scrypt is tuned to take ~50ms (see security.py),
+        # and this runs on the one loop that also serves every connected
+        # WebSocket. Blocking it means the alarm's real-time state push stops
+        # for the duration — for one login that is barely visible, but the
+        # lockout only starts after three attempts, so this is by design a
+        # path someone can make the backend walk repeatedly.
+        if not await asyncio.to_thread(verify_password, password, self._password_hash):
             await self._register_failed_attempt(f"{MAX_LOGIN_ATTEMPTS} failed login attempts")
             return None
 
@@ -587,7 +778,11 @@ class AppState:
         if self.is_locked_out:
             return False
         self._clear_expired_lockout()
-        if not verify_password(old_password, self._password_hash):
+        # Both scrypt calls run in a worker thread; see `login` for why. This
+        # one is the more expensive of the two — a verify plus a fresh hash is
+        # ~150ms of solid CPU, which is a long time to hold an event loop that
+        # is also responsible for pushing an alarm.
+        if not await asyncio.to_thread(verify_password, old_password, self._password_hash):
             await self._register_failed_attempt(
                 f"{MAX_LOGIN_ATTEMPTS} failed password-change attempts"
             )
@@ -596,7 +791,7 @@ class AppState:
             return False
 
         self._failed_attempts = 0
-        self._password_hash = hash_password(new_password)
+        self._password_hash = await asyncio.to_thread(hash_password, new_password)
         self.tokens.revoke_all(except_token=current_token)
         self._log("Password changed", EventCategory.auth)
         self._persist()
@@ -682,6 +877,30 @@ class AppState:
         )
         await self._broadcast()
 
+    def _clear_alarm_timers(self) -> None:
+        """Drops everything that only means something while an alarm cycle is
+        still running: the entry-delay deadline, the watchdog behind it, and
+        the pending "still not cleared" escalation.
+
+        Shared by `disarm()` and `report_state_from_esp32()` because those are
+        the same event seen from two sides — someone made the system safe.
+        Only `disarm()` used to do any of this, and it is the *rarer* of the
+        two paths: the door controller owns the keypad, so a real-world disarm
+        arrives here as a controller report. That left a disarmed system still
+        holding a live escalation task, which fired the urgent "alarm not
+        cleared, call your emergency contact" push a minute after the alarm
+        had already been dealt with, and a stale `_entry_delay_ends_at`.
+        """
+        self._entry_delay_ends_at = None
+        if self._entry_delay_task:
+            self._entry_delay_task.cancel()
+            self._entry_delay_task = None
+        # Acknowledging the alarm in time is exactly what should stop the
+        # escalation notification from going out.
+        if self._escalation_task:
+            self._escalation_task.cancel()
+            self._escalation_task = None
+
     async def disarm(self) -> None:
         """Disarms the system. Cancels any in-progress `_finish_arming`
         task first, so a disarm during the exit-delay window reliably
@@ -696,14 +915,7 @@ class AppState:
         if self._arming_task:
             self._arming_task.cancel()
             self._arming_task = None
-        # Whatever countdown was running is over — clear it so a stale
-        # deadline can't make the app show a countdown after disarming.
-        self._entry_delay_ends_at = None
-        # Acknowledging the alarm in time is exactly what should stop the
-        # escalation notification from going out.
-        if self._escalation_task:
-            self._escalation_task.cancel()
-            self._escalation_task = None
+        self._clear_alarm_timers()
         self.sensors = [
             SensorReading(type=s.type, label=s.label, ok=True) for s in self.sensors
         ]
@@ -759,6 +971,9 @@ class AppState:
             # so we don't spam duplicate "armed/disarmed" events.
             return
 
+        # Same teardown `disarm()` does, and this is the path that actually
+        # runs in the field — see [_clear_alarm_timers].
+        self._clear_alarm_timers()
         self.alarm_state = new_state
         # The controller reports only armed/disarmed, never which mode was
         # requested — so the mode comes from `_arm_mode`, which `arm()`
@@ -800,8 +1015,41 @@ class AppState:
             return
         self.alarm_state = AlarmState.entryDelay
         self._entry_delay_ends_at = datetime.now() + timedelta(seconds=seconds)
+        if self._entry_delay_task:
+            self._entry_delay_task.cancel()
+        self._entry_delay_task = asyncio.create_task(self._entry_delay_watchdog(seconds))
         self._log("Door opened — enter code to disarm", EventCategory.armDisarm)
         await self._broadcast()
+
+    async def _entry_delay_watchdog(self, seconds: int) -> None:
+        """Raises the alarm ourselves if the entry delay simply ran out.
+
+        The countdown belongs to the door controller, and the design is that
+        it reports the outcome: PIN accepted (`/esp32/state-change`) or time
+        up (`/esp32/sensor-event`). Nothing here ever checked that a report
+        arrived, so escalation depended entirely on that one board surviving
+        the next 30 seconds — and the board is inside the house the intruder
+        just walked into. Pull its power, or its WiFi, between opening the
+        door and the countdown expiring and the system stayed in `entryDelay`
+        for good: no `triggered`, no siren command to any other board, no
+        push, and an app showing a countdown that never reaches zero. A silent
+        and total bypass of the alarm, from the one state it is most exposed
+        in.
+
+        So: wait out the same window plus [ENTRY_DELAY_GRACE], and if the
+        system is *still* in `entryDelay`, treat it as nobody having disarmed.
+        Cancelled by every legitimate way out of the state (see
+        [_clear_alarm_timers]), so it only ever fires when the controller went
+        quiet.
+        """
+        try:
+            await asyncio.sleep(seconds + ENTRY_DELAY_GRACE.total_seconds())
+        except asyncio.CancelledError:
+            return
+        if self.alarm_state != AlarmState.entryDelay:
+            return
+        logger.warning("Entry delay expired with no report from the door controller — alarming.")
+        await self.trigger_alert(SensorType.door, "entry delay expired with no disarm")
 
     @property
     def entry_delay_seconds_remaining(self) -> int:
@@ -974,17 +1222,38 @@ class AppState:
         Only disarms from `armed` or `triggered` — the states where disarming
         is a meaningful action. Recognizing a face while already disarmed is
         just an audit-log entry.
+
+        That audit entry is rate-limited per person (see
+        FACE_LOG_COOLDOWN). The ESP32-CAM pushes two frames a second, so
+        someone simply standing in front of it used to produce two log lines
+        and two full-state broadcasts every second: the 200-entry log filled
+        with "Face recognized: X" in under two minutes, burying everything
+        that mattered, and every connected phone was sent ~21 KB per frame —
+        about 2.6 MB a minute — to be told the same thing over and over.
+        Recognition itself is unthrottled; only the *reporting* of it is.
         """
-        self._log(f"Face recognized: {name}", EventCategory.faceId)
+        now = datetime.now()
+        last_seen = self._face_last_logged.get(name)
+        recently_logged = last_seen is not None and now - last_seen < FACE_LOG_COOLDOWN
+        self._face_last_logged[name] = now
 
         should_disarm = self.face_disarm_enabled and self.alarm_state in (
             AlarmState.armed,
             AlarmState.triggered,
             AlarmState.entryDelay,
         )
+
+        # A disarm is always logged, however recently this face was seen —
+        # rate-limiting an "the alarm was just turned off" entry would be
+        # exactly the wrong thing to economise on.
         if not should_disarm:
+            if recently_logged:
+                return False
+            self._log(f"Face recognized: {name}", EventCategory.faceId)
             await self._broadcast()
             return False
+
+        self._log(f"Face recognized: {name}", EventCategory.faceId)
 
         # disarm() broadcasts and resets sensors; log the reason first so the
         # event log reads in cause-then-effect order.
@@ -1170,25 +1439,37 @@ class AppState:
         return True
 
     async def set_police_call_delay(self, seconds: int) -> None:
-        """Stores how long to wait after a triggered alarm before
-        auto-calling `emergency_number`. Like set_emergency_number, this
-        is currently just stored — see that method's note.
+        """Stores how long to wait after a triggered alarm before escalating
+        (see `_start_escalation` for what "escalating" means here, since
+        nothing dials a phone).
+
+        Clamped, unlike before — its sibling `set_night_mode_hours` always
+        was. A negative value is the one that matters: `asyncio.sleep()`
+        returns immediately for one, so `_escalate_after_delay` would send the
+        urgent "alarm still active, nobody has dealt with it" push in the same
+        instant as the alarm it is supposed to be following up on, leaving no
+        window at all to disarm first.
         """
-        self.police_call_delay_seconds = seconds
+        self.police_call_delay_seconds = _clamp_police_call_delay(seconds)
         self._persist()
         await self._broadcast()
 
     # ---- Camera connectivity ---------------------------------------------------
 
-    async def set_camera_online(self, online: bool) -> None:
-        """Updates the "camera online" flag shown in the app, set True by
-        /camera/recognize whenever a frame comes in. No-ops when the value
-        isn't actually changing, to avoid a broadcast per frame.
+    async def note_camera_frame(self) -> None:
+        """Records that a camera frame just arrived, from /camera/recognize.
+
+        Broadcasts only on the offline->online transition, not on every
+        frame — the ESP32-CAM sends two a second, and a full-state push each
+        time would be 2.6 MB a minute to every connected phone to say
+        nothing new. The reverse transition needs no broadcast from here at
+        all: it is time-derived, so `_monitor_boards` picks it up on its next
+        tick, the same way a board going quiet does.
         """
-        if online == self.camera_online:
-            return
-        self.camera_online = online
-        await self._broadcast()
+        was_online = self.camera_online
+        self._camera_last_frame_at = datetime.now()
+        if not was_online:
+            await self._broadcast()
 
 
 state = AppState()

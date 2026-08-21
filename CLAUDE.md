@@ -131,7 +131,7 @@ settings עם שינוי סיסמה + night mode + איש קשר לחירום + 
 camera. **מדבר בפועל עם ה-backend האמיתי** — `HttpBackendService`
 (`services/http_backend_service.dart`) הוא ה-`BackendService` שנטען
 כברירת מחדל ב-`main.dart` (REST + WebSocket ל-`/ws`), נבדק end-to-end
-(ראה `python/simulate.py`, 51/51 עברו כולל אחרי restart של הבקנד).
+(ראה `python/simulate.py`, 96/96 עברו כולל אחרי restart של הבקנד).
 `MockBackendService` נשאר קיים רק בשביל widget tests (אין שרת אמיתי
 בזמן `flutter test`) ועבודת UI אופליין — הוא לא נטען יותר ב-`main.dart`.
 
@@ -180,7 +180,10 @@ firebase_messaging בלי לוודא שהקובץ קיים.
   לעשות login אינטראקטיבי. נוצר אוטומטית בהרצה ראשונה ונשמר ב-`state.json`,
   או נקבע דרך `HOMEGUARD_DEVICE_KEY`.
 
-`/health` הוא היחיד הפתוח. ה-WebSocket מקבל טוקן ב-`?token=` (ל-WebSocket אין
+הפתוחים הם `/health`, `/login`, ותיעוד ה-API של FastAPI (`/docs`, `/redoc`,
+`/openapi.json`) — כלומר סכמת ה-API המלאה ציבורית. אם זה לא רצוי בפריסה
+אמיתית, `FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`.
+ה-WebSocket מקבל טוקן ב-`?token=` (ל-WebSocket אין
 דרך ניידת להוסיף כותרות) ונסגר עם 1008 **לפני** `accept()`.
 
 **אם מוסיפים route חדש — הוא חייב `Depends(require_app)` או
@@ -252,7 +255,7 @@ liveness detection** — תמונה מודפסת עשויה לעבור. זו נ�
 FastAPI, בנוי ונבדק. פירוט מלא ב-`python/README.md`. **שתי חבילות בדיקות
 בכוונה:**
 
-- `pytest` (`python/tests/`) — 136 בדיקות in-process מול ה-ASGI app דרך
+- `pytest` (`python/tests/`) — 219 בדיקות in-process מול ה-ASGI app דרך
   `httpx.ASGITransport`. בלי שרת, בלי פורטים, ובלי המתנות אמיתיות (פקיעת
   lockout ו-heartbeat מיושן נבדקים בהזזת timestamps). כל בדיקה מקבלת התקנה
   נקייה דרך reload של מודול ה-state לתיקייה זמנית. זה מה שמריצים תוך כדי
@@ -282,7 +285,11 @@ MSVC/CMake על Windows, בדיוק הכאב שהפרויקט הזה כבר אי
 ה-ONNX חסרים, השירות נופל אוטומטית חזרה ל-Haar+LBPH עם אזהרה
 (`FaceRecognitionService.backend_name` אומר מי פעיל).
 
-`backend/models.py` משקף 1:1 את `app/lib/services/backend_service.dart` — אם
+`backend/models.py` משקף 1:1 את **`app/lib/services/http_backend_service.dart`**
+— שם מפתחות ה-JSON באמת מפוענחים. `backend_service.dart` (בלי ה-`http_`) הוא
+הממשק המופשט ומחלקות הטיפוסים בצד Dart, ואין בו אף מפתח wire; לשקף שדה שם
+ולעצור זו הטעות שצריך להימנע ממנה — זה מתקמפל, ואז האפליקציה זורקת על ה-frame
+הראשון. אם
 משנים שדה בצד אחד, לשנות גם בשני. יש בדיקה
 (`test_state_shape_matches_the_flutter_client`) שנועלת את צורת ה-wire.
 
@@ -290,7 +297,7 @@ MSVC/CMake על Windows, בדיוק הכאב שהפרויקט הזה כבר אי
 (אבל התגובה מחזירה `hardware: bool` והאפליקציה מציגה את זה); דריכה מהקודן
 הפיזי לא נושאת mode, אז נופלים למצב האחרון שהאפליקציה ביקשה, בברירת מחדל Away
 (המחמיר); `emergency_number`/`police_call_delay_seconds` נשמרים אבל אף אחד לא
-מחייג; `night_mode` נשמר אבל אין scheduler.
+מחייג (ראה "חיוג חירום" למעלה — במקום זה נשלחת התראת הסלמה).
 
 הרצה: `python\venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 מתוך `python/`.

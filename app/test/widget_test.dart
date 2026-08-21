@@ -151,4 +151,100 @@ void main() {
       expect(event(EventCategory.info).severity, EventSeverity.info);
     });
   });
+
+  // ---- Paths the mock could not reach before it grew test seams ----------
+  //
+  // Each of these covers a branch that shipped untested purely because
+  // MockBackendService had no way to produce the state: an infrastructure
+  // error, a lockout, or an entry delay. Those are three of the four screens
+  // that matter most when something is actually wrong.
+
+  group('failure paths', () {
+    testWidgets('an infrastructure error surfaces as a SnackBar', (tester) async {
+      final backend = MockBackendService();
+      await pumpApp(tester, backend: backend);
+      await login(tester);
+
+      backend.emitError('Backend unreachable');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(find.text('Backend unreachable'), findsOneWidget);
+    });
+
+    testWidgets('three wrong passwords reach the locked-out screen', (tester) async {
+      await pumpApp(tester);
+
+      for (var i = 0; i < 3; i++) {
+        await tester.enterText(find.byType(TextFormField), 'wrong$i');
+        await tester.tap(find.text('UNLOCK'));
+        await tester.pump(const Duration(milliseconds: 800));
+      }
+
+      // The backend is the lockout authority and the app only relays it, so
+      // what's asserted is that the relayed state is actually rendered: the
+      // countdown replaces the error line, and the button stops offering to
+      // unlock.
+      expect(find.textContaining('Locked out'), findsOneWidget);
+      expect(find.text('LOCKED'), findsOneWidget);
+      expect(find.text('UNLOCK'), findsNothing);
+    });
+
+    testWidgets('a correct password is still refused while locked out', (tester) async {
+      await pumpApp(tester);
+
+      for (var i = 0; i < 3; i++) {
+        await tester.enterText(find.byType(TextFormField), 'wrong$i');
+        await tester.tap(find.text('UNLOCK'));
+        await tester.pump(const Duration(milliseconds: 800));
+      }
+      // There is no UNLOCK button left to press — which is the point. A
+      // lockout the right password walks straight through is not a lockout,
+      // and the UI enforces that by refusing to offer the action at all.
+      await tester.enterText(find.byType(TextFormField), 'homeguard');
+      await tester.pump(const Duration(milliseconds: 800));
+
+      expect(find.text('LOCKED'), findsOneWidget);
+      expect(find.text('ARM AWAY'), findsNothing, reason: 'must not reach the dashboard');
+    });
+  });
+
+  group('entry delay', () {
+    testWidgets('shows the countdown when the door opens on an armed system',
+        (tester) async {
+      final backend = MockBackendService();
+      await pumpApp(tester, backend: backend);
+      await login(tester);
+
+      backend.simulateEntryDelay(seconds: 20);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // The number itself is what the person walking in is racing; asserting
+      // on the phrase rather than the exact value keeps this robust to the
+      // countdown having ticked once.
+      expect(find.textContaining('Door opened'), findsOneWidget);
+    });
+
+    testWidgets('the countdown actually counts down', (tester) async {
+      final backend = MockBackendService();
+      await pumpApp(tester, backend: backend);
+      await login(tester);
+
+      backend.simulateEntryDelay(seconds: 20);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('alarm in 20s'), findsOneWidget);
+
+      // The backend pushes this number exactly once (`begin_entry_delay`
+      // broadcasts and nothing re-sends), so without a local ticker the
+      // display froze at the seeded value until the alarm fired — on the one
+      // screen where the number is the whole point.
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.textContaining('alarm in 19s'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 2));
+      expect(find.textContaining('alarm in 17s'), findsOneWidget);
+    });
+  });
 }

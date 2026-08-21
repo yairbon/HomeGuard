@@ -94,7 +94,22 @@ class _MainShellState extends State<MainShell> {
     }
 
     return Scaffold(
-      body: IndexedStack(index: _index, children: _screens),
+      // Every tab stays mounted (that's the point of IndexedStack — scroll
+      // positions and the camera connection survive a tab switch), but only
+      // the visible one should be *doing* anything. Without this the
+      // dashboard's status indicator kept pulsing at 60fps behind the
+      // settings screen, and four hidden screens animated for nobody.
+      //
+      // The camera feed hangs its own lifecycle off this same signal (see
+      // `_FeedPlaceholder` in camera_screen.dart), so the MJPEG stream is
+      // only open while its tab is actually on screen.
+      body: IndexedStack(
+        index: _index,
+        children: [
+          for (var i = 0; i < _screens.length; i++)
+            TickerMode(enabled: i == _index, child: _screens[i]),
+        ],
+      ),
       bottomNavigationBar: NavigationBarTheme(
         data: NavigationBarThemeData(
           backgroundColor: AppColors.surface,
