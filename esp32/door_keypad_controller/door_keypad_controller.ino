@@ -24,6 +24,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 
 // WiFi credentials, backend address, the shared device key and the keypad
 // PIN all live in secrets.h, which is gitignored. Copy
@@ -89,12 +90,79 @@ State currentState = DISARMED;
 
 // --- Keypad & Security Variables ---
 String enteredPin = "";
-const String SECRET_PIN = KEYPAD_PIN;  // from secrets.h
+
 // The physical 3x4 matrix is now wired (see ROW_PINS/COL_PINS above) and
 // read by getPhysicalKey() below. getSimulatedKey() (Serial Monitor input)
 // is kept as a fallback, not removed — see getKey() — so the state machine
 // stays testable from a desk even without the physical keypad in hand, and
 // so a wiring mistake on one row/column doesn't block testing the rest.
+
+// The disarm PIN, changeable from the app at runtime.
+//
+// KEYPAD_PIN in secrets.h is the *factory default*, compiled in and used
+// only on a board whose NVS has never been written. The live value lives in
+// NVS (flash) and is what loadKeypadPin() below puts here at every boot, so
+// a PIN set from the app survives power loss and reboots. It has to work
+// this way: secrets.h is a C++ header baked into the binary at compile time,
+// so writing to it can only affect the *next* flash, never a board already
+// running. The backend keeps secrets.h in sync anyway, which is what stops a
+// reflash from silently restoring an old PIN.
+String secretPin = KEYPAD_PIN;
+
+// NVS handle for the "homeguard" namespace. Opened per operation rather
+// than held open, so a write is committed and the handle released before
+// anything else can touch it.
+Preferences prefs;
+const char* PREFS_NAMESPACE = "homeguard";
+const char* PREFS_PIN_KEY = "keypad_pin";
+
+// A PIN must be 4-8 characters and digits only — the keypad's other two
+// keys ('*' arms, '#' submits) can never appear in one, so accepting them
+// would create a PIN that cannot be typed. Enforced identically on the
+// backend; both sides validate because either can be reached alone.
+bool isValidPin(const String& pin) {
+  if (pin.length() < 4 || pin.length() > 8) return false;
+  for (unsigned int i = 0; i < pin.length(); i++) {
+    if (!isDigit(pin[i])) return false;
+  }
+  return true;
+}
+
+// Reads the stored PIN out of NVS into `secretPin`, leaving the secrets.h
+// default in place if nothing valid is stored. Called once from setup().
+void loadKeypadPin() {
+  prefs.begin(PREFS_NAMESPACE, /*readOnly=*/true);
+  String stored = prefs.getString(PREFS_PIN_KEY, "");
+  prefs.end();
+
+  if (isValidPin(stored)) {
+    secretPin = stored;
+    Serial.println("Keypad PIN loaded from NVS (set via the app).");
+  } else {
+    Serial.println("No PIN in NVS — using the KEYPAD_PIN default from secrets.h.");
+  }
+}
+
+// Persists a new PIN to NVS and switches to it immediately. Returns false
+// without changing anything if the PIN is malformed or the write fails.
+bool saveKeypadPin(const String& pin) {
+  if (!isValidPin(pin)) return false;
+
+  prefs.begin(PREFS_NAMESPACE, /*readOnly=*/false);
+  size_t written = prefs.putString(PREFS_PIN_KEY, pin);
+  prefs.end();
+
+  if (written == 0) {
+    Serial.println("Failed to write the new PIN to NVS — keeping the previous one.");
+    return false;
+  }
+  secretPin = pin;
+  // Deliberately never printed. This board's Serial output is the one place
+  // a PIN could leak to someone with physical USB access to a board they
+  // don't own the code for.
+  Serial.println("Keypad PIN updated and stored in NVS.");
+  return true;
+}
 
 // --- Sensor & Timer Variables ---
 bool isDoorOpen = false;
@@ -167,6 +235,7 @@ void setup() {
   server.on("/arm", HTTP_POST, handleRemoteArm);
   server.on("/disarm", HTTP_POST, handleRemoteDisarm);
   server.on("/trigger-alarm", HTTP_POST, handleRemoteTriggerAlarm);
+  server.on("/keypad-pin", HTTP_POST, handleSetKeypadPin);
   server.begin();
   Serial.println("Remote control server started.");
 
@@ -245,7 +314,7 @@ char getPhysicalKey() {
 }
 
 // Tries the physical keypad first, falls back to Serial input — see the
-// comment above SECRET_PIN for why both stay live at once.
+// comment above secretPin for why both stay live at once.
 char getKey() {
   char physical = getPhysicalKey();
   if (physical != '\0') return physical;
@@ -258,6 +327,40 @@ char getKey() {
 // every reporting function below.
 String backendUrl(const char* path) {
   return "http://" + String(backendHost) + ":" + String(backendPort) + String(path);
+}
+
+// How long any single outbound call may take before we give up.
+//
+// This matters far more on this board than on the sensor boards, because
+// this is the only one that also *answers* requests. Every reporting
+// function below runs synchronously inside loop(), and loop() calls
+// server.handleClient() exactly once per pass — so for as long as a report
+// is in flight, this board answers nothing: not /arm, not /disarm, and not
+// /trigger-alarm, which the backend calls when a *different* board reports a
+// break-in. The backend gives that call 3 seconds (esp32_client.py) and then
+// reports hardware: false, leaving the buzzers silent through an actual
+// intrusion.
+//
+// The Arduino core defaults both the connect and the response timeout to
+// HTTPCLIENT_DEFAULT_TCP_TIMEOUT = 5000ms, so one unlucky call could block
+// for ~10 seconds. 1000ms each caps the worst case at ~2s, comfortably
+// inside the backend's budget. Reports are already fire-and-forget with no
+// retry, so the cost of being stricter is a dropped report, not a wrong one.
+//
+// Same window silently swallows keypresses: getPhysicalKey() only sees a key
+// that is down at the sampling instant and there is no buffer, so anything
+// pressed and released while we're blocked is lost. Serial-simulated input
+// doesn't show this (the UART FIFO keeps buffering), which is why it will
+// first appear when the physical keypad is wired.
+const uint16_t HTTP_TIMEOUT_MS = 1000;
+
+// Opens an outbound request with the timeouts applied. Every call site below
+// goes through this rather than calling http.begin() directly, so a new
+// reporting function can't quietly reintroduce the 10-second stall.
+void beginRequest(HTTPClient& http, const String& url) {
+  http.begin(url);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
 }
 
 // Tells the backend this board's authoritative armed/disarmed state, so
@@ -274,7 +377,7 @@ void reportStateChange(bool armed) {
     return;
   }
   HTTPClient http;
-  http.begin(backendUrl("/esp32/state-change"));
+  beginRequest(http, backendUrl("/esp32/state-change"));
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_KEY);
   String body = armed ? "{\"armed\":true}" : "{\"armed\":false}";
@@ -298,7 +401,7 @@ void reportStateChange(bool armed) {
 void reportEntryDelay() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  http.begin(backendUrl("/esp32/entry-delay"));
+  beginRequest(http, backendUrl("/esp32/entry-delay"));
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("{\"seconds\":" + String(ENTRY_TIME_LIMIT / 1000) + "}");
@@ -310,8 +413,8 @@ void reportEntryDelay() {
 void reportDoorAlert() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  http.begin(backendUrl("/esp32/sensor-event?sensor=door&board=door_controller"
-                        "&reason=Door%20not%20disarmed%20in%20time"));
+  beginRequest(http, backendUrl("/esp32/sensor-event?sensor=door&board=door_controller"
+                                "&reason=Door%20not%20disarmed%20in%20time"));
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
@@ -324,7 +427,7 @@ void reportDoorAlert() {
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  http.begin(backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
+  beginRequest(http, backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.POST("");
   http.end();
@@ -390,8 +493,17 @@ void handleRemoteDisarm() {
   currentState = DISARMED;
   enteredPin = "";
   silenceBuzzers();
-  reportStateChange(false);
+  // Answer first, then report. The backend's /disarm is blocked on this
+  // response with a 3-second budget; reporting first chained a second
+  // backend round trip inside that budget, so one WiFi retransmit made a
+  // disarm that actually worked come back as hardware: false — the app
+  // telling the user the board wasn't reached, while the siren it just
+  // silenced sits quiet next to them. (No deadlock either way: by the time
+  // this report lands, state.disarm() has already run and
+  // report_state_from_esp32 early-returns on the state it already agrees
+  // with.)
   server.send(200, "text/plain", "OK");
+  reportStateChange(false);
 }
 
 // WebServer handler for POST /trigger-alarm. Called by the backend when a
@@ -401,6 +513,43 @@ void handleRemoteDisarm() {
 // up in the app but stays silent here. No state guard, same reasoning as
 // handleRemoteDisarm: trust the backend's decision over whatever this board
 // locally thinks the state is.
+// WebServer handler for POST /keypad-pin. Sets the disarm PIN from the app,
+// via the backend (see set_keypad_pin in python/backend/state.py).
+//
+// Body is {"pin":"1234"}, parsed with the same substring approach the other
+// handlers use rather than pulling in a JSON library for one field. The
+// value is validated here as well as on the backend: this route is reachable
+// by anything on the network that has the device key, so it cannot rely on
+// the backend having checked first.
+//
+// Answers before doing anything slow, for the same reason handleRemoteDisarm
+// does — the backend is blocked on this response inside a 3-second budget.
+// The NVS write is local flash (single-digit milliseconds), not a network
+// call, so ordering matters less here than it does there; it is done this way
+// for consistency and so a future retry loop can't stall the caller.
+void handleSetKeypadPin() {
+  if (!authorized()) return;
+
+  String body = server.arg("plain");
+  int start = body.indexOf("\"pin\"");
+  if (start >= 0) {
+    start = body.indexOf('"', body.indexOf(':', start) + 1);
+  }
+  int end = start >= 0 ? body.indexOf('"', start + 1) : -1;
+  String pin = (start >= 0 && end > start) ? body.substring(start + 1, end) : "";
+
+  if (!saveKeypadPin(pin)) {
+    // The PIN itself never goes into the response or the log — only whether
+    // it was accepted.
+    Serial.println("\n[REMOTE] Rejected a keypad-PIN change (must be 4-8 digits)");
+    server.send(400, "text/plain", "Invalid PIN");
+    return;
+  }
+
+  Serial.println("\n[REMOTE] Keypad PIN changed via app");
+  server.send(200, "text/plain", "OK");
+}
+
 void handleRemoteTriggerAlarm() {
   if (!authorized()) return;
   Serial.println("\n[REMOTE] Alarm triggered remotely (another sensor reported a breach)");
@@ -507,6 +656,15 @@ void loop() {
         delayStartTime = millis();
         lastBeepTime = millis();
         isBuzzerCurrentlyOn = false;
+        // Start the disarm window with an empty buffer. Digits accumulate in
+        // every state, and none of DISARMED/PENDING_ARM/EXITING/REMOTE_ARMING/
+        // ARMED handles '#', so anything typed or brushed against the keypad
+        // earlier is still sitting in enteredPin. Without this reset, one
+        // stray digit turns a correctly-typed PIN into "51913" != "1913" and
+        // the siren goes off on a legitimate entry — recoverable only by
+        // knowing to press '#' twice. The ENTRY_DELAY -> ALARM transition
+        // already cleared it; this is the matching clear on the way in.
+        enteredPin = "";
         Serial.println("\nWARNING: Door opened! Enter PIN to disarm.");
         reportEntryDelay();
       }
@@ -529,7 +687,7 @@ void loop() {
           // 2. Handle keypad to disarm
           if (input == '#') {
             Serial.println();
-            if (enteredPin == SECRET_PIN) {
+            if (enteredPin == secretPin) {
               currentState = DISARMED;
               enteredPin = "";
               silenceBuzzers();
@@ -592,7 +750,7 @@ void loop() {
         // 2. The only way to stop the alarm is entering the correct PIN
         if (input == '#') {
           Serial.println();
-          if (enteredPin == SECRET_PIN) {
+          if (enteredPin == secretPin) {
             currentState = DISARMED;
             enteredPin = "";
             silenceBuzzers();

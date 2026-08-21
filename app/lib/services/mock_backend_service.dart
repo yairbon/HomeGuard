@@ -155,6 +155,23 @@ class MockBackendService implements BackendService {
     return true;
   }
 
+  /// Mirrors the real service's validation so a widget test exercises the
+  /// same accept/reject boundary. `hardware: true` because there is no board
+  /// here to fail — the mock stands in for a working system, and the
+  /// unreachable-board case belongs to the real service's tests.
+  ///
+  /// Deliberately doesn't retain the PIN: nothing ever reads one back, on
+  /// either implementation. The app sets it and forgets it, the same shape as
+  /// changing a password, so storing it here would be state no test could
+  /// meaningfully assert on.
+  @override
+  Future<KeypadPinResult> setKeypadPin(String pin) async {
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (!RegExp(r'^\d{4,8}$').hasMatch(pin)) return const KeypadPinResult(ok: false);
+    _logEvent('Keypad PIN changed', EventCategory.auth);
+    return const KeypadPinResult(ok: true, hardware: true);
+  }
+
   /// Arms the system in [mode]. Only takes effect if currently disarmed
   /// (arming an already-armed/triggered system is a no-op — there's
   /// nothing sensible to transition from). Immediately moves to

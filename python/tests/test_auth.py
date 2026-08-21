@@ -8,6 +8,7 @@ route was reachable by anyone who could open a socket to the backend.
 from __future__ import annotations
 
 import pytest
+from fastapi.routing import APIRoute
 
 from backend.security import TokenStore, hash_password, verify_password
 
@@ -26,12 +27,19 @@ PROTECTED_ROUTES = [
     ("post", "/change-password", {"old_password": PASSWORD, "new_password": "x"}),
     ("get", "/faces", None),
     ("post", "/faces", {"name": "x"}),
+    ("delete", "/faces/1", None),
+    ("post", "/faces/1/photo", None),
     ("get", "/camera/latest", None),
     ("get", "/camera/stream", None),
     ("post", "/face-id-enabled", {"enabled": True}),
+    ("post", "/face-disarm-enabled", {"enabled": True}),
     ("post", "/settings/night-mode", {"enabled": True}),
+    ("post", "/settings/night-mode-hours", {"arm_hour": 23, "disarm_hour": 7}),
     ("post", "/settings/emergency-number", {"number": "100"}),
     ("post", "/settings/police-call-delay", {"seconds": 30}),
+    ("post", "/settings/keypad-pin", {"pin": "1913"}),
+    ("post", "/settings/ntfy", {"server": "https://ntfy.sh", "topic": "x"}),
+    ("post", "/settings/ntfy/test", None),
     ("post", "/debug/simulate-face-recognition", None),
 ]
 
@@ -39,18 +47,91 @@ DEVICE_ROUTES = [
     ("/esp32/heartbeat", {"board": "ultrasonic"}, None),
     ("/esp32/sensor-event", {"sensor": "door", "reason": "forged"}, None),
     ("/esp32/state-change", None, {"armed": False}),
+    ("/esp32/entry-delay", None, {"seconds": 25}),
 ]
+
+# Reachable with *either* credential, so it belongs to neither table above —
+# but it still must reject a caller holding neither.
+EITHER_CREDENTIAL_ROUTES = ["/camera/recognize"]
+
+# Open by design. Anything not in here and not in the tables above is a route
+# somebody forgot to cover; see test_every_route_is_covered_by_a_table.
+#
+# The FastAPI docs routes are Starlette `Route`s rather than `APIRoute`s, so
+# they never reach that test — worth knowing that `/openapi.json`, `/docs` and
+# `/redoc` are also anonymous, which means the full API schema is public even
+# though three READMEs claim `/health` is the only open endpoint.
+PUBLIC_ROUTES = {"/health", "/login"}
 
 
 async def _call(client, method: str, path: str, body):
     """Dispatches one route from the table above.
 
     `json=` is only passed for methods that carry a body — httpx's `get()`
-    signature rejects the keyword outright rather than ignoring it.
+    and `delete()` signatures reject the keyword outright rather than
+    ignoring it.
     """
-    if method == "get":
-        return await client.get(path)
+    if method in ("get", "delete"):
+        return await getattr(client, method)(path)
     return await getattr(client, method)(path, json=body)
+
+
+def _table_paths() -> set[str]:
+    """Every path the tables in this module claim to cover, with the sample
+    ids swapped back for their templates so they match the route objects."""
+    covered = {path for _, path, _ in PROTECTED_ROUTES}
+    covered |= {path for path, _, _ in DEVICE_ROUTES}
+    covered |= set(EITHER_CREDENTIAL_ROUTES)
+    covered |= PUBLIC_ROUTES
+    return {
+        path.replace("/faces/1/photo", "/faces/{face_id}/photo").replace(
+            "/faces/1", "/faces/{face_id}"
+        )
+        for path in covered
+    }
+
+
+def test_every_route_is_covered_by_a_table():
+    """The drift guard on the tables above.
+
+    Those tables are the project's stated defence against shipping an
+    endpoint that forgot its `Depends(require_app)` (CLAUDE.md says as much),
+    but they are hand-maintained — and by the time this test was written they
+    had silently fallen eight routes behind, including `/face-disarm-enabled`
+    (which controls whether a photograph can disarm the alarm) and
+    `/esp32/entry-delay` (which can push the system into its disarm
+    countdown). Nothing was actually unguarded, but nothing would have said
+    so if it had been.
+
+    So: enumerate the app's own routes and require each to appear somewhere.
+    Adding a route now forces a deliberate choice — cover it, or declare it
+    public — instead of relying on someone remembering.
+    """
+    from backend.main import app
+
+    actual = {
+        route.path
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        # /ws authenticates inline (closes with 1008 before accept()) because
+        # WebSockets can't carry an Authorization header; it isn't an
+        # APIRoute anyway, but be explicit.
+        and route.path != "/ws"
+    }
+    missing = actual - _table_paths()
+    assert not missing, (
+        f"These routes are in the app but in no table: {sorted(missing)}. "
+        "Add each to PROTECTED_ROUTES / DEVICE_ROUTES / EITHER_CREDENTIAL_ROUTES, "
+        "or to PUBLIC_ROUTES if it is genuinely meant to be open."
+    )
+
+
+@pytest.mark.parametrize("path", EITHER_CREDENTIAL_ROUTES)
+async def test_either_credential_routes_reject_no_credential(client, path):
+    """`require_app_or_device` accepts two kinds of caller — and must still
+    refuse a third kind that holds neither."""
+    response = await client.post(path, files={"photo": ("f.jpg", b"x", "image/jpeg")})
+    assert response.status_code == 401
 
 
 @pytest.mark.parametrize("method,path,body", PROTECTED_ROUTES)
@@ -242,3 +323,64 @@ def test_is_valid_handles_missing_tokens():
     assert store.is_valid(None) is False
     assert store.is_valid("") is False
     assert store.is_valid("never-issued") is False
+
+
+async def test_one_typo_after_a_lockout_expires_does_not_re_lock_and_re_alarm(
+    client, state, monkeypatch
+):
+    """The counter has to be cleared when the lockout is, not only on success.
+
+    `_failed_attempts` used to stay latched at MAX_LOGIN_ATTEMPTS once the 30
+    seconds elapsed, so the user's next single mistyped character hit
+    `>= MAX` immediately: re-locked for another 30 seconds *and* — because
+    `_register_failed_attempt` escalates — `trigger_alert` fired. On an armed
+    house that means the siren, the buzzer command to the door controller,
+    and an urgent push, all from one typo, in a loop the user could not
+    escape at better than one mistake per cycle.
+    """
+    from datetime import datetime, timedelta
+
+    from backend.models import AlarmState
+
+    for i in range(3):
+        await client.post("/login", json={"password": f"nope{i}"})
+    assert state.is_locked_out is True
+
+    state._locked_until = datetime.now() - timedelta(seconds=1)
+
+    body = (await client.post("/login", json={"password": "one-typo"})).json()
+
+    assert body["locked_out"] is False, "a single wrong password must not re-lock"
+    assert body["attempts_remaining"] == 2, "the user gets a full fresh allowance"
+    assert state.alarm_state != AlarmState.triggered
+
+
+async def test_attempts_remaining_is_coherent_once_a_lockout_has_expired(client, state):
+    """`attempts_remaining: 0` alongside `locked_out: false` is a contradiction
+    the app rendered as "0 attempts left" on a system that was in fact
+    accepting logins."""
+    from datetime import datetime, timedelta
+
+    for i in range(3):
+        await client.post("/login", json={"password": f"nope{i}"})
+
+    state._locked_until = datetime.now() - timedelta(seconds=1)
+    state._clear_expired_lockout()
+
+    assert state.is_locked_out is False
+    assert state.attempts_remaining == 3
+
+
+async def test_an_expired_lockout_cannot_be_cleared_early(state):
+    """The reset is a no-op while the lockout is still running — otherwise it
+    would be a way to serve none of it."""
+    from datetime import datetime, timedelta
+
+    for i in range(3):
+        await state.login(f"nope{i}")
+    state._locked_until = datetime.now() + timedelta(seconds=30)
+
+    state._clear_expired_lockout()
+
+    assert state.is_locked_out is True
+    assert state.attempts_remaining == 0

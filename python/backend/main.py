@@ -51,6 +51,7 @@ from .models import (
     SetEntryDelayRequest,
     SetFaceDisarmEnabledRequest,
     SetFaceIdEnabledRequest,
+    SetKeypadPinRequest,
     SetNightModeHoursRequest,
     SetNightModeRequest,
     SetNtfyRequest,
@@ -395,6 +396,28 @@ async def set_ntfy(body: SetNtfyRequest):
     that makes an alert reach the phone with the app closed."""
     await state.set_ntfy(body.server, body.topic)
     return {"ok": True}
+
+
+@app.post("/settings/keypad-pin", dependencies=[Depends(require_app)])
+async def set_keypad_pin(body: SetKeypadPinRequest):
+    """Changes the disarm PIN on the physical keypad.
+
+    `hardware` reports whether the door controller acknowledged — the board
+    stores the PIN in NVS, so that ack is what makes the change real. False
+    means the board was unreachable and is still accepting the old PIN; the
+    new one is saved here and can be re-sent.
+
+    `secrets_updated` reports whether `esp32/.../secrets.h` was rewritten to
+    match. That file only supplies the default for a board flashed fresh, so
+    it is a safeguard against a future reflash silently restoring an old PIN,
+    not part of applying the change. It is off unless HOMEGUARD_SECRETS_H is
+    set (see backend/secrets_file.py).
+    """
+    try:
+        hardware, secrets_updated = await state.set_keypad_pin(body.pin)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "hardware": hardware, "secrets_updated": secrets_updated}
 
 
 @app.post("/settings/ntfy/test", dependencies=[Depends(require_app)])

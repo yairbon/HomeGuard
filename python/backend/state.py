@@ -65,6 +65,36 @@ BOARD_NAMES = ("ultrasonic", "vibration", "door_controller")
 # run for weeks. The app's log screen only ever shows a scrollback anyway.
 MAX_EVENTS = 200
 
+# Bounds on the physical keypad's disarm PIN. Digits only, because the 3x4
+# matrix's other two keys are '*' (arm) and '#' (submit) — a PIN containing
+# either could never be typed. The same rule is enforced in the door
+# controller sketch's isValidPin(); both sides check, because the board's
+# /keypad-pin route is reachable by anything on the network holding the
+# device key and so cannot assume the backend validated first.
+KEYPAD_PIN_MIN_LENGTH = 4
+KEYPAD_PIN_MAX_LENGTH = 8
+
+
+def is_valid_keypad_pin(pin: object) -> bool:
+    """True for a PIN the keypad can actually accept.
+
+    Deliberately strict rather than permissive. Beyond being a usability
+    rule, this is the sanitizer standing between an app-supplied string and
+    two places that string reaches: an HTTP body sent to the door controller,
+    and — when secrets-file syncing is switched on — a `#define` written into
+    a C++ header that gets compiled into firmware. A PIN restricted to digits
+    cannot carry a quote, a newline, or a preprocessor directive into either.
+    """
+    return (
+        isinstance(pin, str)
+        and KEYPAD_PIN_MIN_LENGTH <= len(pin) <= KEYPAD_PIN_MAX_LENGTH
+        and pin.isdigit()
+        # `str.isdigit()` is True for superscripts and other Unicode digit
+        # forms ('²', '٣'); the keypad emits ASCII, and so must this.
+        and pin.isascii()
+    )
+
+
 DEFAULT_PASSWORD = "homeguard"
 STATE_FILE = Path(
     os.environ.get("HOMEGUARD_STATE_FILE", Path(__file__).resolve().parent.parent / "state.json")
@@ -115,6 +145,17 @@ class AppState:
         # topic name, since that name is the only thing protecting it.
         self.ntfy_server = "https://ntfy.sh"
         self.ntfy_topic = ""
+        # The physical keypad's disarm PIN, when it has been set from the app.
+        # Empty means "never set here" — the board is then running whatever
+        # KEYPAD_PIN was compiled into its secrets.h, which the backend has no
+        # way to know. Stored as the literal PIN rather than a hash because
+        # unlike the app password, the backend does not *verify* this value:
+        # it relays it to the door controller, which is the only thing that
+        # compares it. That also means it has to survive a restart, so a
+        # re-send after the board comes back online sends the right PIN.
+        # It sits in state.json next to the device key, which is likewise a
+        # shared secret held in the clear (see security.py).
+        self.keypad_pin = ""
 
         # Last time each board was heard from. Absent = never seen this run.
         # Board liveness is derived from these timestamps rather than stored
@@ -180,6 +221,11 @@ class AppState:
         )
         self.ntfy_server = data.get("ntfy_server") or self.ntfy_server
         self.ntfy_topic = data.get("ntfy_topic", self.ntfy_topic)
+        # Re-validated on load rather than trusted: this is the one persisted
+        # field that gets relayed to hardware, and state.json is a plain file
+        # a user may well have opened and edited.
+        stored_pin = data.get("keypad_pin", "")
+        self.keypad_pin = stored_pin if is_valid_keypad_pin(stored_pin) else ""
 
         faces = data.get("faces")
         if isinstance(faces, list):
@@ -241,6 +287,7 @@ class AppState:
             "police_call_delay_seconds": self.police_call_delay_seconds,
             "ntfy_server": self.ntfy_server,
             "ntfy_topic": self.ntfy_topic,
+            "keypad_pin": self.keypad_pin,
         }
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +322,18 @@ class AppState:
             return
         payload = self.snapshot().model_dump_json()
         dead = []
-        for ws in self._sockets:
+        # Iterate a snapshot of the set, not the set itself. `send_text`
+        # suspends whenever the peer's write buffer is full — routine for a
+        # backgrounded phone or a Tailscale hop — and while it is suspended
+        # another task can register() a newly-connected app or unregister()
+        # one that just dropped. Iterating the live set through that window
+        # raises `RuntimeError: Set changed size during iteration`, which is
+        # not caught by the `except` below (it wraps only the send) and so
+        # escapes into whatever called us: the alarm frame is lost for every
+        # socket after the mutation point, `/esp32/sensor-event` 500s back at
+        # the board, and the same escape from `_monitor_boards` kills board
+        # liveness for the rest of the process.
+        for ws in list(self._sockets):
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -283,8 +341,7 @@ class AppState:
                 # network drop, etc). Broad except because the exact
                 # exception type varies by transport/ASGI server; any
                 # failure here just means "drop this socket", not a bug
-                # to propagate. Collected instead of discarded in-loop to
-                # avoid mutating self._sockets while iterating over it.
+                # to propagate.
                 dead.append(ws)
         for ws in dead:
             self._sockets.discard(ws)
@@ -447,6 +504,20 @@ class AppState:
         triggers. Clamped at 0 (never negative) for display purposes."""
         return max(0, MAX_LOGIN_ATTEMPTS - self._failed_attempts)
 
+    def _clear_expired_lockout(self) -> None:
+        """Resets the failed-attempt counter once a lockout has run out.
+
+        Called at the top of every password check. `is_locked_out` is derived
+        purely from `_locked_until` elapsing, which says nothing about the
+        counter — so without this the user serves the 30 seconds and then
+        starts their next attempt already at the limit. Deliberately a no-op
+        while a lockout is still in effect, so it can't be used to reset the
+        counter early.
+        """
+        if self._locked_until is not None and not self.is_locked_out:
+            self._locked_until = None
+            self._failed_attempts = 0
+
     async def _register_failed_attempt(self, reason: str) -> None:
         """Shared failure path for every password check in the system.
 
@@ -476,6 +547,18 @@ class AppState:
         if self.is_locked_out:
             return None
 
+        # A lockout that has elapsed must also clear the counter that caused
+        # it. Previously only a *successful* login reset `_failed_attempts`,
+        # so after the 30 seconds expired the counter was still latched at
+        # MAX_LOGIN_ATTEMPTS: the next single typo hit `>= MAX` immediately,
+        # re-locked for another 30 seconds, and — because
+        # `_register_failed_attempt` escalates — fired `trigger_alert` on an
+        # armed house. One mistyped character, full siren. It also made
+        # `attempts_remaining` report 0 alongside `locked_out: false`, an
+        # incoherent pair the app rendered as "0 attempts left" on a system
+        # that was in fact accepting logins.
+        self._clear_expired_lockout()
+
         if not verify_password(password, self._password_hash):
             await self._register_failed_attempt(f"{MAX_LOGIN_ATTEMPTS} failed login attempts")
             return None
@@ -503,6 +586,7 @@ class AppState:
         """
         if self.is_locked_out:
             return False
+        self._clear_expired_lockout()
         if not verify_password(old_password, self._password_hash):
             await self._register_failed_attempt(
                 f"{MAX_LOGIN_ATTEMPTS} failed password-change attempts"
@@ -577,6 +661,19 @@ class AppState:
         `transitional` before the delay elapses.
         """
         await asyncio.sleep(ARMING_EXIT_DELAY.total_seconds())
+
+        # Re-check before committing. `arm()` publishes `transitional` and
+        # awaits a broadcast *before* it stores our task handle, so during
+        # that window `disarm()` and `report_state_from_esp32()` both find
+        # `self._arming_task is None` and their `.cancel()` is a no-op — the
+        # disarm applies, and three seconds later this task would arm a house
+        # whose door controller was just told to disarm. Backend says ARMED,
+        # hardware says DISARMED, siren dead, and an opened door reports
+        # nothing. Checking the state here closes that regardless of whether
+        # the broadcast happened to suspend.
+        if self.alarm_state != AlarmState.transitional:
+            return
+
         self.alarm_state = AlarmState.armed
         self._apply_bypass(mode)
         self._log(
@@ -625,6 +722,26 @@ class AppState:
         the backend/app stay correct even if someone arms or disarms at
         the keypad without touching the app at all.
         """
+        # One exception to "the controller is authoritative": it may not
+        # arm out of a live alarm. `arm()` already refuses that ("repeated
+        # /arm calls can't interrupt an alert") but this path used to accept
+        # `triggered -> armed`, and `_apply_bypass` below then rebuilt every
+        # SensorReading with ok=True — erasing the ok=False marker on the
+        # sensor that caught the intrusion. The red banner vanished from the
+        # app with no `disarmed` event to explain it, and the pending
+        # `_escalate_after_delay` found a non-triggered state and swallowed
+        # the "alarm not cleared" push. Reachable whenever the controller
+        # doesn't know we're alarming, which is the default: an unset
+        # HOMEGUARD_DOOR_CONTROLLER_URL makes every outbound command a no-op.
+        # Only a human disarm — keypad, app, or face — leaves `triggered`.
+        if armed and self.alarm_state == AlarmState.triggered:
+            self._log(
+                "Controller reported armed during an active alarm — ignored",
+                EventCategory.alert,
+            )
+            await self._broadcast()
+            return
+
         # The controller's report is authoritative and can arrive at any
         # time, including mid-exit-delay (e.g. it finished its own timer,
         # or someone armed/disarmed directly at the keypad). Cancel our
@@ -743,6 +860,16 @@ class AppState:
         )
         self._start_escalation(reason)
 
+        # Push to the apps *before* touching the hardware. This used to run
+        # after, which meant every connected phone waited out the door
+        # controller's round trip — and that board answers from inside its
+        # own `loop()`, where a blocking HTTPClient call can hold it for
+        # seconds, so the wait routinely ran to `esp32_client`'s full 3s
+        # timeout. Three seconds of an alarm nobody has been told about is
+        # the exact cost `notifier.notify()` is non-blocking to avoid; there
+        # is no reason to reintroduce it two lines later.
+        await self._broadcast()
+
         # The door controller's buzzers only react to its own local door
         # sensor + keypad — they don't know a different board just tripped.
         # Skipped when the door itself is the source: its entryDelay->ALARM
@@ -753,8 +880,6 @@ class AppState:
             from . import esp32_client  # deferred: esp32_client imports `state`
 
             await esp32_client.send_trigger_alarm()
-
-        await self._broadcast()
 
     def _start_escalation(self, reason: str) -> None:
         """Schedules the follow-up notification for an alarm nobody has
@@ -957,6 +1082,48 @@ class AppState:
                 # A scheduling error must never kill the loop and silently
                 # stop all future auto-arming.
                 logger.exception("Night-mode check failed")
+
+    async def set_keypad_pin(self, pin: str) -> tuple[bool, bool]:
+        """Changes the physical keypad's disarm PIN.
+
+        Returns `(hardware_ack, secrets_synced)` so the app can tell the
+        three outcomes apart: the board took it, the board is unreachable, or
+        the board took it but the source header wasn't updated.
+
+        Order matters. The PIN is stored and persisted **before** the board
+        is contacted, so an unreachable board leaves the backend holding the
+        new value rather than losing it — the user's change survives, and can
+        be re-sent. That does mean a failed push leaves the backend and the
+        board briefly disagreeing, which is the honest state of affairs and
+        is exactly what `hardware_ack=False` tells the app.
+
+        Rejects an invalid PIN by raising ValueError; the route turns that
+        into a 422. Logged as an event because changing what disarms the
+        alarm is precisely the kind of change worth an audit trail — but the
+        PIN itself never enters the log, the same rule the ntfy topic follows
+        (there's a test for that one; there's now one for this).
+        """
+        if not is_valid_keypad_pin(pin):
+            raise ValueError(
+                f"PIN must be {KEYPAD_PIN_MIN_LENGTH}-{KEYPAD_PIN_MAX_LENGTH} digits"
+            )
+
+        self.keypad_pin = pin
+        self._persist()
+
+        from . import esp32_client, secrets_file  # deferred: esp32_client imports `state`
+
+        hardware_ack = await esp32_client.send_keypad_pin(pin)
+        secrets_synced = secrets_file.update_keypad_pin(pin)
+
+        self._log(
+            "Keypad PIN changed"
+            if hardware_ack
+            else "Keypad PIN changed — the door controller could not be reached",
+            EventCategory.auth,
+        )
+        await self._broadcast()
+        return hardware_ack, secrets_synced
 
     async def set_emergency_number(self, number: str) -> None:
         """Stores the number to call when police auto-dial (if/once

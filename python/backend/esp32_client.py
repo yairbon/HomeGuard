@@ -89,6 +89,24 @@ async def send_disarm() -> bool:
     return await _post("/disarm")
 
 
+async def send_keypad_pin(pin: str) -> bool:
+    """Push a new disarm PIN to the door controller's NVS.
+
+    The board persists it in flash and uses it from that moment on, so this
+    is what actually changes the PIN — `secrets.h` only supplies the default
+    for a board that has never been told one (see backend/secrets_file.py).
+
+    Callers must have validated `pin` first (`is_valid_keypad_pin`); the
+    board validates again on its side, and rejects with 400 rather than
+    storing something the keypad could not type.
+
+    Returns False when the board is unreachable. The PIN stays stored on this
+    side either way, so the app can retry once the board is back rather than
+    losing the change.
+    """
+    return await _post("/keypad-pin", json={"pin": pin})
+
+
 async def send_trigger_alarm() -> bool:
     """Tell the door controller to sound its siren immediately.
 

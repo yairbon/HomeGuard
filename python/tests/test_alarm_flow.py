@@ -191,3 +191,147 @@ async def test_event_log_is_capped(state):
         state._log(f"event {i}")
     assert len(state.events) == MAX_EVENTS
     assert state.events[0].message == f"event {MAX_EVENTS + 49}"  # newest first
+
+
+# ---- Regressions found in the August 2026 audit --------------------------
+#
+# Each of these locks a defect that the suite passed straight over, because
+# none of them live inside a single function — they are all gaps *between*
+# two pieces that are individually correct.
+
+
+class _FakeSocket:
+    """A stand-in for a connected app's WebSocket.
+
+    `send_text` optionally runs a callback, which is how a test simulates
+    another client connecting or dropping *during* a broadcast — the window
+    that only exists because `send_text` is awaited.
+    """
+
+    def __init__(self, on_send=None):
+        self.received: list[str] = []
+        self._on_send = on_send
+
+    async def send_text(self, payload: str) -> None:
+        self.received.append(payload)
+        if self._on_send is not None:
+            self._on_send()
+
+
+async def test_a_client_disconnecting_mid_broadcast_does_not_abort_the_broadcast(state):
+    """A phone dropping while an alarm frame is going out used to raise
+    `RuntimeError: Set changed size during iteration` out of `_broadcast`.
+
+    That is not a cosmetic failure: it aborted the loop, so every socket after
+    the mutation point never received the alarm; it escaped into the calling
+    route, so `/esp32/sensor-event` answered the reporting board with a 500;
+    and the same escape out of `_monitor_boards` killed board liveness for the
+    rest of the process. `send_text` suspends whenever a peer's write buffer
+    is full, which for a backgrounded phone or a Tailscale hop is routine.
+    """
+    doomed = _FakeSocket()
+    survivor = _FakeSocket(on_send=lambda: state._sockets.discard(doomed))
+    state._sockets.update({doomed, survivor})
+
+    await state._broadcast()
+
+    assert survivor.received, "the surviving client must still get the frame"
+    assert doomed not in state._sockets
+
+
+async def test_a_client_connecting_mid_broadcast_does_not_abort_the_broadcast(state):
+    """The other half of the same window: `register()` runs from the /ws
+    handler task and grows the set while a send is suspended."""
+    late = _FakeSocket()
+    first = _FakeSocket(on_send=lambda: state._sockets.add(late))
+    state._sockets.add(first)
+
+    await state._broadcast()  # must not raise
+
+    assert first.received
+
+
+async def test_a_disarm_during_the_exit_delay_is_not_undone_three_seconds_later(state):
+    """`arm()` publishes `transitional` and awaits a broadcast *before* it
+    stores `_arming_task`, so a disarm landing in that window found
+    `_arming_task is None` and cancelled nothing.
+
+    `_finish_arming` then armed unconditionally. The result was a backend
+    that said ARMED while the door controller — which had just been told to
+    disarm — said DISARMED: the app shows a protected house, the siren is
+    dead, and an opened door reports nothing at all.
+    """
+    await state.arm(ArmMode.away)
+    assert state.alarm_state == AlarmState.transitional
+
+    await state.disarm()
+    assert state.alarm_state == AlarmState.disarmed
+
+    # Let the countdown run to completion rather than cancelling it — the
+    # point is that the task itself declines to act, whether or not anyone
+    # remembered to cancel it.
+    if state._arming_task:
+        await asyncio.wait_for(state._arming_task, timeout=5)
+
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_the_controller_cannot_arm_out_of_a_live_alarm(state):
+    """`arm()` already refuses to interrupt an alert; this path did not.
+
+    Reachable in the ordinary case, not a contrived one: with no
+    HOMEGUARD_DOOR_CONTROLLER_URL the board is never told the system armed,
+    so someone reaching the keypad and arming it sends `armed: true` while
+    the backend is mid-alarm. That used to clear the alarm with no `disarmed`
+    event to explain it, rebuild every sensor as ok — erasing the marker on
+    the one that caught the intrusion — and leave `_escalate_after_delay` to
+    find a non-triggered state and swallow the "alarm not cleared" push.
+    """
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(source=SensorType.ultrasonic, reason="break-in")
+    assert state.alarm_state == AlarmState.triggered
+
+    await state.report_state_from_esp32(armed=True)
+
+    assert state.alarm_state == AlarmState.triggered
+    tripped = next(s for s in state.sensors if s.type == SensorType.ultrasonic)
+    assert tripped.ok is False, "the intrusion evidence must survive"
+
+
+async def test_the_controller_can_still_disarm_out_of_a_live_alarm(state):
+    """The guard above must not block the legitimate case — someone typing
+    the PIN on the keypad is exactly how an alarm is meant to be cleared."""
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(source=SensorType.ultrasonic, reason="break-in")
+
+    await state.report_state_from_esp32(armed=False)
+
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_the_alarm_reaches_the_apps_before_the_hardware_round_trip(state, monkeypatch):
+    """Ordering, not speed, is what this locks.
+
+    `trigger_alert` used to await the door controller's siren command before
+    broadcasting. That board answers from inside its own `loop()`, where a
+    blocking HTTP call can hold it for seconds, so the wait routinely ran to
+    the full 3-second timeout — three seconds in which the alarm had fired
+    and no phone had been told.
+    """
+    from backend import esp32_client
+
+    order: list[str] = []
+    socket = _FakeSocket(on_send=lambda: order.append("broadcast"))
+    state._sockets.add(socket)
+
+    async def fake_trigger() -> bool:
+        order.append("hardware")
+        return True
+
+    monkeypatch.setattr(esp32_client, "send_trigger_alarm", fake_trigger)
+
+    await arm_now(state, ArmMode.away)
+    order.clear()
+    await state.trigger_alert(source=SensorType.ultrasonic, reason="break-in")
+
+    assert order[:2] == ["broadcast", "hardware"], f"got {order}"

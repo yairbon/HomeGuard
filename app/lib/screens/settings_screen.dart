@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+// For FilteringTextInputFormatter — the keypad PIN fields accept digits only.
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../services/auth_service.dart';
@@ -9,13 +11,19 @@ import '../widgets/homeguard_icons.dart';
 
 /// Account and system settings screen.
 ///
-/// Covers four independent areas: a night-mode toggle, emergency-contact
-/// details plus the police-call response delay, a change-password form,
-/// and the backend URL. The night-mode switch and emergency-contact
-/// fields persist to [BackendService] as soon as they change; the password
-/// form is only submitted when the user taps its button (see
-/// [_submitPassword]). The backend URL persists to local device storage
-/// via [BackendConfig] instead — see [_saveBackendUrl].
+/// Covers five independent areas: a night-mode toggle, emergency-contact
+/// details plus the police-call response delay, a change-password form, the
+/// physical keypad's PIN, and the backend URL. The night-mode switch and
+/// emergency-contact fields persist to [BackendService] as soon as they
+/// change; the password and PIN forms are only submitted when the user taps
+/// their button (see [_submitPassword], [_submitKeypadPin]). The backend URL
+/// persists to local device storage via [BackendConfig] instead — see
+/// [_saveBackendUrl].
+///
+/// The two credential forms are unrelated despite sitting next to each
+/// other: [_submitPassword] changes how you sign in to *this app*, while
+/// [_submitKeypadPin] changes the code typed on the *hardware* keypad by the
+/// door. Only the second one leaves the backend.
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -32,6 +40,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _backendUrlController = TextEditingController();
   final _ntfyServerController = TextEditingController();
   final _ntfyTopicController = TextEditingController();
+  final _pinFormKey = GlobalKey<FormState>();
+  final _pinController = TextEditingController();
+  final _pinConfirmController = TextEditingController();
+
+  bool _isSubmittingPin = false;
+  String? _pinError;
+  String? _pinSuccess;
+  // Set when the PIN was saved on the backend but the door controller didn't
+  // answer. Kept apart from _pinSuccess because it is neither a success nor a
+  // failure: the change is recorded, and the keypad is still on the old PIN.
+  String? _pinWarning;
 
   bool _isSavingNtfy = false;
   String? _ntfyMessage;
@@ -160,6 +179,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _backendUrlController.dispose();
     _ntfyServerController.dispose();
     _ntfyTopicController.dispose();
+    _pinController.dispose();
+    _pinConfirmController.dispose();
     super.dispose();
   }
 
@@ -183,6 +204,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final backend = context.read<BackendService>();
     final ok = await backend.changePassword(_oldController.text, _newController.text);
 
+    // Guard, like every other awaited handler on this screen: the user can
+    // navigate away mid-request, and setState on a disposed State throws.
+    if (!mounted) return;
     setState(() {
       _isSubmitting = false;
       if (ok) {
@@ -192,6 +216,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _confirmController.clear();
       } else {
         _error = 'Current password is incorrect';
+      }
+    });
+  }
+
+  /// Validates and submits the keypad-PIN form.
+  ///
+  /// Reports three outcomes rather than two, because "saved, but the board
+  /// didn't answer" is a genuinely different situation from either success
+  /// or failure: the change is recorded and will be re-sent, but until the
+  /// door controller takes it, **the keypad still opens on the old PIN**.
+  /// Telling the user that plainly is the whole point — an alarm panel that
+  /// says "PIN changed" when the hardware disagrees is worse than one that
+  /// says nothing.
+  Future<void> _submitKeypadPin() async {
+    if (!(_pinFormKey.currentState?.validate() ?? false)) return;
+
+    setState(() {
+      _isSubmittingPin = true;
+      _pinError = null;
+      _pinSuccess = null;
+      _pinWarning = null;
+    });
+
+    final backend = context.read<BackendService>();
+    final result = await backend.setKeypadPin(_pinController.text);
+
+    if (!mounted) return;
+    setState(() {
+      _isSubmittingPin = false;
+      if (!result.reachable) {
+        _pinError = "Couldn't reach the backend — check the URL below";
+      } else if (!result.ok) {
+        _pinError = 'PIN must be 4-8 digits';
+      } else {
+        _pinController.clear();
+        _pinConfirmController.clear();
+        if (result.hardware) {
+          _pinSuccess = result.secretsUpdated
+              ? 'Keypad PIN updated, and secrets.h synced for the next flash'
+              : 'Keypad PIN updated on the keypad';
+        } else {
+          _pinWarning = 'Saved, but the door controller did not answer — '
+              'the keypad still uses the old PIN. It will be sent again '
+              'when the board is back online.';
+        }
       }
     });
   }
@@ -449,6 +518,92 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                       child: CircularProgressIndicator(strokeWidth: 2),
                                     )
                                   : const Text('UPDATE PASSWORD'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  _SectionCard(
+                    child: Form(
+                      key: _pinFormKey,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
+                              const SizedBox(width: 10),
+                              const Text('Keypad PIN', style: TextStyle(color: AppColors.textPrimary)),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          const Text(
+                            'The code typed on the physical keypad to disarm. '
+                            'Sent to the door controller, which stores it and '
+                            'keeps it across reboots.',
+                            style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                          ),
+                          const SizedBox(height: 16),
+                          TextFormField(
+                            controller: _pinController,
+                            obscureText: true,
+                            keyboardType: TextInputType.number,
+                            // Digits only: the keypad's other two keys are '*'
+                            // (arm) and '#' (submit), so a PIN containing
+                            // anything else could never be typed on it.
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'New keypad PIN',
+                              counterText: '',
+                            ),
+                            validator: (v) => (v == null || v.length < 4)
+                                ? 'At least 4 digits'
+                                : null,
+                          ),
+                          const SizedBox(height: 12),
+                          TextFormField(
+                            controller: _pinConfirmController,
+                            obscureText: true,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'Confirm keypad PIN',
+                              counterText: '',
+                            ),
+                            validator: (v) =>
+                                v != _pinController.text ? 'PINs do not match' : null,
+                          ),
+                          if (_pinError != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_pinError!, style: const TextStyle(color: AppColors.alarm)),
+                          ],
+                          if (_pinWarning != null) ...[
+                            const SizedBox(height: 12),
+                            Text(
+                              _pinWarning!,
+                              style: const TextStyle(color: AppColors.transitional),
+                            ),
+                          ],
+                          if (_pinSuccess != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_pinSuccess!, style: const TextStyle(color: AppColors.safe)),
+                          ],
+                          const SizedBox(height: 20),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton(
+                              onPressed: _isSubmittingPin ? null : _submitKeypadPin,
+                              child: _isSubmittingPin
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Text('UPDATE KEYPAD PIN'),
                             ),
                           ),
                         ],

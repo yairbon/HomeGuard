@@ -370,6 +370,26 @@ class HttpBackendService implements BackendService {
     return res.body['ok'] as bool? ?? false;
   }
 
+  @override
+  Future<KeypadPinResult> setKeypadPin(String pin) async {
+    final res = _report(
+      await _post('/settings/keypad-pin', {'pin': pin}),
+      'the keypad PIN change',
+    );
+    if (!res.reachable) {
+      return const KeypadPinResult(ok: false, reachable: false);
+    }
+    return KeypadPinResult(
+      ok: res.body['ok'] as bool? ?? false,
+      // Defaults matter here: a `false` that comes from a missing field
+      // would claim the board didn't take the PIN. That's the safe direction
+      // to be wrong in — it tells the user to check the keypad rather than
+      // assuring them of something unverified.
+      hardware: res.body['hardware'] as bool? ?? false,
+      secretsUpdated: res.body['secrets_updated'] as bool? ?? false,
+    );
+  }
+
   // ---- Arm / disarm -------------------------------------------------------------
 
   /// Tells the backend to arm in [mode]; the resulting state change is

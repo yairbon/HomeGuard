@@ -123,6 +123,38 @@ class LoginResult {
   });
 }
 
+/// Outcome of changing the physical keypad's disarm PIN.
+///
+/// Three distinguishable results, because they need three different things
+/// said to the user:
+///
+/// * [ok] false — the PIN was rejected (not 4-8 digits) or the backend
+///   couldn't be reached. Nothing changed anywhere.
+/// * [ok] true, [hardware] false — saved here, but the door controller
+///   didn't answer. The keypad is **still accepting the old PIN**; this is
+///   the case the user most needs told plainly.
+/// * [ok] true, [hardware] true — the board stored it in NVS and is using
+///   it now.
+///
+/// [secretsUpdated] is a separate axis and only relevant on a development
+/// machine: it says whether `esp32/.../secrets.h` was rewritten to match, so
+/// that reflashing the board later doesn't silently restore an old PIN. It
+/// is false on any normal install, where the backend has no source tree to
+/// write to, and that is not a failure.
+class KeypadPinResult {
+  final bool ok;
+  final bool hardware;
+  final bool secretsUpdated;
+  final bool reachable;
+
+  const KeypadPinResult({
+    required this.ok,
+    this.hardware = false,
+    this.secretsUpdated = false,
+    this.reachable = true,
+  });
+}
+
 /// Push-notification target: an ntfy server and topic.
 ///
 /// On the public ntfy.sh the topic name is the only thing keeping strangers
@@ -161,6 +193,19 @@ abstract class BackendService {
   /// Returns whether the change succeeded (implementations should reject
   /// when [oldPassword] doesn't match the current password).
   Future<bool> changePassword(String oldPassword, String newPassword);
+
+  /// Changes the PIN typed on the physical keypad to disarm.
+  ///
+  /// Unrelated to [changePassword], which is the app's own login. This one
+  /// travels: backend -> door controller -> the board's NVS, which is the
+  /// only copy the keypad actually compares against. See [KeypadPinResult]
+  /// for why the outcome isn't a plain bool.
+  ///
+  /// Must be 4-8 digits — the keypad's other two keys are `*` (arm) and `#`
+  /// (submit), so anything else produces a PIN that can't be typed. The
+  /// backend and the firmware both enforce that independently; the app
+  /// checks too, only so the user gets told before a round trip.
+  Future<KeypadPinResult> setKeypadPin(String pin);
 
   /// Arms the system in the given [mode] (see [ArmMode] for what each mode
   /// bypasses). Implementations are expected to pass through a

@@ -196,6 +196,19 @@ class SetPoliceCallDelayRequest(BaseModel):
     seconds: int
 
 
+class SetKeypadPinRequest(BaseModel):
+    """Body for /settings/keypad-pin — the PIN typed on the physical keypad
+    to disarm.
+
+    Not part of `FullState`, deliberately: a PIN that rode in every state
+    broadcast would be pushed to every connected client several times a
+    minute and be sitting in each one's memory. The app sets it and never
+    reads it back, the same shape as changing the login password.
+    """
+
+    pin: str
+
+
 class SetNtfyRequest(BaseModel):
     """Body for /settings/ntfy — where to push alerts so they arrive even
     when the app isn't running. See backend/notifier.py.
