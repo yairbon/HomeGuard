@@ -183,6 +183,32 @@ const int BEEP_ON_DURATION = 150;     // Beep stays on for 150ms
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 10000;
 
+enum ReportKind : uint8_t {
+  REPORT_STATE_CHANGE,
+  REPORT_ENTRY_DELAY,
+  REPORT_DOOR_ALERT,
+  REPORT_HEARTBEAT,
+};
+
+struct ReportMessage {
+  ReportKind kind;
+  bool armed;  // only meaningful for REPORT_STATE_CHANGE
+};
+
+// Small on purpose. If reports are backing up this far the backend is down,
+// and the useful behaviour then is to drop them rather than to accumulate a
+// burst that will all arrive at once when it returns. Heartbeats are resent
+// every interval anyway, and a stale arm/disarm report is worse than none —
+// the backend would apply it as though it had just happened.
+const int REPORT_QUEUE_DEPTH = 8;
+
+// 8 KB: HTTPClient plus the underlying WiFiClient need a few KB of stack for
+// TLS-capable buffers even on plain HTTP, and a stack overflow here would
+// look like a random reboot rather than a failed report.
+const uint32_t REPORTER_STACK_BYTES = 8192;
+
+QueueHandle_t reportQueue = nullptr;
+
 // Boot sequence: configure pins, force the buzzers quiet so they don't
 // chirp on power-up, read the door's initial state, then bring up WiFi
 // and the remote-control WebServer.
@@ -232,6 +258,17 @@ void setup() {
   // from the backend.
   const char* collectedHeaders[] = {"X-Device-Key"};
   server.collectHeaders(collectedHeaders, 1);
+
+  reportQueue = xQueueCreate(REPORT_QUEUE_DEPTH, sizeof(ReportMessage));
+  if (reportQueue == nullptr) {
+    Serial.println("Could not create the report queue — reports will block loop().");
+  } else {
+    // Core 0: the Arduino loop task runs on core 1, so the blocking HTTP work
+    // sits on the other core alongside the WiFi stack rather than competing
+    // with the keypad scan and handleClient() for the same one.
+    xTaskCreatePinnedToCore(reporterTask, "hgReporter", REPORTER_STACK_BYTES,
+                            nullptr, 1, nullptr, 0);
+  }
 
   server.on("/arm", HTTP_POST, handleRemoteArm);
   server.on("/disarm", HTTP_POST, handleRemoteDisarm);
@@ -372,7 +409,7 @@ void beginRequest(HTTPClient& http, const String& url) {
 // This is the single most security-sensitive message this board sends: a
 // forged "armed:false" would make the app show a disarmed system. Hence the
 // X-Device-Key header, which the backend requires on every /esp32/* route.
-void reportStateChange(bool armed) {
+void sendStateChangeNow(bool armed) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot report state — WiFi disconnected");
     return;
@@ -399,7 +436,7 @@ void reportStateChange(bool armed) {
 // in, and the person walking in had no countdown on their phone. The duration
 // is sent rather than hardcoded on the backend so changing ENTRY_TIME_LIMIT
 // here stays correct everywhere.
-void reportEntryDelay() {
+void sendEntryDelayNow() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   beginRequest(http, backendUrl("/esp32/entry-delay"));
@@ -411,7 +448,7 @@ void reportEntryDelay() {
 
 // Reports the door-breach-timeout alarm, same pattern as the other two
 // sensor boards use for their own sensors.
-void reportDoorAlert() {
+void sendDoorAlertNow() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   beginRequest(http, backendUrl("/esp32/sensor-event?sensor=door&board=door_controller"
@@ -426,7 +463,7 @@ void reportDoorAlert() {
 // pushes already are one) so the app can show this board as online. Doesn't
 // check the response code — a missed heartbeat just gets retried on the
 // next interval, no special handling needed for a one-off failure.
-void sendHeartbeat() {
+void sendHeartbeatNow() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   beginRequest(http, backendUrl("/esp32/heartbeat?board=") + BOARD_NAME);
@@ -434,6 +471,74 @@ void sendHeartbeat() {
   http.POST("");
   http.end();
 }
+
+// ---- Outbound reporting runs on its own task ---------------------------
+//
+// Everything above sends synchronously and can block for up to
+// HTTP_TIMEOUT_MS on connect plus the same again waiting for a response.
+// That was survivable on the three push-only sensor boards, but not here,
+// because this is the board that also *answers*: `loop()` calls
+// `server.handleClient()` exactly once per pass, so for the whole duration
+// of a report this board replies to nothing — not /arm, not /disarm, and
+// not /trigger-alarm, which the backend calls (with a 3-second budget) when
+// a different board reports a break-in. A siren that never sounds during an
+// actual intrusion was the cost.
+//
+// Capping the timeouts shrank that window; moving the sends off `loop()`
+// removes it. `loop()` now only drops a small struct on a queue and returns
+// immediately, and this task does the waiting.
+//
+// The task deliberately shares no mutable state with `loop()`. It reads the
+// queue and nothing else — not `currentState`, not `enteredPin` — so there
+// is nothing here to guard with a mutex and no way for a half-updated state
+// machine to be observed mid-transition. Everything it needs travels in the
+// message.
+
+
+void reporterTask(void* param) {
+  ReportMessage message;
+  for (;;) {
+    // Blocks indefinitely; this task consumes no CPU while idle.
+    if (xQueueReceive(reportQueue, &message, portMAX_DELAY) != pdTRUE) continue;
+    switch (message.kind) {
+      case REPORT_STATE_CHANGE: sendStateChangeNow(message.armed); break;
+      case REPORT_ENTRY_DELAY:  sendEntryDelayNow();               break;
+      case REPORT_DOOR_ALERT:   sendDoorAlertNow();                break;
+      case REPORT_HEARTBEAT:    sendHeartbeatNow();                break;
+    }
+  }
+}
+
+// Hands a report to the task. Never blocks: a zero tick timeout means a full
+// queue drops the message rather than stalling `loop()`, which is the entire
+// reason this indirection exists.
+//
+// Falls back to sending inline if the queue doesn't exist, so a failure to
+// create it degrades to the old blocking behaviour instead of silently
+// reporting nothing at all.
+void enqueueReport(ReportKind kind, bool armed = false) {
+  ReportMessage message = {kind, armed};
+  // No queue means creation failed at boot. Sending inline blocks loop()
+  // again — the very thing this indirection exists to avoid — but going
+  // silent would be worse, so it degrades rather than drops.
+  if (reportQueue == nullptr) {
+    switch (kind) {
+      case REPORT_STATE_CHANGE: sendStateChangeNow(armed); break;
+      case REPORT_ENTRY_DELAY:  sendEntryDelayNow();       break;
+      case REPORT_DOOR_ALERT:   sendDoorAlertNow();        break;
+      case REPORT_HEARTBEAT:    sendHeartbeatNow();        break;
+    }
+    return;
+  }
+  if (xQueueSend(reportQueue, &message, 0) != pdTRUE) {
+    Serial.println("Report queue full — dropping a report (is the backend up?)");
+  }
+}
+
+void reportStateChange(bool armed) { enqueueReport(REPORT_STATE_CHANGE, armed); }
+void reportEntryDelay()            { enqueueReport(REPORT_ENTRY_DELAY); }
+void reportDoorAlert()             { enqueueReport(REPORT_DOOR_ALERT); }
+void sendHeartbeat()               { enqueueReport(REPORT_HEARTBEAT); }
 
 // ---- Remote control (new) ----------------------------------------------
 // Called by the backend, which itself only calls it from the app's own

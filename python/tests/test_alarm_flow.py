@@ -335,3 +335,67 @@ async def test_the_alarm_reaches_the_apps_before_the_hardware_round_trip(state, 
     await state.trigger_alert(source=SensorType.ultrasonic, reason="break-in")
 
     assert order[:2] == ["broadcast", "hardware"], f"got {order}"
+
+
+async def test_the_siren_command_is_retried_once(state, monkeypatch):
+    """The one outbound command whose failure is invisible from inside the
+    house.
+
+    Every other command's failure surfaces in the app as `hardware: false`.
+    A siren that never sounds looks exactly like no break-in. The door
+    controller answers from inside its own `loop()` and its WebServer takes
+    one client at a time, so a single badly-timed request can genuinely be
+    dropped — which is also what makes the board trivially deniable by
+    anything on the network holding its single connection slot.
+    """
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "TRIGGER_RETRY_DELAY", 0)
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://192.0.2.1")
+    attempts = []
+
+    async def failing_post(path, json=None):
+        attempts.append(path)
+        return False
+
+    monkeypatch.setattr(esp32_client, "_post", failing_post)
+
+    assert await esp32_client.send_trigger_alarm() is False
+    assert attempts == ["/trigger-alarm", "/trigger-alarm"]
+
+
+async def test_no_retry_when_no_board_is_configured(state, monkeypatch):
+    """With HOMEGUARD_DOOR_CONTROLLER_URL unset the first call never went
+    anywhere, so there is nothing to retry — and retrying would mean a
+    pointless sleep plus a misleading log line on every alarm raised in a
+    demo or test setup."""
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "")
+    attempts = []
+
+    async def failing_post(path, json=None):
+        attempts.append(path)
+        return False
+
+    monkeypatch.setattr(esp32_client, "_post", failing_post)
+
+    assert await esp32_client.send_trigger_alarm() is False
+    assert len(attempts) == 1
+
+
+async def test_a_siren_command_that_lands_is_not_repeated(state, monkeypatch):
+    """A retry is for a dropped request, not a standing habit."""
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "TRIGGER_RETRY_DELAY", 0)
+    attempts = []
+
+    async def ok_post(path, json=None):
+        attempts.append(path)
+        return True
+
+    monkeypatch.setattr(esp32_client, "_post", ok_post)
+
+    assert await esp32_client.send_trigger_alarm() is True
+    assert len(attempts) == 1

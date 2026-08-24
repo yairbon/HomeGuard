@@ -184,7 +184,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 219 tests, ~97s
+.\venv\Scripts\python.exe -m pytest        # 222 tests, ~91s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 

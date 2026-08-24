@@ -255,7 +255,7 @@ liveness detection** — תמונה מודפסת עשויה לעבור. זו נ�
 FastAPI, בנוי ונבדק. פירוט מלא ב-`python/README.md`. **שתי חבילות בדיקות
 בכוונה:**
 
-- `pytest` (`python/tests/`) — 219 בדיקות in-process מול ה-ASGI app דרך
+- `pytest` (`python/tests/`) — 222 בדיקות in-process מול ה-ASGI app דרך
   `httpx.ASGITransport`. בלי שרת, בלי פורטים, ובלי המתנות אמיתיות (פקיעת
   lockout ו-heartbeat מיושן נבדקים בהזזת timestamps). כל בדיקה מקבלת התקנה
   נקייה דרך reload של מודול ה-state לתיקייה זמנית. זה מה שמריצים תוך כדי

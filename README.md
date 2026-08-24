@@ -91,7 +91,7 @@ python -m venv venv
 
 | מה | איך | היקף |
 |---|---|---|
-| בקנד, מהיר | `pytest` מתוך `python/` | 219 בדיקות in-process, בלי שרת |
+| בקנד, מהיר | `pytest` מתוך `python/` | 222 בדיקות in-process, בלי שרת |
 | בקנד, מקצה לקצה | `python simulate.py` מול שרת חי | 96 בדיקות דרך סוקט אמיתי |
 | בקנד, lint | `ruff check .` | |
 | אפליקציה | `flutter analyze` + `flutter test` | |

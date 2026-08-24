@@ -20,6 +20,7 @@ the actual sketch if you change either side.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -43,6 +44,11 @@ DOOR_CONTROLLER_URL = os.environ.get("HOMEGUARD_DOOR_CONTROLLER_URL", "")
 # burns the full timeout and comes back as `hardware: false`, i.e. the app
 # reporting a board unreachable while the board sits there fine.
 _client = build_client(timeout=3.0)
+
+# Pause before the one retry in `send_trigger_alarm`. Short: the point is to
+# step over a board that was busy for a moment, not to wait out one that is
+# gone.
+TRIGGER_RETRY_DELAY = 0.5
 
 
 async def _post(path: str, json: dict | None = None) -> bool:
@@ -124,7 +130,32 @@ async def send_trigger_alarm() -> bool:
     state machine — a breach reported by a *different* board (ultrasonic,
     vibration) reaches the app fine but never reaches the door controller's
     hardware. This is how state.trigger_alert() closes that gap.
+
+    The one command here that gets a retry, because it is the one whose
+    failure is silent in the physical world: every other command's failure
+    surfaces in the app as `hardware: false`, but a siren that never sounds
+    looks, from inside the house, exactly like no break-in. The board answers
+    from inside its own `loop()` and its WebServer serves one client at a
+    time, so a single badly-timed request genuinely can be dropped — while
+    one of its own reports is in flight, or while that single slot is held.
+
+    Safe to repeat: `handleRemoteTriggerAlarm` only sets ALARM, so a second
+    delivery of a command that already arrived changes nothing. Cheap, too —
+    `trigger_alert` broadcasts to the apps *before* calling this, so the retry
+    delays no one.
     """
+    if await _post("/trigger-alarm"):
+        return True
+
+    # Nothing to retry against on an install with no board configured — the
+    # first call didn't fail, it never went anywhere. Retrying would mean a
+    # pointless half-second sleep and a misleading log line on every alarm
+    # raised in a demo or test setup.
+    if not DOOR_CONTROLLER_URL:
+        return False
+
+    await asyncio.sleep(TRIGGER_RETRY_DELAY)
+    logger.warning("Retrying the siren command — the first attempt did not land")
     return await _post("/trigger-alarm")
 
 
