@@ -1,10 +1,13 @@
 """Communication with the door/keypad controller board.
 
-There are three ESP32 boards in this project (see esp32/), each with its
-own sketch. Two of them (ultrasonic, vibration) are pure sensor-push
-clients — they call this backend's `/esp32/sensor-event` and
-`/esp32/heartbeat` endpoints directly and never receive anything back, so
-they need no entry here.
+There are four ESP32 boards in this project (see esp32/), each with its
+own sketch. Three of them (ultrasonic, vibration, ESP32-CAM) are pure push
+clients — they call this backend's `/esp32/sensor-event`,
+`/esp32/heartbeat` and `/camera/recognize` endpoints directly and never
+receive anything back, so they need no entry here. (The camera board is
+also *pulled* from, by the stream proxy in main.py, but that has its own
+client — a stream connection needs a completely different timeout profile
+from a 3-second command POST.)
 
 The door/keypad controller is different: it's the arm/disarm authority
 (it owns the keypad), so the app needs to be able to command it remotely,
@@ -17,11 +20,13 @@ the actual sketch if you change either side.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
 import httpx
 
+from .http_clients import build_client
 from .models import ArmMode
 from .state import state
 
@@ -32,7 +37,18 @@ logger = logging.getLogger("esp32_client")
 # boots — it prints its assigned IP on connect.
 DOOR_CONTROLLER_URL = os.environ.get("HOMEGUARD_DOOR_CONTROLLER_URL", "")
 
-_client = httpx.AsyncClient(timeout=3.0)
+# `build_client` is what supplies `trust_env=False` here, and that matters
+# more on this client than on any other: the target is a bare LAN IP, and a
+# stray HTTP_PROXY in the environment would route every arm/disarm command
+# through a proxy with no route to 192.168.x.x. That doesn't fail fast — it
+# burns the full timeout and comes back as `hardware: false`, i.e. the app
+# reporting a board unreachable while the board sits there fine.
+_client = build_client(timeout=3.0)
+
+# Pause before the one retry in `send_trigger_alarm`. Short: the point is to
+# step over a board that was busy for a moment, not to wait out one that is
+# gone.
+TRIGGER_RETRY_DELAY = 0.5
 
 
 async def _post(path: str, json: dict | None = None) -> bool:
@@ -89,6 +105,24 @@ async def send_disarm() -> bool:
     return await _post("/disarm")
 
 
+async def send_keypad_pin(pin: str) -> bool:
+    """Push a new disarm PIN to the door controller's NVS.
+
+    The board persists it in flash and uses it from that moment on, so this
+    is what actually changes the PIN — `secrets.h` only supplies the default
+    for a board that has never been told one (see backend/secrets_file.py).
+
+    Callers must have validated `pin` first (`is_valid_keypad_pin`); the
+    board validates again on its side, and rejects with 400 rather than
+    storing something the keypad could not type.
+
+    Returns False when the board is unreachable. The PIN stays stored on this
+    side either way, so the app can retry once the board is back rather than
+    losing the change.
+    """
+    return await _post("/keypad-pin", json={"pin": pin})
+
+
 async def send_trigger_alarm() -> bool:
     """Tell the door controller to sound its siren immediately.
 
@@ -96,5 +130,43 @@ async def send_trigger_alarm() -> bool:
     state machine — a breach reported by a *different* board (ultrasonic,
     vibration) reaches the app fine but never reaches the door controller's
     hardware. This is how state.trigger_alert() closes that gap.
+
+    The one command here that gets a retry, because it is the one whose
+    failure is silent in the physical world: every other command's failure
+    surfaces in the app as `hardware: false`, but a siren that never sounds
+    looks, from inside the house, exactly like no break-in. The board answers
+    from inside its own `loop()` and its WebServer serves one client at a
+    time, so a single badly-timed request genuinely can be dropped — while
+    one of its own reports is in flight, or while that single slot is held.
+
+    Safe to repeat: `handleRemoteTriggerAlarm` only sets ALARM, so a second
+    delivery of a command that already arrived changes nothing. Cheap, too —
+    `trigger_alert` broadcasts to the apps *before* calling this, so the retry
+    delays no one.
     """
+    if await _post("/trigger-alarm"):
+        return True
+
+    # Nothing to retry against on an install with no board configured — the
+    # first call didn't fail, it never went anywhere. Retrying would mean a
+    # pointless half-second sleep and a misleading log line on every alarm
+    # raised in a demo or test setup.
+    if not DOOR_CONTROLLER_URL:
+        return False
+
+    await asyncio.sleep(TRIGGER_RETRY_DELAY)
+    logger.warning("Retrying the siren command — the first attempt did not land")
     return await _post("/trigger-alarm")
+
+
+async def aclose() -> None:
+    """Closes the shared HTTP client, for a clean shutdown — the same job
+    `notifier.aclose()` does, called from the same lifespan teardown.
+
+    Without it, shutdown left this client's connection pool (and its
+    transport's sockets) to be closed by the garbage collector, which on a
+    reload-per-test suite like this one means a stream of "unclosed client"
+    warnings and, in a real deployment, a half-open TCP connection to the
+    door controller that nothing ever tore down.
+    """
+    await _client.aclose()

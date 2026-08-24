@@ -33,6 +33,8 @@ import logging
 
 import httpx
 
+from .http_clients import build_client
+
 logger = logging.getLogger("notifier")
 
 # Short, because this runs on the alert path. A slow or unreachable ntfy
@@ -40,7 +42,14 @@ logger = logging.getLogger("notifier")
 # — see `notify` for how that's guaranteed.
 _TIMEOUT = 5.0
 
-_client = httpx.AsyncClient(timeout=_TIMEOUT, trust_env=False)
+# The one client here that genuinely uses TLS — and the reason the trust store
+# is built once in http_clients.py and shared, rather than three times.
+_client = build_client(timeout=_TIMEOUT)
+
+# Strong references to in-flight `notify()` tasks. See `notify` for why the
+# alternative — letting the loop's weak reference be the only one — can drop
+# an alarm push mid-flight. Entries remove themselves on completion.
+_pending: set[asyncio.Task] = set()
 
 
 async def _send(server: str, topic: str, title: str, message: str, priority: str, tags: str):
@@ -89,13 +98,29 @@ def notify(
     """
     if not topic:
         return
-    # Held in no variable and never awaited: this is intentional
-    # fire-and-forget. `_send` catches everything, so the task cannot raise
-    # into the void and there is no "task exception was never retrieved"
-    # warning to worry about.
-    asyncio.create_task(_send(server, topic, title, message, priority, tags))
+    # Never awaited: this is intentional fire-and-forget, and `_send` catches
+    # everything so the task cannot raise into the void.
+    #
+    # But it *is* held, in `_pending`. asyncio keeps only a weak reference to
+    # a running task, so one suspended on the ntfy round-trip with no strong
+    # reference anywhere can be garbage-collected mid-flight — the push then
+    # silently never leaves the box, with no exception and no log line. This
+    # is the one notification path that reaches a phone with the app swiped
+    # away, so a silent drop is the whole feature failing exactly when it
+    # matters. `ruff` would normally flag this as RUF006, but the RUF rules
+    # aren't in the select list.
+    task = asyncio.create_task(_send(server, topic, title, message, priority, tags))
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
 
 
 async def aclose() -> None:
-    """Closes the shared HTTP client, for a clean shutdown."""
+    """Closes the shared HTTP client, for a clean shutdown.
+
+    Drains any still-in-flight pushes first — closing the client out from
+    under them would abort an alert that was already on the wire. Bounded, so
+    an unreachable ntfy server delays shutdown by at most `_TIMEOUT`.
+    """
+    if _pending:
+        await asyncio.wait(set(_pending), timeout=_TIMEOUT)
     await _client.aclose()

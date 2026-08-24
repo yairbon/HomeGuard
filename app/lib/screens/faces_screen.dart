@@ -39,8 +39,10 @@ class FacesScreen extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
             child: Text(
-              'Faces on this list are recognized as residents. A face that '
-              "isn't listed triggers an alert while the system is armed.",
+              'Adding a face captures the current camera frame as its '
+              'reference photo, so point the camera at the person first. '
+              "A face that isn't listed triggers an alert while the system "
+              'is armed.',
               style: TextStyle(color: AppColors.textMuted, fontSize: 13),
             ),
           ),
@@ -75,6 +77,23 @@ class FacesScreen extends StatelessWidget {
     final controller = TextEditingController();
     final alarmService = context.read<AlarmService>();
 
+    // Disposed once the dialog is gone. It was leaked before — a fresh
+    // TextEditingController (and the focus/selection listeners a TextField
+    // attaches to it) per dialog, kept alive for as long as the app ran.
+    try {
+      await _askForFaceName(context, controller, alarmService);
+    } finally {
+      controller.dispose();
+    }
+  }
+
+  /// Shows the name dialog and adds the resulting face, if any. Split out of
+  /// [_showAddFaceDialog] purely so the controller's disposal can wrap it.
+  Future<void> _askForFaceName(
+    BuildContext context,
+    TextEditingController controller,
+    AlarmService alarmService,
+  ) async {
     final name = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -103,8 +122,33 @@ class FacesScreen extends StatelessWidget {
     // value), and possibly an empty string if "Add" was tapped with a blank
     // field (the Add button pops unconditionally) — both cases are treated
     // as "don't add anything".
-    if (name != null && name.isNotEmpty) {
-      await alarmService.addFace(name);
+    if (name == null || name.isEmpty) return;
+
+    final outcome = await alarmService.enrollFace(name);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(_enrolmentMessage(outcome, name))),
+    );
+  }
+
+  /// What to tell the user about an enrolment attempt.
+  ///
+  /// Four outcomes rather than "added / not added", because three of them
+  /// need a different next action: point the camera at someone, retry the
+  /// photo, or check the connection. The one this screen used to have —
+  /// silent success — was the worst of them, since it also covered the case
+  /// where the face could never be recognised.
+  static String _enrolmentMessage(EnrollFaceOutcome outcome, String name) {
+    switch (outcome) {
+      case EnrollFaceOutcome.enrolled:
+        return '$name enrolled — the camera can now recognise them';
+      case EnrollFaceOutcome.noFrame:
+        return 'No camera frame available. Check the camera is online, then try again.';
+      case EnrollFaceOutcome.noFaceInFrame:
+        return "Added $name, but no face was visible in the frame — "
+            'stand in front of the camera and add a photo to finish.';
+      case EnrollFaceOutcome.failed:
+        return "Couldn't add $name — the backend didn't accept it.";
     }
   }
 }
@@ -133,7 +177,7 @@ class _FaceTile extends StatelessWidget {
               backgroundColor: AppColors.system.withValues(alpha: 0.15),
               child: Text(
                 initial,
-                style: AppTheme.monoStyle(fontSize: 16, color: AppColors.system),
+                style: AppTheme.monoAvatar.copyWith(color: AppColors.system),
               ),
             ),
             const SizedBox(width: 14),
@@ -145,7 +189,7 @@ class _FaceTile extends StatelessWidget {
                   const SizedBox(height: 2),
                   Text(
                     'APPROVED',
-                    style: AppTheme.monoStyle(fontSize: 10, color: AppColors.safe, letterSpacing: 1),
+                    style: AppTheme.monoBadge.copyWith(color: AppColors.safe),
                   ),
                 ],
               ),

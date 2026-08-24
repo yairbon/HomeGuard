@@ -1,6 +1,7 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -78,12 +79,7 @@ class CameraScreen extends StatelessWidget {
           const SizedBox(height: 24),
           Text(
             'RECENT IDENTIFICATIONS',
-            style: AppTheme.displayStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              color: AppColors.textMuted,
-              letterSpacing: 1.5,
-            ),
+            style: AppTheme.displayEyebrow.copyWith(color: AppColors.textMuted),
           ),
           const SizedBox(height: 8),
           if (recentIds.isEmpty)
@@ -171,39 +167,99 @@ class _FeedPlaceholder extends StatefulWidget {
   State<_FeedPlaceholder> createState() => _FeedPlaceholderState();
 }
 
-class _FeedPlaceholderState extends State<_FeedPlaceholder> {
+class _FeedPlaceholderState extends State<_FeedPlaceholder> with WidgetsBindingObserver {
   MjpegStreamClient? _stream;
   StreamSubscription<Uint8List>? _frameSub;
 
-  // Only ever the single newest frame, never a queue: at 25-30fps a
-  // producer that outruns the decoder would grow a buffered list without
-  // bound, and a stale frame has no value in a live security feed anyway.
-  // Held in a ValueNotifier rather than State so a new frame repaints only
-  // the image itself, not the badge/caption/border around it — setState
-  // here would rebuild the whole card 30 times a second.
-  final _latestFrame = ValueNotifier<Uint8List?>(null);
+  // Decoded frames live in a ValueNotifier rather than State so a new frame
+  // repaints only the image itself, not the badge/caption/border around it —
+  // setState here would rebuild the whole card 30 times a second.
+  final _decoder = MjpegImageDecoder();
+
+  /// Retries [_start] while the tab is visible but there is still no stream
+  /// URL to connect to. Without it, a feed that found `cameraStreamUrl` null
+  /// once stayed dead for the rest of the session.
+  Timer? _retryTimer;
+
+  /// Visibility of the tab this widget sits in, from the [TickerMode] that
+  /// `MainShell` wraps each [IndexedStack] child in.
+  ValueListenable<TickerModeData>? _tabVisibility;
+
+  bool _appResumed = true;
 
   @override
   void initState() {
     super.initState();
-    _connect();
+    WidgetsBinding.instance.addObserver(this);
+    // getValuesNotifier deliberately establishes no dependency, so this is
+    // safe in initState and won't re-fire didChangeDependencies. This widget
+    // never moves in the tree, so subscribing once here is enough.
+    _tabVisibility = TickerMode.getValuesNotifier(context)..addListener(_syncStreaming);
+    _syncStreaming();
   }
 
-  void _connect() {
+  /// The stream is only worth having open while someone can actually see it.
+  ///
+  /// `MainShell`'s IndexedStack mounts all five tabs at login, so this used to
+  /// connect the moment the user signed in and keep decoding video for the
+  /// whole session on tabs where not a single frame was ever painted. Over
+  /// Tailscale on cellular that is a continuous video download nobody
+  /// watches. Backgrounding the app had the same problem.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appResumed = state == AppLifecycleState.resumed;
+    _syncStreaming();
+  }
+
+  bool get _shouldStream => _appResumed && (_tabVisibility?.value.enabled ?? true);
+
+  void _syncStreaming() {
+    if (_shouldStream) {
+      _start();
+    } else {
+      _stop();
+    }
+  }
+
+  void _start() {
+    if (!mounted || _stream != null) return;
     final backend = context.read<BackendService>();
     final url = backend.cameraStreamUrl;
-    if (url == null) return;
+    if (url == null) {
+      // Null means "no way to authenticate a request yet" — e.g. the token
+      // hasn't landed. Poll for it rather than giving up; same 3s cadence as
+      // every other reconnect in the app.
+      _retryTimer ??= Timer.periodic(const Duration(seconds: 3), (_) {
+        if (_shouldStream) _start();
+      });
+      return;
+    }
+    _retryTimer?.cancel();
+    _retryTimer = null;
     final stream = MjpegStreamClient(streamUrl: url, headers: backend.cameraFrameHeaders);
     _stream = stream;
-    _frameSub = stream.frames.listen((frame) => _latestFrame.value = frame);
+    _frameSub = stream.frames.listen(_decoder.submit);
     stream.connect();
+  }
+
+  /// Closes the connection but keeps the last decoded frame, so returning to
+  /// the tab shows the last thing the camera saw instead of a black box while
+  /// the first new frame arrives.
+  void _stop() {
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _frameSub?.cancel();
+    _frameSub = null;
+    _stream?.dispose();
+    _stream = null;
   }
 
   @override
   void dispose() {
-    _frameSub?.cancel();
-    _stream?.dispose();
-    _latestFrame.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _tabVisibility?.removeListener(_syncStreaming);
+    _stop();
+    _decoder.dispose();
     super.dispose();
   }
 
@@ -223,17 +279,16 @@ class _FeedPlaceholderState extends State<_FeedPlaceholder> {
             fit: StackFit.expand,
             children: [
               RepaintBoundary(
-                child: ValueListenableBuilder<Uint8List?>(
-                  valueListenable: _latestFrame,
+                child: ValueListenableBuilder<ui.Image?>(
+                  valueListenable: _decoder.image,
                   builder: (context, frame, _) {
                     if (frame == null) return _cameraIcon();
-                    return Image.memory(
-                      frame,
-                      fit: BoxFit.cover,
-                      // Holds the previous frame while the next one decodes,
-                      // instead of flashing empty between every frame.
-                      gaplessPlayback: true,
-                    );
+                    // RawImage, not Image.memory: the frames are already
+                    // decoded (see MjpegImageDecoder for why they have to
+                    // be), and this notifier only ever holds a fully decoded
+                    // one, so there is no gap to paper over with
+                    // gaplessPlayback either.
+                    return RawImage(image: frame, fit: BoxFit.cover);
                   },
                 ),
               ),
@@ -254,7 +309,7 @@ class _FeedPlaceholderState extends State<_FeedPlaceholder> {
                   widget.isOnline
                       ? 'ESP32-CAM · front entrance'
                       : 'ESP32-CAM · waiting for connection',
-                  style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+                  style: AppTheme.monoDetail.copyWith(color: AppColors.textMuted),
                 ),
               ),
             ],
@@ -301,7 +356,7 @@ class _Badge extends StatelessWidget {
             ),
             const SizedBox(width: 5),
           ],
-          Text(text, style: AppTheme.monoStyle(fontSize: 10, color: color, letterSpacing: 1)),
+          Text(text, style: AppTheme.monoBadge.copyWith(color: color)),
         ],
       ),
     );
@@ -350,7 +405,7 @@ class _StatusCard extends StatelessWidget {
                     Text(label, style: TextStyle(fontSize: 11, color: AppColors.textMuted)),
                     Text(
                       value,
-                      style: AppTheme.monoStyle(fontSize: 12, color: color, letterSpacing: 0.5),
+                      style: AppTheme.monoValue.copyWith(color: color),
                     ),
                   ],
                 ),

@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+// For FilteringTextInputFormatter — the keypad PIN fields accept digits only.
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../services/auth_service.dart';
@@ -9,13 +11,19 @@ import '../widgets/homeguard_icons.dart';
 
 /// Account and system settings screen.
 ///
-/// Covers four independent areas: a night-mode toggle, emergency-contact
-/// details plus the police-call response delay, a change-password form,
-/// and the backend URL. The night-mode switch and emergency-contact
-/// fields persist to [BackendService] as soon as they change; the password
-/// form is only submitted when the user taps its button (see
-/// [_submitPassword]). The backend URL persists to local device storage
-/// via [BackendConfig] instead — see [_saveBackendUrl].
+/// Covers five independent areas: a night-mode toggle, emergency-contact
+/// details plus the police-call response delay, a change-password form, the
+/// physical keypad's PIN, and the backend URL. The night-mode switch and
+/// emergency-contact fields persist to [BackendService] as soon as they
+/// change; the password and PIN forms are only submitted when the user taps
+/// their button (see [_submitPassword], [_submitKeypadPin]). The backend URL
+/// persists to local device storage via [BackendConfig] instead — see
+/// [_saveBackendUrl].
+///
+/// The two credential forms are unrelated despite sitting next to each
+/// other: [_submitPassword] changes how you sign in to *this app*, while
+/// [_submitKeypadPin] changes the code typed on the *hardware* keypad by the
+/// door. Only the second one leaves the backend.
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -32,6 +40,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _backendUrlController = TextEditingController();
   final _ntfyServerController = TextEditingController();
   final _ntfyTopicController = TextEditingController();
+  final _pinFormKey = GlobalKey<FormState>();
+  final _pinController = TextEditingController();
+  final _pinConfirmController = TextEditingController();
+
+  bool _isSubmittingPin = false;
+  String? _pinError;
+  String? _pinSuccess;
+  // Set when the PIN was saved on the backend but the door controller didn't
+  // answer. Kept apart from _pinSuccess because it is neither a success nor a
+  // failure: the change is recorded, and the keypad is still on the old PIN.
+  String? _pinWarning;
 
   bool _isSavingNtfy = false;
   String? _ntfyMessage;
@@ -41,11 +60,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _success;
 
   bool _nightMode = false;
-  double _policeCallDelay = 60;
+  int _nightModeArmHour = 23;
+  int _nightModeDisarmHour = 7;
+
+  /// The escalation delay, as a notifier rather than plain state.
+  ///
+  /// A [Slider]'s `onChanged` fires once per pointer sample. Calling
+  /// `setState` from there rebuilt all five section cards and seven text
+  /// fields, dozens of times per drag, to move one integer inside a single
+  /// [Text]. Only that [Text] and the slider itself listen now.
+  final _policeCallDelay = ValueNotifier<double>(60);
+
   // Stays false until _loadSettings() has fetched the real values from the
   // backend, so the body shows a spinner instead of briefly rendering
   // controls pre-populated with the hardcoded defaults above.
   bool _settingsLoaded = false;
+
+  // Set when the load failed outright (backend unreachable or session
+  // rejected). Distinct from "still loading": the screen offers a retry
+  // instead of spinning forever.
+  bool _settingsFailed = false;
 
   // True right after the backend-URL save button is tapped, until the next
   // build; shows a one-off "restart to apply" hint rather than a permanent
@@ -120,33 +154,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
   }
 
-  /// Fetches night mode, emergency number, and police-call delay from
-  /// [BackendService] and populates the corresponding state.
+  /// Fetches every backend-stored setting and populates the form.
   ///
-  /// The three requests are issued together via [Future.wait] rather than
-  /// awaited one at a time, so the loading spinner is shown for only as
-  /// long as the slowest request takes, not the sum of all three. The
-  /// `mounted` check guards the subsequent [setState] in case the user has
-  /// already navigated away from this screen by the time the requests
-  /// resolve.
+  /// One request, not four: this used to call four separate getters, each of
+  /// which fetched the whole of `/state` (event log included) to pull out one
+  /// field. More importantly, each of those getters swallowed transport
+  /// failures and fell back to its own default — so an unreachable backend
+  /// produced a screen that looked fully loaded, showing a blank emergency
+  /// number and a blank ntfy topic as if that were the real configuration.
+  /// One tap on save then wrote the blanks back, turning off the only alert
+  /// channel that works when the app is closed. A null result now means
+  /// exactly what it says, and the screen refuses to pretend otherwise.
+  ///
+  /// The `mounted` check guards the subsequent [setState] in case the user
+  /// has already navigated away by the time the request resolves.
   Future<void> _loadSettings() async {
-    final backend = context.read<BackendService>();
-    final results = await Future.wait([
-      backend.getNightMode(),
-      backend.getEmergencyNumber(),
-      backend.getPoliceCallDelaySeconds(),
-      backend.getNtfyConfig(),
-    ]);
+    final settings = await context.read<BackendService>().getSettings();
     if (!mounted) return;
-    final ntfy = results[3] as NtfyConfig;
     setState(() {
-      _nightMode = results[0] as bool;
-      _emergencyController.text = results[1] as String;
-      _policeCallDelay = (results[2] as int).toDouble();
-      _ntfyServerController.text = ntfy.server;
-      _ntfyTopicController.text = ntfy.topic;
+      if (settings == null) {
+        _settingsFailed = true;
+        return;
+      }
+      _nightMode = settings.nightMode;
+      _nightModeArmHour = settings.nightModeArmHour;
+      _nightModeDisarmHour = settings.nightModeDisarmHour;
+      _emergencyController.text = settings.emergencyNumber;
+      _policeCallDelay.value = settings.policeCallDelaySeconds.toDouble();
+      _ntfyServerController.text = settings.ntfy.server;
+      _ntfyTopicController.text = settings.ntfy.topic;
+      _settingsFailed = false;
       _settingsLoaded = true;
     });
+  }
+
+  /// Re-runs [_loadSettings] from the retry button, putting the screen back
+  /// into its loading state first.
+  void _retryLoadSettings() {
+    setState(() => _settingsFailed = false);
+    _loadSettings();
   }
 
   /// Disposes the four text controllers backing the password-change form
@@ -160,6 +206,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _backendUrlController.dispose();
     _ntfyServerController.dispose();
     _ntfyTopicController.dispose();
+    _pinController.dispose();
+    _pinConfirmController.dispose();
+    _policeCallDelay.dispose();
     super.dispose();
   }
 
@@ -183,6 +232,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final backend = context.read<BackendService>();
     final ok = await backend.changePassword(_oldController.text, _newController.text);
 
+    // Guard, like every other awaited handler on this screen: the user can
+    // navigate away mid-request, and setState on a disposed State throws.
+    if (!mounted) return;
     setState(() {
       _isSubmitting = false;
       if (ok) {
@@ -196,16 +248,77 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
   }
 
+  /// Formats a whole hour as a 24-hour clock label.
+  static String _hourLabel(int hour) => '${hour.toString().padLeft(2, '0')}:00';
+
+  /// Persists a new night-mode window. Optimistic like the night-mode switch
+  /// itself — the two controls belong to the same setting and should behave
+  /// the same way.
+  Future<void> _saveNightModeHours(int armHour, int disarmHour) async {
+    setState(() {
+      _nightModeArmHour = armHour;
+      _nightModeDisarmHour = disarmHour;
+    });
+    await context.read<BackendService>().setNightModeHours(armHour, disarmHour);
+  }
+
+  /// Validates and submits the keypad-PIN form.
+  ///
+  /// Reports three outcomes rather than two, because "saved, but the board
+  /// didn't answer" is a genuinely different situation from either success
+  /// or failure: the change is recorded and will be re-sent, but until the
+  /// door controller takes it, **the keypad still opens on the old PIN**.
+  /// Telling the user that plainly is the whole point — an alarm panel that
+  /// says "PIN changed" when the hardware disagrees is worse than one that
+  /// says nothing.
+  Future<void> _submitKeypadPin() async {
+    if (!(_pinFormKey.currentState?.validate() ?? false)) return;
+
+    setState(() {
+      _isSubmittingPin = true;
+      _pinError = null;
+      _pinSuccess = null;
+      _pinWarning = null;
+    });
+
+    final backend = context.read<BackendService>();
+    final result = await backend.setKeypadPin(_pinController.text);
+
+    if (!mounted) return;
+    setState(() {
+      _isSubmittingPin = false;
+      if (!result.reachable) {
+        _pinError = "Couldn't reach the backend — check the URL below";
+      } else if (!result.ok) {
+        _pinError = 'PIN must be 4-8 digits';
+      } else {
+        _pinController.clear();
+        _pinConfirmController.clear();
+        if (result.hardware) {
+          _pinSuccess = result.secretsUpdated
+              ? 'Keypad PIN updated, and secrets.h synced for the next flash'
+              : 'Keypad PIN updated on the keypad';
+        } else {
+          _pinWarning = 'Saved, but the door controller did not answer — '
+              'the keypad still uses the old PIN. It will be sent again '
+              'when the board is back online.';
+        }
+      }
+    });
+  }
+
   /// Builds the settings screen.
   ///
-  /// Shows a centered spinner until [_settingsLoaded] is true (see
-  /// [_loadSettings]), then renders the night-mode switch, emergency
-  /// contact section, change-password form, and backend-URL section, each
-  /// inside its own [_SectionCard]. The backend-URL section doesn't wait
-  /// on [_settingsLoaded] conceptually (it loads independently in
-  /// [initState]) but is still gated behind the same spinner for a
-  /// simpler single-loading-state screen rather than sections popping in
-  /// at different times.
+  /// Three body states, not two: a spinner while loading, a retry prompt if
+  /// the load failed, and the form once real values are in hand (see
+  /// [_loadSettings] for why a failure must not fall through to the form).
+  /// The sections are the night-mode switch, push notifications, emergency
+  /// contact, change-password form, keypad PIN, and backend URL, each inside
+  /// its own [_SectionCard]. The backend-URL section doesn't wait on
+  /// [_settingsLoaded] conceptually (it loads independently in [initState])
+  /// but is still gated behind the same spinner for a simpler
+  /// single-loading-state screen rather than sections popping in at
+  /// different times.
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -219,7 +332,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ],
       ),
-      body: !_settingsLoaded
+      body: _settingsFailed
+          ? _SettingsLoadFailed(onRetry: _retryLoadSettings)
+          : !_settingsLoaded
           ? const Center(child: CircularProgressIndicator())
           : SingleChildScrollView(
               padding: const EdgeInsets.all(20),
@@ -241,12 +356,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       },
                       title: const Text('Night mode', style: TextStyle(color: AppColors.textPrimary)),
                       subtitle: Text(
-                        'Automatically arm the system overnight',
+                        'Arms automatically at ${_hourLabel(_nightModeArmHour)}, '
+                        'disarms at ${_hourLabel(_nightModeDisarmHour)}',
                         style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                       ),
                       secondary: const HomeGuardIcon(HGIcon.nightMode, color: AppColors.system),
                     ),
                   ),
+                  if (_nightMode) ...[
+                    const SizedBox(height: 12),
+                    _SectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Night-mode window',
+                            style: TextStyle(color: AppColors.textPrimary),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Never overrides a live alarm, and never disarms one — '
+                            'it only arms from disarmed and disarms from armed.',
+                            style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: _HourPicker(
+                                  label: 'Arms at',
+                                  hour: _nightModeArmHour,
+                                  onChanged: (h) => _saveNightModeHours(h, _nightModeDisarmHour),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: _HourPicker(
+                                  label: 'Disarms at',
+                                  hour: _nightModeDisarmHour,
+                                  onChanged: (h) => _saveNightModeHours(_nightModeArmHour, h),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 20),
                   _SectionCard(
                     child: Column(
@@ -369,25 +525,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ],
                         ),
                         const SizedBox(height: 18),
-                        Text(
-                          'Escalate if not cleared within: ${_policeCallDelay.round()}s',
-                          style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                        ),
-                        Slider(
-                          value: _policeCallDelay,
-                          min: 15,
-                          max: 180,
-                          divisions: 33,
-                          activeColor: AppColors.system,
-                          label: '${_policeCallDelay.round()}s',
-                          // Update local state on every drag frame for a smooth
-                          // slider, but only write to the backend once the user
-                          // releases it (onChangeEnd) — persisting on every
-                          // onChanged tick would fire a request per pixel of drag.
-                          onChanged: (value) => setState(() => _policeCallDelay = value),
-                          onChangeEnd: (value) => context
-                              .read<BackendService>()
-                              .setPoliceCallDelaySeconds(value.round()),
+                        // Scoped to the label + slider so a drag doesn't
+                        // rebuild the rest of the screen — see the comment on
+                        // _policeCallDelay.
+                        ValueListenableBuilder<double>(
+                          valueListenable: _policeCallDelay,
+                          builder: (context, delay, _) => Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Escalate if not cleared within: ${delay.round()}s',
+                                style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                              ),
+                              Slider(
+                                value: delay,
+                                min: 15,
+                                max: 180,
+                                divisions: 33,
+                                activeColor: AppColors.system,
+                                label: '${delay.round()}s',
+                                // Update local state on every drag frame for a
+                                // smooth slider, but only write to the backend
+                                // once the user releases it (onChangeEnd) —
+                                // persisting on every onChanged tick would fire
+                                // a request per pixel of drag.
+                                onChanged: (value) => _policeCallDelay.value = value,
+                                onChangeEnd: (value) => context
+                                    .read<BackendService>()
+                                    .setPoliceCallDelaySeconds(value.round()),
+                              ),
+                            ],
+                          ),
                         ),
                       ],
                     ),
@@ -457,6 +625,92 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   const SizedBox(height: 20),
                   _SectionCard(
+                    child: Form(
+                      key: _pinFormKey,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
+                              const SizedBox(width: 10),
+                              const Text('Keypad PIN', style: TextStyle(color: AppColors.textPrimary)),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          const Text(
+                            'The code typed on the physical keypad to disarm. '
+                            'Sent to the door controller, which stores it and '
+                            'keeps it across reboots.',
+                            style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                          ),
+                          const SizedBox(height: 16),
+                          TextFormField(
+                            controller: _pinController,
+                            obscureText: true,
+                            keyboardType: TextInputType.number,
+                            // Digits only: the keypad's other two keys are '*'
+                            // (arm) and '#' (submit), so a PIN containing
+                            // anything else could never be typed on it.
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'New keypad PIN',
+                              counterText: '',
+                            ),
+                            validator: (v) => (v == null || v.length < 4)
+                                ? 'At least 4 digits'
+                                : null,
+                          ),
+                          const SizedBox(height: 12),
+                          TextFormField(
+                            controller: _pinConfirmController,
+                            obscureText: true,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'Confirm keypad PIN',
+                              counterText: '',
+                            ),
+                            validator: (v) =>
+                                v != _pinController.text ? 'PINs do not match' : null,
+                          ),
+                          if (_pinError != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_pinError!, style: const TextStyle(color: AppColors.alarm)),
+                          ],
+                          if (_pinWarning != null) ...[
+                            const SizedBox(height: 12),
+                            Text(
+                              _pinWarning!,
+                              style: const TextStyle(color: AppColors.transitional),
+                            ),
+                          ],
+                          if (_pinSuccess != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_pinSuccess!, style: const TextStyle(color: AppColors.safe)),
+                          ],
+                          const SizedBox(height: 20),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton(
+                              onPressed: _isSubmittingPin ? null : _submitKeypadPin,
+                              child: _isSubmittingPin
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Text('UPDATE KEYPAD PIN'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  _SectionCard(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -515,8 +769,86 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 }
 
+/// Shown in place of the settings form when the backend couldn't be reached.
+///
+/// The alternative — the one this replaced — was rendering the form anyway,
+/// populated entirely from the client-side defaults each getter fell back to.
+/// That is a uniquely bad failure mode for this particular screen: the
+/// defaults are an empty emergency number and an empty ntfy topic, and an
+/// empty topic *means* "push notifications off". Saving what appeared to be
+/// the current settings would have silently disabled the only alerts that
+/// arrive with the app closed.
+class _SettingsLoadFailed extends StatelessWidget {
+  const _SettingsLoadFailed({required this.onRetry});
+
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const HomeGuardIcon(HGIcon.info, size: 28, color: AppColors.transitional),
+            const SizedBox(height: 14),
+            Text(
+              "Couldn't load settings",
+              style: AppTheme.displayBanner.copyWith(color: AppColors.transitional),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'The backend did not answer. Nothing is shown rather than '
+              'showing defaults you might save over the real settings.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: AppColors.textMuted, fontSize: 13),
+            ),
+            const SizedBox(height: 20),
+            OutlinedButton(onPressed: onRetry, child: const Text('RETRY')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Rounded, padded surface used to visually group each settings section
 /// (night mode, emergency contact, change password) on the screen.
+/// A 0-23 hour dropdown. Whole hours only, matching the backend's scheduler,
+/// which evaluates on the hour boundary — offering minutes would imply a
+/// precision `_night_mode_tick` doesn't have.
+class _HourPicker extends StatelessWidget {
+  const _HourPicker({required this.label, required this.hour, required this.onChanged});
+
+  final String label;
+  final int hour;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return InputDecorator(
+      decoration: InputDecoration(labelText: label),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<int>(
+          value: hour,
+          isDense: true,
+          isExpanded: true,
+          dropdownColor: AppColors.surfaceRaised,
+          style: AppTheme.monoValue.copyWith(color: AppColors.textPrimary),
+          items: [
+            for (var h = 0; h < 24; h++)
+              DropdownMenuItem(value: h, child: Text(_SettingsScreenState._hourLabel(h))),
+          ],
+          onChanged: (value) {
+            if (value != null) onChanged(value);
+          },
+        ),
+      ),
+    );
+  }
+}
+
 class _SectionCard extends StatelessWidget {
   const _SectionCard({required this.child});
 

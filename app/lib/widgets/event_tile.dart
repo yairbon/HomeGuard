@@ -137,7 +137,7 @@ class EventTileCard extends StatelessWidget {
                   const SizedBox(height: 2),
                   Text(
                     '${relativeTime(event.timestamp)} · ${clockTime(event.timestamp)}',
-                    style: AppTheme.monoStyle(fontSize: 11, color: AppColors.textMuted),
+                    style: AppTheme.monoDetail.copyWith(color: AppColors.textMuted),
                   ),
                 ],
               ),

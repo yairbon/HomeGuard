@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 /// Parses a raw byte stream in `multipart/x-mixed-replace` format (what an
@@ -166,5 +167,102 @@ class MjpegStreamClient {
     _sub?.cancel();
     _client?.close();
     _frames.close();
+  }
+}
+
+/// Turns the JPEG frames coming out of [MjpegStreamClient] into decoded
+/// [ui.Image]s, exposed as a [ValueListenable] the camera feed can paint
+/// with [RawImage].
+///
+/// This exists because the obvious way to show these frames — handing each
+/// `Uint8List` to `Image.memory` — is a memory trap at video rates.
+/// `MemoryImage`'s cache key is the byte list itself, `Uint8List` has no value
+/// equality, and [MjpegFrameParser] necessarily produces a fresh list per
+/// frame; so every single frame became a *distinct* entry in the global
+/// `ImageCache`, which filled to its 100 MiB default in a few seconds of
+/// watching and then thrashed, evicting and re-decoding for the rest of the
+/// session. None of those entries could ever be hit again either — the same
+/// frame never arrives twice.
+///
+/// Decoding by hand skips the cache entirely, and makes the lifetime of each
+/// decoded image explicit, which is the part `Image.memory` gave no way to
+/// control.
+class MjpegImageDecoder {
+  /// The most recently decoded frame, or null before the first one arrives.
+  /// Never goes back to null on a decode failure: the last good frame stays
+  /// up, which is what a viewer wants from a live feed that hiccuped.
+  final ValueNotifier<ui.Image?> image = ValueNotifier<ui.Image?>(null);
+
+  /// Newest frame not yet decoded. Deliberately a single slot rather than a
+  /// queue: decoding is slower than a 30fps producer on a slow phone, and a
+  /// backlog of stale frames is worthless on a security camera — the point
+  /// is what the doorway looks like *now*.
+  Uint8List? _pending;
+  bool _draining = false;
+  bool _disposed = false;
+
+  /// Offers [jpeg] as the next frame to display, replacing any frame still
+  /// waiting to be decoded.
+  void submit(Uint8List jpeg) {
+    if (_disposed) return;
+    _pending = jpeg;
+    if (!_draining) unawaited(_drain());
+  }
+
+  Future<void> _drain() async {
+    _draining = true;
+    try {
+      while (!_disposed) {
+        final bytes = _pending;
+        if (bytes == null) break;
+        _pending = null;
+
+        final ui.Image decoded;
+        try {
+          // instantiateImageCodecFromBuffer takes ownership of the buffer and
+          // disposes it itself, including on failure — so there is
+          // deliberately no buffer.dispose() here.
+          final codec = await ui.instantiateImageCodecFromBuffer(
+            await ui.ImmutableBuffer.fromUint8List(bytes),
+          );
+          try {
+            decoded = (await codec.getNextFrame()).image;
+          } finally {
+            codec.dispose();
+          }
+        } catch (_) {
+          // A truncated or corrupt frame (a chunk lost mid-stream, say).
+          // Keep showing the last good one and move on to the next.
+          continue;
+        }
+
+        if (_disposed) {
+          decoded.dispose();
+          return;
+        }
+
+        final previous = image.value;
+        // Publish first, dispose second, and never in the same synchronous
+        // step: the RenderImage still holds `previous` until the rebuild this
+        // assignment schedules actually runs, and painting an image that has
+        // already been disposed throws. The microtask lands after this turn
+        // and before the next frame is built, which is exactly the window
+        // where nothing can be painting either image.
+        image.value = decoded;
+        if (previous != null) scheduleMicrotask(previous.dispose);
+      }
+    } finally {
+      _draining = false;
+    }
+  }
+
+  /// Releases the currently displayed frame and the notifier. Any decode
+  /// still in flight discards its result rather than publishing to a
+  /// disposed notifier.
+  void dispose() {
+    _disposed = true;
+    _pending = null;
+    image.value?.dispose();
+    image.dispose();
   }
 }

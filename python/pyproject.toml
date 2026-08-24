@@ -29,4 +29,26 @@ asyncio_mode = "auto"
 # Each test gets a fresh event loop; the state singleton is reset per test by
 # the `state` fixture in conftest.py.
 asyncio_default_fixture_loop_scope = "function"
-filterwarnings = ["error::DeprecationWarning"]
+# Deprecations are errors, so an upstream heads-up lands as a red test rather
+# than a line nobody reads.
+#
+# `error::UserWarning` is here because filters match by class and Starlette's
+# StarletteDeprecationWarning deliberately subclasses UserWarning, not
+# DeprecationWarning — so the first line alone silently let a live deprecation
+# through. The one that was slipping past: FastAPI's TestClient on httpx,
+# used by the test that proves an unauthenticated WebSocket is refused before
+# accept(). Left as a warning rather than an error for now, with a dated note,
+# because the fix is a migration and not a one-liner.
+filterwarnings = [
+    "error::DeprecationWarning",
+    "error::UserWarning",
+    # 2026-08: starlette.testclient warns that httpx support is deprecated in
+    # favour of httpx2. requirements.txt pins httpx~=0.28.1 deliberately, and
+    # the two tests that hit this are the ones proving an unauthenticated
+    # WebSocket is refused before accept() — worth keeping green while the
+    # migration waits. Named by class rather than by module: the module field
+    # matches where a warning is *issued from*, which for a stacklevel'd
+    # warning is not the file it is written in. Drop this line when those
+    # tests move off TestClient, or when httpx2 lands.
+    "default::starlette.exceptions.StarletteDeprecationWarning",
+]

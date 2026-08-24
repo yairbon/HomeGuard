@@ -8,11 +8,12 @@ it auto-armed.
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 
 import pytest
 
-from backend.models import AlarmState, ArmMode, SensorType
+from backend.models import AlarmState, ArmMode, EventCategory, SensorType
 
 from .test_alarm_flow import arm_now
 
@@ -149,6 +150,82 @@ async def test_disarming_clears_the_entry_countdown(state):
 
     assert state.alarm_state == AlarmState.disarmed
     assert state.entry_delay_seconds_remaining == 0
+
+
+@pytest.fixture
+def instant_grace(monkeypatch):
+    """Shrinks the watchdog's grace period so its timer can be awaited
+    directly instead of waited out. The window itself is passed per call
+    (`begin_entry_delay(0)`), so between the two there is nothing left to
+    sleep through."""
+    from backend import state as state_module
+
+    monkeypatch.setattr(state_module, "ENTRY_DELAY_GRACE", timedelta(0))
+
+
+async def test_the_entry_delay_alarms_even_if_the_controller_goes_silent(
+    state, instant_grace
+):
+    """The hole this closes is a total, silent bypass of the alarm.
+
+    The entry countdown belongs to the door controller, and escalation used to
+    depend entirely on that one board living long enough to report the
+    outcome. It is inside the house the intruder just walked into: cut its
+    power (or its WiFi) between opening the door and the countdown expiring
+    and the system sat in `entryDelay` forever — never `triggered`, no siren
+    command to the other boards, no push, and an app showing a countdown that
+    never reached zero. Nobody is told anything, ever.
+    """
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(0)
+    assert state.alarm_state == AlarmState.entryDelay
+
+    # The controller says nothing from here on — this is the board being dead.
+    await asyncio.wait_for(state._entry_delay_task, timeout=5)
+
+    assert state.alarm_state == AlarmState.triggered
+    assert any("entry delay expired" in e.message for e in state.events)
+
+
+async def test_disarming_in_time_cancels_the_entry_delay_watchdog(state, instant_grace):
+    """Typing the PIN is the whole point of the window. The fallback must not
+    alarm a house that was disarmed in time."""
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(0)
+    await state.disarm()
+
+    assert state._entry_delay_task is None
+    await asyncio.sleep(0.05)  # more than enough for a cancelled timer to misfire
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_a_controller_disarm_cancels_the_entry_delay_watchdog(state, instant_grace):
+    """And the same via the path that actually runs in the field: the keypad
+    belongs to the controller, so a real disarm arrives as a state report,
+    not as a call to `disarm()`."""
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(0)
+    await state.report_state_from_esp32(armed=False)
+
+    assert state._entry_delay_task is None
+    assert state._entry_delay_ends_at is None
+    await asyncio.sleep(0.05)
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_the_watchdog_does_not_re_alarm_an_alarm_already_raised(state, instant_grace):
+    """When the controller *is* alive it reports the expiry itself, and the
+    watchdog wakes up a moment later into a system that is already
+    `triggered` — it must find that and stop, not log a second alert."""
+    await arm_now(state, ArmMode.away)
+    await state.begin_entry_delay(0)
+    await state.trigger_alert(SensorType.door, "not disarmed in time")
+    alerts = [e for e in state.events if e.category == EventCategory.alert]
+
+    await asyncio.wait_for(state._entry_delay_task, timeout=5)
+
+    assert state.alarm_state == AlarmState.triggered
+    assert [e for e in state.events if e.category == EventCategory.alert] == alerts
 
 
 async def test_entry_delay_route_requires_the_device_key(client):
@@ -313,6 +390,40 @@ async def test_disarming_in_time_cancels_the_escalation(state, sent):
     assert not any("NOT CLEARED" in c["title"] for c in sent)
 
 
+async def test_a_controller_disarm_also_cancels_the_escalation(state, sent):
+    """`disarm()` always cancelled the escalation; `report_state_from_esp32`
+    did not — and that is the path a real disarm takes, since the door
+    controller owns the keypad. So the ordinary case of someone coming home
+    and typing their PIN still sent the urgent "alarm still active, nobody
+    has dealt with it, call your emergency contact" push a minute later.
+    """
+    await state.set_ntfy("https://ntfy.example", "topic")
+    await state.set_police_call_delay(1)
+
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(SensorType.door, "break-in")
+    await state.report_state_from_esp32(armed=False)
+    assert state.alarm_state == AlarmState.disarmed
+
+    await asyncio.sleep(1.2)
+    assert not any("NOT CLEARED" in c["title"] for c in sent)
+
+
+async def test_a_negative_escalation_delay_is_clamped(state, sent):
+    """`asyncio.sleep()` returns immediately for a negative argument, so an
+    unclamped negative delay fired the "nobody has dealt with this alarm"
+    escalation in the same instant as the alarm — no window to disarm in at
+    all. Its sibling, set_night_mode_hours, clamped from the start.
+    """
+    from backend.state import MAX_POLICE_CALL_DELAY
+
+    await state.set_police_call_delay(-10)
+    assert state.police_call_delay_seconds == 0
+
+    await state.set_police_call_delay(999_999)
+    assert state.police_call_delay_seconds == MAX_POLICE_CALL_DELAY
+
+
 async def test_escalation_without_a_contact_still_notifies(state, sent):
     """No number configured is not a reason to stay silent about an alarm
     nobody has dealt with."""
@@ -328,3 +439,61 @@ async def test_escalation_without_a_contact_still_notifies(state, sent):
     escalations = [c for c in sent if "NOT CLEARED" in c["title"]]
     assert len(escalations) == 1
     assert "Call" not in escalations[0]["message"]
+
+
+async def test_a_lingering_face_is_logged_once_not_twice_a_second(state):
+    """The ESP32-CAM pushes two frames a second.
+
+    Someone simply standing in front of it used to produce two log lines and
+    two full-state broadcasts *per second*: the 200-entry log filled with
+    "Face recognized: X" in under two minutes — burying every arm, disarm and
+    alert in it — and every connected phone was sent the whole ~21 KB
+    snapshot each time, roughly 2.6 MB a minute, to be told the same thing
+    repeatedly.
+    """
+    for _ in range(20):
+        await state.log_face_recognized("Guy Bar")
+
+    entries = [e for e in state.events if "Face recognized: Guy Bar" in e.message]
+    assert len(entries) == 1, f"expected one entry for a continuous sighting, got {len(entries)}"
+
+
+async def test_each_person_is_rate_limited_separately(state):
+    """Two people in frame are two distinct facts, and both belong in the log."""
+    await state.log_face_recognized("Guy Bar")
+    await state.log_face_recognized("Yair Bonfil")
+    await state.log_face_recognized("Guy Bar")
+
+    assert len([e for e in state.events if "Face recognized" in e.message]) == 2
+
+
+async def test_a_later_arrival_is_logged_again(state):
+    """The limit debounces one continuous sighting; it must not swallow a
+    genuinely separate arrival."""
+    from datetime import datetime, timedelta
+
+    from backend.state import FACE_LOG_COOLDOWN
+
+    await state.log_face_recognized("Guy Bar")
+    state._face_last_logged["Guy Bar"] = (
+        datetime.now() - FACE_LOG_COOLDOWN - timedelta(seconds=1)
+    )
+    await state.log_face_recognized("Guy Bar")
+
+    assert len([e for e in state.events if "Face recognized: Guy Bar" in e.message]) == 2
+
+
+async def test_a_face_disarm_is_always_logged(state):
+    """Rate-limiting must never hide the alarm being switched off. A disarm
+    is logged even if that same face was recognised a moment earlier."""
+    from backend.models import AlarmState, ArmMode
+
+    await state.set_face_disarm_enabled(True)
+    await state.log_face_recognized("Guy Bar")  # primes the cooldown
+
+    await arm_now(state, ArmMode.away)
+    disarmed = await state.log_face_recognized("Guy Bar")
+
+    assert disarmed is True
+    assert state.alarm_state == AlarmState.disarmed
+    assert any("Disarmed by Face ID: Guy Bar" in e.message for e in state.events)

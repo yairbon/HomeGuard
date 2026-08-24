@@ -121,7 +121,38 @@ class _AlarmStatusIndicatorState extends State<AlarmStatusIndicator>
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
+    );
+    _syncAnimation();
+  }
+
+  @override
+  void didUpdateWidget(AlarmStatusIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.state != widget.state) _syncAnimation();
+  }
+
+  /// Runs the pulse only in the states that actually use it, and stops it
+  /// everywhere else.
+  ///
+  /// It used to `repeat(reverse: true)` from [initState] and never stop. In
+  /// `disarmed` — the state the app sits in almost all the time, and the one
+  /// it's showing whenever someone opens it to check on a quiet house — the
+  /// builder computes `pulse = 0.0` and `tracePulse = null`, so every one of
+  /// those 60 ticks a second rebuilt an identical widget tree and scheduled
+  /// another frame, for a screen that was not changing at all.
+  void _syncAnimation() {
+    final shouldPulse = switch (widget.state) {
+      AlarmState.triggered || AlarmState.transitional || AlarmState.armed => true,
+      AlarmState.disarmed || AlarmState.entryDelay => false,
+    };
+    if (shouldPulse) {
+      if (!_controller.isAnimating) _controller.repeat(reverse: true);
+    } else if (_controller.isAnimating) {
+      _controller.stop();
+      // Park at 0 so the resting frame is the same one every time, rather
+      // than wherever the pulse happened to be when the state changed.
+      _controller.value = 0;
+    }
   }
 
   @override
@@ -179,35 +210,60 @@ class _AlarmStatusIndicatorState extends State<AlarmStatusIndicator>
     );
   }
 
-  /// Rebuilds on every animation tick. Layout is a centered [Stack]: an
-  /// optional glow bloom (triggered only — a steady-state glow on every
-  /// screen view was itself one of the "generic AI dashboard" tells), the
-  /// [_SchematicPainter] drawing the 3 traces and the center panel pad,
-  /// the 3 node icon overlays, and the countdown digit when arming.
+  /// Layout is a centered [Stack]: an optional glow bloom (triggered only — a
+  /// steady-state glow on every screen view was itself one of the "generic AI
+  /// dashboard" tells), the [_SchematicPainter] drawing the 3 traces and the
+  /// center panel pad, the 3 node icon overlays, and the countdown digit when
+  /// arming.
+  ///
+  /// Only the first two of those depend on the animation. The 3 sensor nodes,
+  /// the colours they're built from, and the countdown digit are functions of
+  /// the widget's fields alone, yet they sat inside the builder and were
+  /// rebuilt 60 times a second along with everything else — the countdown's
+  /// text style even re-resolved a Google font on every tick. They're built
+  /// once here and handed to [AnimatedBuilder] as its `child`, which is
+  /// exactly what that parameter is for and which the previous version
+  /// ignored.
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _controller,
-      builder: (context, _) {
-        final isTriggered = widget.state == AlarmState.triggered;
-        final pulse = isTriggered
-            ? _controller.value
-            : (widget.state == AlarmState.transitional ? _controller.value * 0.5 : 0.0);
-        final countdown = widget.armingSecondsRemaining;
-        final showCountdown =
-            widget.state == AlarmState.transitional && countdown != null && countdown > 0;
-        // A slow continuous breathe on the traces while armed — "the loop
-        // is live and being polled" — distinct from the triggered strobe.
-        final tracePulse = widget.state == AlarmState.armed ? _controller.value : null;
+    final nodeColors = {
+      for (final type in SensorType.values) type: _nodeColorFor(_sensorOf(type)),
+    };
+    final countdown = widget.armingSecondsRemaining;
+    final showCountdown =
+        widget.state == AlarmState.transitional && countdown != null && countdown > 0;
 
-        final nodeColors = {
-          for (final type in SensorType.values) type: _nodeColorFor(_sensorOf(type)),
-        };
+    final overlay = Stack(
+      alignment: Alignment.center,
+      children: [
+        for (final type in SensorType.values) _buildNode(type, nodeColors[type]!),
+        if (showCountdown)
+          Text(
+            '$countdown',
+            style: AppTheme.monoCountdown.copyWith(
+              fontSize: widget.size * 0.11,
+              color: _color,
+            ),
+          ),
+      ],
+    );
 
-        return SizedBox(
-          width: widget.size,
-          height: widget.size,
-          child: Stack(
+    return SizedBox(
+      width: widget.size,
+      height: widget.size,
+      child: AnimatedBuilder(
+        animation: _controller,
+        child: overlay,
+        builder: (context, child) {
+          final isTriggered = widget.state == AlarmState.triggered;
+          final pulse = isTriggered
+              ? _controller.value
+              : (widget.state == AlarmState.transitional ? _controller.value * 0.5 : 0.0);
+          // A slow continuous breathe on the traces while armed — "the loop
+          // is live and being polled" — distinct from the triggered strobe.
+          final tracePulse = widget.state == AlarmState.armed ? _controller.value : null;
+
+          return Stack(
             alignment: Alignment.center,
             children: [
               if (isTriggered)
@@ -233,20 +289,11 @@ class _AlarmStatusIndicatorState extends State<AlarmStatusIndicator>
                   tracePulse: tracePulse,
                 ),
               ),
-              for (final type in SensorType.values) _buildNode(type, nodeColors[type]!),
-              if (showCountdown)
-                Text(
-                  '$countdown',
-                  style: AppTheme.monoStyle(
-                    fontSize: widget.size * 0.11,
-                    fontWeight: FontWeight.w700,
-                    color: _color,
-                  ),
-                ),
+              child!,
             ],
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
   }
 }

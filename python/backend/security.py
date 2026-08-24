@@ -1,5 +1,5 @@
 """Authentication primitives: password hashing, app session tokens, and the
-shared device key the three ESP32 boards authenticate with.
+shared device key the four ESP32 boards authenticate with.
 
 Before this module existed, `/login` was decorative — it checked the password
 and returned `ok`, but nothing afterwards ever proved identity again, so
@@ -15,7 +15,7 @@ Two distinct credentials, because there are two distinct kinds of caller:
   boards send on every `/esp32/*` call. Boards can't do an interactive login
   (no UI, no way to store a rotating token across a power cycle), so they get
   a static credential instead. It is deliberately *not* the user's password:
-  it's burned into three sketches, so it must be independently rotatable.
+  it's burned into four sketches, so it must be independently rotatable.
 """
 
 from __future__ import annotations
@@ -97,7 +97,7 @@ class TokenStore:
     Deliberately not persisted across restarts: a backend restart invalidating
     every session is the safe direction to fail, and it's cheap to recover
     from (the app just logs in again). Contrast with the device key, which
-    *is* persisted, because re-flashing three boards is not cheap.
+    *is* persisted, because re-flashing four boards is not cheap.
     """
 
     def __init__(self) -> None:
@@ -168,7 +168,7 @@ def resolve_device_key(persisted: str | None) -> str:
        path, so the key can be managed alongside other deployment config.
     2. `persisted` — a key generated on an earlier run and saved to the state
        file. Reused so the value stays stable across restarts; a key that
-       changed on every boot would mean re-flashing three boards every time
+       changed on every boot would mean re-flashing four boards every time
        the backend restarted.
     3. A freshly generated key, logged loudly so it can be copied into the
        sketches' `secrets.h`.
@@ -185,7 +185,7 @@ def resolve_device_key(persisted: str | None) -> str:
     generated = secrets.token_urlsafe(24)
     logger.warning(
         "HOMEGUARD_DEVICE_KEY not set — generated one for this install: %s\n"
-        "    Put it in esp32/secrets.h as HOMEGUARD_DEVICE_KEY on all three boards.\n"
+        "    Put it in esp32/secrets.h as HOMEGUARD_DEVICE_KEY on all four boards.\n"
         "    It is saved to the state file, so it stays the same across restarts.",
         generated,
     )

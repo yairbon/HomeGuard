@@ -204,3 +204,52 @@ async def test_ntfy_settings_survive_a_restart(monkeypatch, tmp_path):
     importlib.reload(state_module)
     assert state_module.state.ntfy_topic == "persisted-topic"
     assert state_module.state.ntfy_server == "https://push.example"
+
+
+async def test_an_in_flight_push_is_held_by_a_strong_reference(state, monkeypatch):
+    """asyncio keeps only a *weak* reference to a running task.
+
+    `notify()` schedules and returns — correct, and locked by
+    `test_notify_never_blocks` above — but for a while nothing else held the
+    resulting task either, so one suspended on the ntfy round-trip could be
+    collected mid-flight. The push then never left the box: no exception, no
+    log line, nothing. That is the one notification path that reaches a phone
+    with the app swiped away, so a silent drop is the whole feature failing
+    at exactly the moment it exists for.
+
+    Asserting on the registry rather than trying to provoke a real collection
+    — `gc` timing is not something a test should depend on.
+    """
+    from backend import notifier
+
+    started = asyncio.Event()
+
+    async def slow_send(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(notifier, "_send", slow_send)
+
+    notifier.notify("https://ntfy.example", "topic", "title", "message")
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    assert notifier._pending, "an in-flight push must be referenced somewhere"
+
+    for task in list(notifier._pending):
+        task.cancel()
+
+
+async def test_a_finished_push_is_released(state, monkeypatch):
+    """The registry must not become a leak — entries remove themselves."""
+    from backend import notifier
+
+    async def instant_send(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(notifier, "_send", instant_send)
+
+    notifier.notify("https://ntfy.example", "topic", "title", "message")
+    await asyncio.sleep(0)  # let the task run to completion
+    await asyncio.sleep(0)  # and let the done-callback fire
+
+    assert not notifier._pending

@@ -1,6 +1,6 @@
 # HomeGuard Backend
 
-FastAPI backend that unifies the three ESP32 boards' communication and face
+FastAPI backend that unifies the four ESP32 boards' communication and face
 recognition, and serves the Flutter app.
 
 ## Setup
@@ -41,7 +41,13 @@ Nothing here is open. Two credentials, for two kinds of caller:
 | Flutter app | Session token from `/login` (12h) | `Authorization: Bearer <token>` |
 | ESP32 boards | Shared device key | `X-Device-Key` header, or `?key=` |
 
-`/health` is the only unauthenticated route. The WebSocket takes its token as
+`/health`, `/login` and FastAPI's own docs routes (`/docs`, `/redoc`,
+`/openapi.json`) are the unauthenticated surface — note that means the full
+API schema is public. Everything else requires a credential.
+`tests/test_auth.py` enumerates `app.routes` and fails if a new route is
+added without being covered, so this list cannot drift again.
+
+The WebSocket takes its token as
 `?token=` (the browser WebSocket API can't set headers) and is refused
 *before* `accept()`, so an unauthenticated client never receives a state
 frame.
@@ -63,10 +69,14 @@ keep each test on a fresh install).
 
 ## Board liveness
 
-Each board POSTs `/esp32/heartbeat?board=<name>` every 10 seconds. A board is
-reported offline after 30 seconds of silence, and `/state` carries a `boards`
-array with per-board status — the dashboard names the specific board that
-went quiet.
+Each *sensor* board POSTs `/esp32/heartbeat?board=<name>` every 10 seconds.
+A board is reported offline after 30 seconds of silence, and `/state` carries
+a `boards` array with per-board status — the dashboard names the specific
+board that went quiet.
+
+The ESP32-CAM deliberately sends no heartbeat and has no entry in
+`BOARD_NAMES`; its liveness is signalled by frames arriving at
+`/camera/recognize`.
 
 This replaced a single `esp32_online` boolean that latched: once any board had
 ever checked in, nothing ever set it back, so a board could lose power and the
@@ -174,7 +184,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 136 tests, ~50s
+.\venv\Scripts\python.exe -m pytest        # 222 tests, ~91s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 
@@ -224,8 +234,14 @@ success.
 
 ## Matching the Flutter side
 
-`backend/models.py` mirrors `app/lib/services/backend_service.dart`
-field-for-field. If you rename or add something on one side, mirror it on the
-other — a mismatch is a runtime crash in the app's JSON decoding, not a
-compile error. `test_state_shape_matches_the_flutter_client` pins the wire
-shape so the two can't drift silently.
+`backend/models.py` must stay in step with
+**`app/lib/services/http_backend_service.dart`** — that is where the JSON
+keys are actually decoded. The abstract `app/lib/services/backend_service.dart`
+holds the Dart-side *types* and contains no wire keys at all, so mirroring a
+field there and stopping is the mistake to avoid: it compiles, and then the
+app throws on the first state frame.
+
+If you rename or add something on one side, mirror it on the other — a
+mismatch is a runtime crash in the app's JSON decoding, not a compile error.
+`test_state_shape_matches_the_flutter_client` pins the top-level shape so the
+two can't drift silently.

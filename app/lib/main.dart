@@ -25,7 +25,12 @@ import 'theme/app_theme.dart';
 /// very first frame — no placeholder-then-reconnect flicker.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  NotificationService.init();
+  // Awaited, unlike before: init() creates the Android notification channel
+  // and requests the runtime permission, and dropping its Future meant the
+  // "set up before runApp" the doc above promises wasn't actually guaranteed
+  // — an alert firing during those first frames could reach a plugin that
+  // hadn't finished initializing.
+  await NotificationService.init();
   final backendUrl = await BackendConfig.load();
   runApp(HomeGuardApp(backendUrl: backendUrl));
 }
@@ -89,15 +94,9 @@ class HomeGuardApp extends StatelessWidget {
           create: (_) => backend ?? HttpBackendService(baseUrl: backendUrl),
           dispose: (_, backend) => backend.dispose(),
         ),
-        ChangeNotifierProvider<AuthService>(
-          create: (context) => AuthService(context.read<BackendService>()),
-          // Eager like AlarmService below, for consistency between the two
-          // top-level services. Unlike AlarmService, AuthService's
-          // constructor does no async/stream setup, so this isn't strictly
-          // required for correctness today — but it keeps both providers'
-          // lifecycles predictable if that ever changes.
-          lazy: false,
-        ),
+        // AlarmService is declared before AuthService (it used to be the
+        // other way round) so that AuthService can read it: a provider can
+        // only see the ones above it. See the onSignedIn argument below.
         ChangeNotifierProvider<AlarmService>(
           // Must be eager: AlarmService's constructor subscribes to the
           // backend's broadcast streams, which don't replay past events to
@@ -106,6 +105,22 @@ class HomeGuardApp extends StatelessWidget {
           // the very first login's initial sensor readings and "Logged in"
           // event had already been emitted into the void.
           create: (context) => AlarmService(context.read<BackendService>()),
+          lazy: false,
+        ),
+        ChangeNotifierProvider<AuthService>(
+          create: (context) => AuthService(
+            context.read<BackendService>(),
+            // Signing in successfully retires any outstanding "couldn't
+            // reach the backend" complaint from an earlier attempt, which
+            // would otherwise land as a SnackBar over the dashboard's first
+            // frame — see AuthService's constructor doc.
+            onSignedIn: context.read<AlarmService>().clearError,
+          ),
+          // Eager like AlarmService above, for consistency between the two
+          // top-level services. Unlike AlarmService, AuthService's
+          // constructor does no async/stream setup, so this isn't strictly
+          // required for correctness today — but it keeps both providers'
+          // lifecycles predictable if that ever changes.
           lazy: false,
         ),
       ],

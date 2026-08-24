@@ -64,7 +64,7 @@ class SensorStatusPanel extends StatelessWidget {
             ),
             Text(
               sensor.bypassed ? 'BYPASSED' : (sensor.ok ? 'OK' : 'BREACH'),
-              style: AppTheme.monoStyle(fontSize: 10, color: color, letterSpacing: 1),
+              style: AppTheme.monoBadge.copyWith(color: color),
             ),
           ],
         );

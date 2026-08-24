@@ -44,6 +44,13 @@ class AlarmService extends ChangeNotifier {
         _armingTimer?.cancel();
         _armingSecondsRemaining = 0;
       }
+      // Same discipline for the entry-delay ticker: it belongs to that state
+      // and must not keep counting once a disarm (or the alarm itself) has
+      // ended the window.
+      if (state != AlarmState.entryDelay) {
+        _entryDelayTimer?.cancel();
+        _entryDelaySecondsRemaining = 0;
+      }
       if (justTriggered) {
         NotificationService.showAlert(
           _events.isNotEmpty ? _events.first.message : 'Intrusion detected',
@@ -55,6 +62,11 @@ class AlarmService extends ChangeNotifier {
     });
     _logSub = _backend.eventLogStream.listen((events) {
       _events = events;
+      // Same reasoning as _offlineBoards: the camera tab filtered the whole
+      // log (up to 200 entries) on every single build to find the handful of
+      // face-ID rows it shows.
+      _faceIdEvents =
+          events.where((e) => e.category == EventCategory.faceId).toList(growable: false);
       notifyListeners();
     });
     _sensorSub = _backend.sensorStream.listen((sensors) {
@@ -65,8 +77,18 @@ class AlarmService extends ChangeNotifier {
       _isOnline = online;
       notifyListeners();
     });
+    // Whether *this app* can still hear the backend, as opposed to whether
+    // the backend can hear the boards. See BackendService.backendLinkStream.
+    _linkSub = _backend.backendLinkStream.listen((linked) {
+      _isBackendLinked = linked;
+      notifyListeners();
+    });
     _boardsSub = _backend.boardsStream.listen((boards) {
       _boards = boards;
+      // Derived once per update rather than per build: the dashboard reads
+      // this on every frame (and used to read it twice in the same build),
+      // while boards change a few times an hour at most.
+      _offlineBoards = boards.where((b) => !b.online).toList(growable: false);
       notifyListeners();
     });
     // Infrastructural failures (backend unreachable, session expired) are
@@ -93,12 +115,41 @@ class AlarmService extends ChangeNotifier {
       _faceDisarmEnabled = enabled;
       notifyListeners();
     });
-    // Unlike the exit-delay countdown, this is not ticked locally: the door
-    // controller owns the real timer and the backend re-broadcasts what's
-    // left, so the number shown always comes from the authority rather than
-    // a second clock that could drift away from it.
+    // Seeded by the backend, ticked locally in between.
+    //
+    // The comment that used to sit here said the backend "re-broadcasts
+    // what's left", so no local clock was needed. It doesn't:
+    // `begin_entry_delay` broadcasts exactly once, and the only periodic loop
+    // (`_monitor_boards`) pushes solely when a board's liveness *changes*. So
+    // the app received "20" and then nothing — the number froze at 20 until
+    // the alarm fired. That is precisely the failure `AlarmState.entryDelay`
+    // was introduced to fix: someone walking in, watching a countdown that
+    // isn't counting.
+    //
+    // Every backend value re-seeds the local ticker, so the authority still
+    // wins and drift is bounded to one broadcast interval. The ticker only
+    // ever moves the *displayed* number — it must never drive the state
+    // itself, which is why nothing here touches `_state`.
     _entryDelaySub = _backend.entryDelayStream.listen((seconds) {
       _entryDelaySecondsRemaining = seconds;
+      _restartEntryDelayCountdown(seconds);
+      notifyListeners();
+    });
+  }
+
+  /// (Re)starts the local entry-delay countdown, or stops it when there is
+  /// nothing left to count. Cancelled on any state change away from
+  /// [AlarmState.entryDelay] and in [dispose], so a stale ticker can never
+  /// outlive the window it belongs to.
+  void _restartEntryDelayCountdown(int seconds) {
+    _entryDelayTimer?.cancel();
+    if (seconds <= 0) return;
+    _entryDelayTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_entryDelaySecondsRemaining <= 0) {
+        _entryDelayTimer?.cancel();
+        return;
+      }
+      _entryDelaySecondsRemaining--;
       notifyListeners();
     });
   }
@@ -118,6 +169,7 @@ class AlarmService extends ChangeNotifier {
   late final StreamSubscription<List<SecurityEvent>> _logSub;
   late final StreamSubscription<List<SensorReading>> _sensorSub;
   late final StreamSubscription<bool> _connectivitySub;
+  late final StreamSubscription<bool> _linkSub;
   late final StreamSubscription<List<BoardStatus>> _boardsSub;
   late final StreamSubscription<String> _errorSub;
   late final StreamSubscription<List<ApprovedFace>> _facesSub;
@@ -128,9 +180,17 @@ class AlarmService extends ChangeNotifier {
 
   AlarmState _state = AlarmState.disarmed;
   List<SecurityEvent> _events = const [];
+  List<SecurityEvent> _faceIdEvents = const [];
   List<SensorReading> _sensors = const [];
-  bool _isOnline = true;
+  // Both start false: before the first state frame the app knows nothing, and
+  // "nothing yet" must not render as "everything is fine" on an alarm panel.
+  // _isBackendLinked being false is what keeps _isOnline's initial value off
+  // the screen entirely — the badge shows the no-link treatment instead of a
+  // board status it hasn't actually been told.
+  bool _isOnline = false;
+  bool _isBackendLinked = false;
   List<BoardStatus> _boards = const [];
+  List<BoardStatus> _offlineBoards = const [];
   String? _lastError;
   List<ApprovedFace> _faces = const [];
   bool _isCameraOnline = true;
@@ -139,6 +199,7 @@ class AlarmService extends ChangeNotifier {
   int _entryDelaySecondsRemaining = 0;
   int _armingSecondsRemaining = 0;
   Timer? _armingTimer;
+  Timer? _entryDelayTimer;
 
   AlarmState get state => _state;
   /// Seconds left in the local arming countdown, only meaningful while
@@ -148,6 +209,11 @@ class AlarmService extends ChangeNotifier {
   List<SensorReading> get sensors => _sensors;
   bool get isOnline => _isOnline;
 
+  /// Whether the app still has a live link to the backend — i.e. whether
+  /// anything on this screen is still being updated. False means every value
+  /// here is the last one heard, however long ago that was.
+  bool get isBackendLinked => _isBackendLinked;
+
   /// Per-board liveness for the dashboard (see [BoardStatus]). Empty until
   /// the first state frame arrives, or when talking to a backend that
   /// predates per-board tracking.
@@ -155,7 +221,7 @@ class AlarmService extends ChangeNotifier {
 
   /// Boards the backend has stopped hearing from — the ones worth calling
   /// out on the dashboard. An empty list means everything is reporting.
-  List<BoardStatus> get offlineBoards => _boards.where((b) => !b.online).toList();
+  List<BoardStatus> get offlineBoards => _offlineBoards;
 
   /// Most recent infrastructural failure, or null if none is outstanding.
   /// Cleared via [clearError] once shown.
@@ -168,13 +234,13 @@ class AlarmService extends ChangeNotifier {
   /// [BackendService.faceDisarmEnabledStream]).
   bool get faceDisarmEnabled => _faceDisarmEnabled;
 
-  /// Seconds left to disarm during [AlarmState.entryDelay], straight from
-  /// the backend rather than a local ticker.
+  /// Seconds left to disarm during [AlarmState.entryDelay]. Seeded by the
+  /// backend and ticked down locally between its pushes — see the
+  /// subscription in the constructor for why both halves are needed.
   int get entryDelaySecondsRemaining => _entryDelaySecondsRemaining;
   /// Just the subset of [events] relevant to the Camera/face-ID tab,
-  /// filtered by category rather than tracked as a separate list.
-  List<SecurityEvent> get faceIdEvents =>
-      _events.where((e) => e.category == EventCategory.faceId).toList();
+  /// recomputed when the log changes rather than on every build.
+  List<SecurityEvent> get faceIdEvents => _faceIdEvents;
 
   // Thin pass-throughs to the backend — the resulting state change is
   // observed back through the stream subscriptions wired up in the
@@ -182,7 +248,24 @@ class AlarmService extends ChangeNotifier {
   Future<void> arm(ArmMode mode) => _backend.arm(mode);
   Future<void> disarm() => _backend.disarm();
 
-  Future<void> addFace(String name) => _backend.addFace(name);
+  /// Enrols a new approved face: creates the record, grabs the newest camera
+  /// frame, and attaches it as a training photo.
+  ///
+  /// Both halves matter. A record on its own has no embedding to compare
+  /// against, so it can never match anyone — which is what the app used to
+  /// create, under a list captioned "recognized as residents". The frame is
+  /// captured *first*, so a system with no camera frame available doesn't
+  /// leave an inert record behind for the user to wonder about.
+  Future<EnrollFaceOutcome> enrollFace(String name) async {
+    final frame = await _backend.captureCameraFrame();
+    if (frame == null) return EnrollFaceOutcome.noFrame;
+
+    final id = await _backend.addFace(name);
+    if (id == null) return EnrollFaceOutcome.failed;
+
+    final accepted = await _backend.addFacePhoto(id, frame);
+    return accepted ? EnrollFaceOutcome.enrolled : EnrollFaceOutcome.noFaceInFrame;
+  }
   Future<void> removeFace(String id) => _backend.removeFace(id);
   Future<void> setFaceIdEnabled(bool enabled) => _backend.setFaceIdEnabled(enabled);
   Future<void> setFaceDisarmEnabled(bool enabled) => _backend.setFaceDisarmEnabled(enabled);
@@ -237,6 +320,7 @@ class AlarmService extends ChangeNotifier {
     _logSub.cancel();
     _sensorSub.cancel();
     _connectivitySub.cancel();
+    _linkSub.cancel();
     _boardsSub.cancel();
     _errorSub.cancel();
     _facesSub.cancel();
@@ -245,6 +329,7 @@ class AlarmService extends ChangeNotifier {
     _faceDisarmSub.cancel();
     _entryDelaySub.cancel();
     _armingTimer?.cancel();
+    _entryDelayTimer?.cancel();
     super.dispose();
   }
 }

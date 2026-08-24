@@ -24,17 +24,25 @@ without the theme applied.
 
 ## Palette (`AppColors` in `app_theme.dart`)
 
+These are copied from `AppColors` and must be kept in step with it — the
+code is the source of truth, and this table has been wrong before.
+
 | Token | Hex | Use |
 |---|---|---|
-| `background` | `#0B0F14` | Scaffold background — near-black, not pure black |
-| `surface` | `#141B22` | Cards, app bar |
-| `surfaceRaised` | `#1B242D` | Elevated cards, settings sections |
-| `textPrimary` | `#EDEFF2` | Body text |
-| `textMuted` | `#8A94A3` | Secondary/caption text |
-| `safe` | `#00E6A8` | Disarmed, OK, success — **never** reuse for anything else |
-| `alarm` | `#FF3D57` | Armed, triggered, alerts, destructive actions |
-| `transitional` | `#FFB238` | Arming-in-progress only |
-| `system` | `#4FB8FF` | Interactive elements (buttons, links) — kept distinct from status colors on purpose, so "clickable" never gets confused with "this is a status" |
+| `background` | `#0E1310` | Scaffold background — near-black with a green bias, not pure black |
+| `surface` | `#141A16` | Cards, app bar |
+| `surfaceRaised` | `#1C241F` | Elevated cards, settings sections |
+| `textPrimary` | `#ECEFE7` | Body text |
+| `textMuted` | `#8B9A8E` | Secondary/caption text |
+| `trace` | `#3E4A40` | Hairlines, inactive circuit traces, dividers |
+| `safe` | `#43C285` | Disarmed, OK, success — **never** reuse for anything else |
+| `alarm` | `#E14B3C` | Armed, triggered, alerts, destructive actions |
+| `transitional` | `#E2953A` | Arming-in-progress only |
+| `system` | `#4198D1` | Interactive elements (buttons, links) — kept distinct from status colors on purpose, so "clickable" never gets confused with "this is a status" |
+
+The neutrals are deliberately hue-shifted toward the green of `safe` rather
+than being flat grey. That is what stops the panel reading as a generic dark
+theme.
 
 Don't introduce a new color without a reason tied to meaning (status vs.
 interactive vs. text hierarchy) — that discipline is what keeps the
@@ -48,6 +56,14 @@ interactive vs. text hierarchy) — that discipline is what keeps the
 - **IBM Plex Sans** (default via `google_fonts` text theme) — body copy,
   labels, buttons. Don't use mono for paragraph-length text — it's for
   data/status, not prose.
+- **Big Shoulders Display** (`AppTheme.displayStyle()`) — the condensed face
+  used for large headline numerals and screen titles. Sparingly; it carries
+  weight precisely because it's rare.
+
+All three are **bundled as assets** in `app/google_fonts/`, not fetched at
+runtime — an alarm panel has to render on a device with no route to the open
+internet. The filenames encode the match (`<Family>-<Weight>.ttf`), so
+renaming one silently sends that face back to a network download.
 
 ## Signature motif: the circuit ring
 

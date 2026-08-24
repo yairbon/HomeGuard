@@ -1,10 +1,23 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
+
 import 'backend_service.dart';
 
 /// Simulates the ESP32 + FastAPI backend so the UI can be built and tested
 /// before those exist. Password and timings are placeholders for demo use.
+///
+/// It is also the only backend a widget test can have (there is no server
+/// during `flutter test`), which makes anything it *can't* do a piece of the
+/// app no test can reach. It had quietly drifted into exactly that: the error
+/// stream never emitted, so the failure→SnackBar path was untested; lockout
+/// was unreachable, so [LoginScreen]'s entire locked branch was dead code as
+/// far as the suite was concerned; and [AlarmState.entryDelay] — the most
+/// time-critical screen in the app — was never produced. The
+/// `simulate*`/[emitError] seams below exist to close that gap, and are
+/// marked [visibleForTesting] rather than left as general API because
+/// nothing in the running app should be forcing these states.
 class MockBackendService implements BackendService {
   String _password = 'homeguard';
 
@@ -12,14 +25,13 @@ class MockBackendService implements BackendService {
   final _eventLogController = StreamController<List<SecurityEvent>>.broadcast();
   final _sensorController = StreamController<List<SensorReading>>.broadcast();
   final _connectivityController = StreamController<bool>.broadcast();
+  final _linkController = StreamController<bool>.broadcast();
   final _boardsController = StreamController<List<BoardStatus>>.broadcast();
   final _facesController = StreamController<List<ApprovedFace>>.broadcast();
   final _cameraOnlineController = StreamController<bool>.broadcast();
   final _faceIdEnabledController = StreamController<bool>.broadcast();
   final _faceDisarmEnabledController = StreamController<bool>.broadcast();
   final _entryDelayController = StreamController<int>.broadcast();
-  // Never emitted on: the mock has no network to fail, so there is nothing
-  // infrastructural to report. Present only to satisfy the interface.
   final _errorController = StreamController<String>.broadcast();
 
   /// All three boards reported healthy, since there's no hardware to model.
@@ -48,10 +60,26 @@ class MockBackendService implements BackendService {
   int _nextFaceId = 3;
 
   bool _nightMode = false;
+  int _nightModeArmHour = 23;
+  int _nightModeDisarmHour = 7;
   String _emergencyNumber = '';
   int _policeCallDelaySeconds = 60;
   String _ntfyServer = 'https://ntfy.sh';
   String _ntfyTopic = '';
+
+  /// Mirrors the real backend's lockout rule (python/backend/state.py):
+  /// three wrong passwords, then a cooldown during which even the right one
+  /// is refused — itself a copy of how the physical keypad behaves.
+  ///
+  /// Simulated here, not enforced here-as-authority: the backend remains the
+  /// only lockout authority in production, and [AuthService] still just
+  /// relays whatever a [LoginResult] says. This exists so a widget test can
+  /// actually reach the locked-out screen, which is otherwise unreachable
+  /// without a live server.
+  static const _maxAttempts = 3;
+  static const _lockoutDuration = Duration(seconds: 30);
+  int _failedAttempts = 0;
+  DateTime? _lockedOutUntil;
 
   /// Sets up the in-memory state and, on the next microtask, publishes the
   /// initial values on the streams that need a first value (connectivity,
@@ -65,6 +93,11 @@ class MockBackendService implements BackendService {
     // the camera's own connection status separately.
     scheduleMicrotask(() {
       _connectivityController.add(true);
+      // Emitted once and never retracted: there is no socket here to drop,
+      // so from the UI's point of view the link is permanently up. Without
+      // this the dashboard would render its (correct, but alarming)
+      // no-live-connection treatment throughout every widget test.
+      _linkController.add(true);
       _boardsController.add(_mockBoards);
       _cameraOnlineController.add(true);
       _faceIdEnabledController.add(_faceIdEnabled);
@@ -87,10 +120,37 @@ class MockBackendService implements BackendService {
   Stream<bool> get connectivityStream => _connectivityController.stream;
 
   @override
+  Stream<bool> get backendLinkStream => _linkController.stream;
+
+  @override
   Stream<List<BoardStatus>> get boardsStream => _boardsController.stream;
 
   @override
   Stream<String> get errorStream => _errorController.stream;
+
+  /// Publishes [message] on [errorStream] as the real service does when a
+  /// request fails infrastructurally.
+  ///
+  /// The mock has no network to fail, so before this the stream was declared
+  /// and never used, and the whole failure→`AlarmService.lastError`→SnackBar
+  /// path in [MainShell] had no test covering it at all.
+  @visibleForTesting
+  void emitError(String message) {
+    if (!_errorController.isClosed) _errorController.add(message);
+  }
+
+  /// Puts the system into [AlarmState.entryDelay] with [seconds] left, the
+  /// way the door controller reporting `/esp32/entry-delay` does.
+  ///
+  /// Nothing in the mock's own arm/disarm flow produces this state (it has no
+  /// door to open), so the countdown screen the person walking in is racing
+  /// was never rendered in a test.
+  @visibleForTesting
+  void simulateEntryDelay({int seconds = 20}) {
+    _state = AlarmState.entryDelay;
+    _emitState();
+    if (!_entryDelayController.isClosed) _entryDelayController.add(seconds);
+  }
 
   @override
   Stream<List<ApprovedFace>> get facesStream => _facesController.stream;
@@ -98,10 +158,8 @@ class MockBackendService implements BackendService {
   @override
   Stream<bool> get cameraOnlineStream => _cameraOnlineController.stream;
 
-  // No real backend to fetch a frame from — the camera screen falls back to
-  // its placeholder icon whenever this is null.
-  @override
-  String? get cameraFrameUrl => null;
+  // No real backend to stream from — the camera screen falls back to its
+  // placeholder icon whenever this is null.
   @override
   Map<String, String> get cameraFrameHeaders => const {};
   @override
@@ -122,18 +180,50 @@ class MockBackendService implements BackendService {
   /// current alarm state and sensor readings so a freshly-logged-in
   /// listener (which only just subscribed) sees the current picture
   /// rather than waiting for the next unrelated change.
+  ///
+  /// Wrong attempts accumulate towards a lockout exactly as the real backend
+  /// counts them (see [_maxAttempts]); a correct password clears the count.
+  /// While locked out the right password is refused too — that is the point
+  /// of a lockout, and it is also what makes the refusal safe to simulate
+  /// here without weakening anything: the real decision still happens
+  /// server-side.
   @override
   Future<LoginResult> login(String password) async {
     await Future.delayed(const Duration(milliseconds: 500));
-    final ok = password == _password;
-    if (ok) {
+
+    final lockedUntil = _lockedOutUntil;
+    if (lockedUntil != null) {
+      final remaining = lockedUntil.difference(DateTime.now());
+      if (remaining > Duration.zero) {
+        return LoginResult(
+          ok: false,
+          lockedOut: true,
+          lockoutRemainingSeconds: remaining.inSeconds + 1,
+        );
+      }
+      _lockedOutUntil = null;
+      _failedAttempts = 0;
+    }
+
+    if (password == _password) {
+      _failedAttempts = 0;
       _logEvent('Logged in', EventCategory.auth);
       _emitState();
       _emitSensors();
+      return const LoginResult(ok: true, attemptsRemaining: _maxAttempts);
     }
-    // Mock doesn't simulate lockout — that's tested against the real
-    // backend, which is the actual authority on it.
-    return LoginResult(ok: ok, attemptsRemaining: ok ? 3 : 2);
+
+    _failedAttempts++;
+    if (_failedAttempts >= _maxAttempts) {
+      _lockedOutUntil = DateTime.now().add(_lockoutDuration);
+      _logEvent('Too many failed logins — locked out', EventCategory.auth);
+      return LoginResult(
+        ok: false,
+        lockedOut: true,
+        lockoutRemainingSeconds: _lockoutDuration.inSeconds,
+      );
+    }
+    return LoginResult(ok: false, attemptsRemaining: _maxAttempts - _failedAttempts);
   }
 
   /// No-op: the mock has no session to invalidate, since it never issued a
@@ -153,6 +243,23 @@ class MockBackendService implements BackendService {
     _password = newPassword;
     _logEvent('Password changed', EventCategory.auth);
     return true;
+  }
+
+  /// Mirrors the real service's validation so a widget test exercises the
+  /// same accept/reject boundary. `hardware: true` because there is no board
+  /// here to fail — the mock stands in for a working system, and the
+  /// unreachable-board case belongs to the real service's tests.
+  ///
+  /// Deliberately doesn't retain the PIN: nothing ever reads one back, on
+  /// either implementation. The app sets it and forgets it, the same shape as
+  /// changing a password, so storing it here would be state no test could
+  /// meaningfully assert on.
+  @override
+  Future<KeypadPinResult> setKeypadPin(String pin) async {
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (!RegExp(r'^\d{4,8}$').hasMatch(pin)) return const KeypadPinResult(ok: false);
+    _logEvent('Keypad PIN changed', EventCategory.auth);
+    return const KeypadPinResult(ok: true, hardware: true);
   }
 
   /// Arms the system in [mode]. Only takes effect if currently disarmed
@@ -211,9 +318,15 @@ class MockBackendService implements BackendService {
   /// Records a sensor breach (or a generic alert if [source] is null) and
   /// escalates to [AlarmState.triggered]. See interface doc on
   /// [BackendService.triggerAlert] for the no-op-when-disarmed contract.
+  ///
+  /// [AlarmState.entryDelay] escalates too, matching `trigger_alert` in
+  /// python/backend/state.py. Guarding on `armed` alone meant a second sensor
+  /// tripping while someone was mid-entry-countdown was silently ignored
+  /// here but not by the backend — a mock that disagrees with the real thing
+  /// about when the alarm goes off is worse than no mock.
   @override
   Future<void> triggerAlert({SensorType? source, required String reason}) async {
-    if (_state != AlarmState.armed) return;
+    if (_state != AlarmState.armed && _state != AlarmState.entryDelay) return;
 
     // A bypassed sensor (e.g. vibration in Home mode) shouldn't be able
     // to escalate to a full alarm — that's the whole point of bypassing
@@ -249,12 +362,42 @@ class MockBackendService implements BackendService {
   /// Adds [name] to the approved-faces list, assigning it the next
   /// sequential id.
   @override
-  Future<void> addFace(String name) async {
+  Future<String?> addFace(String name) async {
     await Future.delayed(const Duration(milliseconds: 300));
-    _faces.add(ApprovedFace(id: '${_nextFaceId++}', name: name));
+    final id = '${_nextFaceId++}';
+    _faces.add(ApprovedFace(id: id, name: name));
     _facesController.add(List.unmodifiable(_faces));
     _logEvent('Approved face added: $name', EventCategory.faceId);
+    return id;
   }
+
+  /// Accepts any non-empty frame. There is no recognizer here to find a face
+  /// in one, and inventing a rejection would make widget tests assert against
+  /// a rule the real backend doesn't apply in the same way — the real 422
+  /// case is covered on the Python side.
+  @override
+  Future<bool> addFacePhoto(String id, Uint8List jpeg) async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    if (jpeg.isEmpty) return false;
+    if (!_faces.any((f) => f.id == id)) return false;
+    _logEvent('Training photo added', EventCategory.faceId);
+    return true;
+  }
+
+  /// A one-pixel JPEG stand-in. Non-null so the enrolment flow is reachable
+  /// in widget tests; `_cameraHasFrame` lets a test force the no-frame branch
+  /// that the real service hits before any camera has ever connected.
+  @override
+  Future<Uint8List?> captureCameraFrame() async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    return _cameraHasFrame ? Uint8List.fromList(const [0xFF, 0xD8, 0xFF, 0xD9]) : null;
+  }
+
+  /// Test seam for the branch above. Not `final`, and deliberately public:
+  /// the mock's job is to make every real-service outcome reachable from a
+  /// widget test, and this one is otherwise unreachable.
+  bool _cameraHasFrame = true;
+  set cameraHasFrame(bool value) => _cameraHasFrame = value;
 
   /// Removes the approved face matching [id], if any. Looks the face up
   /// before removing it purely so the log message can include its name
@@ -286,11 +429,27 @@ class MockBackendService implements BackendService {
   }
 
   @override
-  Future<bool> getNightMode() async => _nightMode;
+  Future<AppSettings?> getSettings() async => AppSettings(
+        nightMode: _nightMode,
+        nightModeArmHour: _nightModeArmHour,
+        nightModeDisarmHour: _nightModeDisarmHour,
+        emergencyNumber: _emergencyNumber,
+        policeCallDelaySeconds: _policeCallDelaySeconds,
+        ntfy: NtfyConfig(server: _ntfyServer, topic: _ntfyTopic),
+      );
 
   /// Enables/disables night mode and logs the change (unlike most other
   /// settings setters here, this one is user-visible enough in the event
   /// log to be worth recording).
+  /// Clamps to 0-23 the way the backend does, so the mock can't accept a
+  /// window the real service would silently correct.
+  @override
+  Future<void> setNightModeHours(int armHour, int disarmHour) async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    _nightModeArmHour = armHour.clamp(0, 23);
+    _nightModeDisarmHour = disarmHour.clamp(0, 23);
+  }
+
   @override
   Future<void> setNightMode(bool enabled) async {
     await Future.delayed(const Duration(milliseconds: 200));
@@ -302,27 +461,15 @@ class MockBackendService implements BackendService {
   }
 
   @override
-  Future<String> getEmergencyNumber() async => _emergencyNumber;
-
-  @override
   Future<void> setEmergencyNumber(String number) async {
     await Future.delayed(const Duration(milliseconds: 200));
     _emergencyNumber = number;
   }
 
   @override
-  Future<int> getPoliceCallDelaySeconds() async => _policeCallDelaySeconds;
-
-  @override
   Future<void> setPoliceCallDelaySeconds(int seconds) async {
     await Future.delayed(const Duration(milliseconds: 200));
     _policeCallDelaySeconds = seconds;
-  }
-
-  @override
-  Future<NtfyConfig> getNtfyConfig() async {
-    await Future.delayed(const Duration(milliseconds: 200));
-    return NtfyConfig(server: _ntfyServer, topic: _ntfyTopic);
   }
 
   @override
@@ -394,6 +541,7 @@ class MockBackendService implements BackendService {
     _eventLogController.close();
     _sensorController.close();
     _connectivityController.close();
+    _linkController.close();
     _boardsController.close();
     _errorController.close();
     _facesController.close();

@@ -1,5 +1,5 @@
 // ==========================================
-// HomeGuard - Camera worker (board 4: ESP32-CAM)
+// HomeGuard - Camera worker (board 4 of 4: ESP32-CAM)
 // ==========================================
 //
 // This board replaces this project's original assumption that the camera
@@ -30,6 +30,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include "esp_system.h"  // esp_restart(), for the two unrecoverable paths below
 
 // See esp32/secrets.h.example. Copy it into this folder as secrets.h and
 // fill in the same values used for the other three boards.
@@ -131,60 +132,141 @@ bool initCamera() {
   return true;
 }
 
+// ---- Frame upload -------------------------------------------------------
+
+// Everything in this block is built once, at boot, instead of per frame. The
+// original rebuilt the URL, the boundary, the multipart head and the
+// multipart tail on every send — six to eight transient Strings, twice a
+// second, forever. Each is a malloc/free pair in internal DRAM (the big body
+// buffer itself is fine: it clears the 16KB threshold, so it lands in PSRAM),
+// and that steady churn against a small heap is the classic "runs for hours,
+// then quietly stops" shape.
+//
+// The stack-local HTTPClient was worse than merely wasteful: ~HTTPClient()
+// calls stop() unconditionally, so the core's default keep-alive (_reuse is
+// true) was thrown away and every frame paid a fresh TCP connect and close —
+// roughly two connections a second against a 16-socket pool. A file-scope
+// client is what actually keeps the socket open: begin() with an unchanged
+// host and port reuses the live connection instead of reconnecting, and end()
+// leaves it open while _reuse is set. begin() also clears the header list, so
+// the two addHeader() calls below don't accumulate across frames.
+static const String MULTIPART_BOUNDARY = "HomeGuardCamBoundary";
+static const String CAMERA_UPLOAD_URL =
+  "http://" + String(backendHost) + ":" + String(backendPort) + "/camera/recognize";
+static const String MULTIPART_CONTENT_TYPE = "multipart/form-data; boundary=" + MULTIPART_BOUNDARY;
+static const String MULTIPART_HEAD = "--" + MULTIPART_BOUNDARY +
+                                     "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"frame.jpg\""
+                                     "\r\nContent-Type: image/jpeg\r\n\r\n";
+static const String MULTIPART_TAIL = "\r\n--" + MULTIPART_BOUNDARY + "--\r\n";
+
+HTTPClient cameraHttp;
+
+// Back-off and failure state, both consumed by noteSendResult() below.
+unsigned long sendBackoffMs = 0;
+const unsigned long BACKOFF_MIN_MS = 500;
+const unsigned long BACKOFF_MAX_MS = 30000;
+int consecutiveFailures = 0;
+const int FAILURE_RESTART_THRESHOLD = 40;
+
+// sendFrame()'s return value for "nothing was sent" — no frame captured, or
+// no memory to build the body. Distinct from an HTTP status (>0) and from an
+// HTTPClient transport error (<0), because those two mean the backend was
+// actually reached, or reached for, and this one doesn't.
+const int SEND_LOCAL_FAILURE = 0;
+
 // Builds a minimal multipart/form-data body by hand (ESP32's HTTPClient has
 // no multipart helper) and POSTs it to /camera/recognize — the same field
 // name ("photo") and shape python/camera_worker.py sends, so the backend
-// can't tell the two apart.
-void sendFrame() {
+// can't tell the two apart. Returns the HTTP status, a negative HTTPClient
+// error, or SEND_LOCAL_FAILURE.
+int sendFrame() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Frame capture failed");
-    return;
+    return SEND_LOCAL_FAILURE;
   }
 
-  const String boundary = "HomeGuardCamBoundary";
-  const String head = "--" + boundary +
-                       "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"frame.jpg\""
-                       "\r\nContent-Type: image/jpeg\r\n\r\n";
-  const String tail = "\r\n--" + boundary + "--\r\n";
-
-  const size_t totalLen = head.length() + fb->len + tail.length();
+  const size_t totalLen = MULTIPART_HEAD.length() + fb->len + MULTIPART_TAIL.length();
   uint8_t* body = (uint8_t*)malloc(totalLen);
   if (!body) {
     Serial.println("Out of memory building the upload body — skipping this frame");
     esp_camera_fb_return(fb);
-    return;
+    return SEND_LOCAL_FAILURE;
   }
 
   size_t pos = 0;
-  memcpy(body + pos, head.c_str(), head.length());
-  pos += head.length();
+  memcpy(body + pos, MULTIPART_HEAD.c_str(), MULTIPART_HEAD.length());
+  pos += MULTIPART_HEAD.length();
   memcpy(body + pos, fb->buf, fb->len);
   pos += fb->len;
-  memcpy(body + pos, tail.c_str(), tail.length());
+  memcpy(body + pos, MULTIPART_TAIL.c_str(), MULTIPART_TAIL.length());
 
   // The frame buffer is only needed to fill `body` above — release it before
   // the (slow, blocking) network call so the camera driver can reuse it for
   // the next capture instead of sitting idle for the round trip.
   esp_camera_fb_return(fb);
 
-  HTTPClient http;
-  http.begin("http://" + String(backendHost) + ":" + String(backendPort) + "/camera/recognize");
-  http.addHeader("X-Device-Key", DEVICE_KEY);
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  cameraHttp.begin(CAMERA_UPLOAD_URL);
+  cameraHttp.setReuse(true);
+  cameraHttp.addHeader("X-Device-Key", DEVICE_KEY);
+  cameraHttp.addHeader("Content-Type", MULTIPART_CONTENT_TYPE);
 
-  int code = http.POST(body, totalLen);
+  int code = cameraHttp.POST(body, totalLen);
+  free(body);
+  cameraHttp.end();  // keeps the TCP connection open — see setReuse() above
+
   if (code == 401) {
     Serial.println("Frame REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
-  } else if (code <= 0) {
-    Serial.printf("Error sending frame: %s\n", http.errorToString(code).c_str());
+  } else if (code < 0) {
+    Serial.printf("Error sending frame: %s\n", cameraHttp.errorToString(code).c_str());
+  } else if (code < 200 || code >= 300) {
+    Serial.printf("Backend refused the frame: HTTP %d\n", code);
   }
-  // No success message on every frame — at ~0.67 fps that would still
-  // flood the log; a 401 or connection error is the only thing worth
-  // interrupting the console for.
+  // No success message on every frame — at 2fps that would flood the log; a
+  // rejection or a connection error is the only thing worth interrupting the
+  // console for.
 
-  free(body);
-  http.end();
+  return code;
+}
+
+// Applies the two responses to a frame that didn't land: an exponential
+// back-off, and eventually a reboot.
+//
+// The back-off exists because sendFrame() used to read the response code only
+// to print it. A backend answering 401 (mismatched DEVICE_KEY) or 500 got the
+// same 15-40KB JPEG re-POSTed twice a second, indefinitely — WiFi airtime
+// spent on a request that cannot start succeeding, on the same radio the
+// alarm path's own reports have to get through. Only results that reached the
+// network back off; a capture failure or an OOM never got there, so there is
+// nothing at the other end to be gentle with.
+//
+// The reboot is for the other failure mode: a fragmented heap or a wedged
+// camera driver, where the board keeps running and keeps sending nothing. The
+// threshold is deliberately deaf to short backend outages — with the
+// back-off, 40 consecutive network failures take about 20 minutes, while 40
+// local failures (which don't back off) take 20 seconds. That asymmetry is
+// the point: rebooting cannot fix someone else's server, but it does fix us.
+void noteSendResult(int result) {
+  if (result >= 200 && result < 300) {
+    consecutiveFailures = 0;
+    sendBackoffMs = 0;
+    return;
+  }
+
+  consecutiveFailures++;
+
+  if (result != SEND_LOCAL_FAILURE) {
+    unsigned long next = (sendBackoffMs == 0) ? BACKOFF_MIN_MS : sendBackoffMs * 2;
+    sendBackoffMs = (next > BACKOFF_MAX_MS) ? BACKOFF_MAX_MS : next;
+    Serial.printf("Backing off %lums (%d frames in a row failed)\n", sendBackoffMs, consecutiveFailures);
+  }
+
+  if (consecutiveFailures >= FAILURE_RESTART_THRESHOLD) {
+    Serial.printf("FATAL: %d frames in a row failed — restarting.\n", consecutiveFailures);
+    Serial.flush();  // esp_restart() doesn't drain the UART on its way out
+    delay(1000);
+    esp_restart();
+  }
 }
 
 // ---- Live stream server (new) ------------------------------------------
@@ -277,6 +359,26 @@ void startCameraServer() {
   }
 }
 
+// How many times initCamera() is retried before the board gives up and
+// reboots, and how long to wait between attempts.
+const int CAMERA_INIT_ATTEMPTS = 5;
+const unsigned long CAMERA_RETRY_DELAY_MS = 500;
+
+// Blocks until the network is up. WiFi.begin() keeps retrying by itself, so
+// an access point that's down at boot resolves itself when it comes back —
+// nothing here has to handle that case.
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("My IP: ");
+  Serial.println(WiFi.localIP());
+}
+
 void setup() {
   // Cheap USB power (a marginal cable/hub, or a port shared with other
   // devices) can sag enough during the camera's init current spike to trip
@@ -290,31 +392,65 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
-  if (!initCamera()) {
-    Serial.println("FATAL: camera init failed. Halting.");
-    while (true) delay(1000);
+  // WiFi first, camera second — deliberately the opposite of how this
+  // started out. initCamera() used to run before WiFi.begin(), and its
+  // failure path was `while (true) delay(1000)`, so a camera that didn't come
+  // up meant the board never joined the network at all: no frames, no
+  // /stream, and no heartbeat either (this board sends none by design — its
+  // frames are its heartbeat, see esp32/README.md), with nothing anywhere to
+  // reboot it. The Arduino loop task isn't subscribed to the task watchdog,
+  // and delay() yields anyway, so that halt was permanent and silent. One
+  // loose ribbon connector — made likelier by the brownout detector being
+  // masked just above — took the camera off the air until a human noticed.
+  // Connecting first at least puts the board on the network before anything
+  // can fail.
+  connectWiFi();
+
+  // Bounded retry instead of a halt. A ribbon that didn't seat on the first
+  // attempt often reads fine a moment later; if the camera really is gone,
+  // rebooting is the only recovery this board has, and a reboot loop is at
+  // least visible — on the serial console, and as a board that keeps
+  // reappearing on the network without ever sending a frame.
+  bool cameraReady = false;
+  for (int attempt = 1; attempt <= CAMERA_INIT_ATTEMPTS && !cameraReady; attempt++) {
+    cameraReady = initCamera();
+    if (!cameraReady) {
+      Serial.printf("Camera init attempt %d of %d failed.\n", attempt, CAMERA_INIT_ATTEMPTS);
+      // A failed esp_camera_init() leaves the driver half-allocated, so
+      // without this the retry fails on the leftovers rather than on the
+      // hardware it is actually meant to be testing.
+      esp_camera_deinit();
+      delay(CAMERA_RETRY_DELAY_MS);
+    }
+  }
+
+  if (!cameraReady) {
+    Serial.printf("FATAL: camera init failed %d times — restarting.\n", CAMERA_INIT_ATTEMPTS);
+    Serial.flush();  // esp_restart() doesn't drain the UART on its way out
+    delay(1000);
+    esp_restart();
   }
   Serial.println("Camera ready.");
-
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected!");
-  Serial.print("My IP: ");
-  Serial.println(WiFi.localIP());
   Serial.printf("Sending a frame to %s:%d every %lums\n", backendHost, backendPort, CAPTURE_INTERVAL_MS);
 
   startCameraServer();
 }
 
 void loop() {
-  if (millis() - lastCapture >= CAPTURE_INTERVAL_MS) {
+  // sendBackoffMs stretches the interval while the backend is refusing frames
+  // or unreachable; it is zero the rest of the time, which is almost always.
+  if (millis() - lastCapture >= CAPTURE_INTERVAL_MS + sendBackoffMs) {
     if (WiFi.status() == WL_CONNECTED) {
-      sendFrame();
+      noteSendResult(sendFrame());
     }
     lastCapture = millis();
   }
+
+  // Yield. Without this the loop task spins at 100% CPU through the entire
+  // inter-frame gap: the core only inserts an automatic yield into loop() on
+  // a single-core build (CONFIG_FREERTOS_UNICORE), which this chip is not, so
+  // a priority-1 task that never blocks starves the idle task and competes
+  // with the stream task and the WiFi stack for a core it isn't using for
+  // anything.
+  delay(10);
 }
