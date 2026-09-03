@@ -113,12 +113,20 @@ MAX_EVENTS = 200
 # controller sketch's isValidPin(); both sides check, because the board's
 # /keypad-pin route is reachable by anything on the network holding the
 # device key and so cannot assume the backend validated first.
+#
+# Also, since AppState.change_password merged the login password and the
+# keypad PIN into one shared secret, these bounds now gate *both*: the app
+# password used to accept any length or character set, and now can't be set
+# to anything the keypad couldn't also type. See that method's docstring for
+# the trade-off that accepts.
 KEYPAD_PIN_MIN_LENGTH = 4
 KEYPAD_PIN_MAX_LENGTH = 8
 
 
 def is_valid_keypad_pin(pin: object) -> bool:
-    """True for a PIN the keypad can actually accept.
+    """True for a value the keypad can actually accept as a PIN — which,
+    since AppState.change_password unified the two, is now also the only
+    shape a new login password may take.
 
     Deliberately strict rather than permissive. Beyond being a usability
     rule, this is the sanitizer standing between an app-supplied string and
@@ -173,6 +181,13 @@ def _clamp_police_call_delay(seconds: int) -> int:
     return max(MIN_POLICE_CALL_DELAY, min(MAX_POLICE_CALL_DELAY, seconds))
 
 
+# The factory-default login password on a fresh install. Predates the
+# digit-only constraint change_password now enforces on any *new* value (see
+# that method), and is grandfathered in as a valid *old* one — /login never
+# validated password shape and still doesn't. It can be verified against
+# forever, it just can never be set again once changed away from: the first
+# change_password call moves the account permanently into the digits-only
+# regime, same as a fresh keypad PIN always was.
 DEFAULT_PASSWORD = "homeguard"
 STATE_FILE = Path(
     os.environ.get("HOMEGUARD_STATE_FILE", Path(__file__).resolve().parent.parent / "state.json")
@@ -247,13 +262,22 @@ class AppState:
         # The physical keypad's disarm PIN, when it has been set from the app.
         # Empty means "never set here" — the board is then running whatever
         # KEYPAD_PIN was compiled into its secrets.h, which the backend has no
-        # way to know. Stored as the literal PIN rather than a hash because
-        # unlike the app password, the backend does not *verify* this value:
-        # it relays it to the door controller, which is the only thing that
-        # compares it. That also means it has to survive a restart, so a
-        # re-send after the board comes back online sends the right PIN.
-        # It sits in state.json next to the device key, which is likewise a
-        # shared secret held in the clear (see security.py).
+        # way to know. Stored as the literal PIN rather than a hash — unlike
+        # `_password_hash`, the backend does not *verify* this value: it
+        # relays it to the door controller and, optionally, secrets.h,
+        # neither of which can compare against a scrypt digest. That also
+        # means it has to survive a restart, so a re-send after the board
+        # comes back online sends the right PIN. It sits in state.json next
+        # to the device key, which is likewise a shared secret held in the
+        # clear (see security.py).
+        #
+        # Since AppState.change_password unified the login password and the
+        # keypad PIN into one shared secret, this is always kept equal to
+        # the plaintext of whatever `_password_hash` currently verifies —
+        # two representations of the same value, not two secrets. It is
+        # still its own field rather than derived from the hash because a
+        # hash cannot be reversed back into the plaintext this needs to send
+        # over the wire.
         self.keypad_pin = ""
 
         # Last time each board was heard from. Absent = never seen this run.
@@ -761,22 +785,76 @@ class AppState:
 
     async def change_password(
         self, old_password: str, new_password: str, current_token: str | None = None
-    ) -> bool:
-        """Changes the login password after verifying `old_password`.
+    ) -> tuple[bool, bool, bool]:
+        """Changes the single shared secret that is both this app's login
+        password and the physical keypad's disarm PIN.
 
-        Rejects a new password that's empty/whitespace-only (`.strip()` check)
-        so the account can't accidentally be left with a blank password, and
-        rejects a wrong `old_password` through the same counted/lockout path
-        as a failed login (see [_register_failed_attempt]).
+        These were originally two independent credentials — a free-form,
+        scrypt-hashed app password here, and a separately-set 4-8 digit
+        keypad PIN behind the now-removed `set_keypad_pin`/
+        `/settings/keypad-pin` — unified into one at the project owner's
+        explicit request. **This is a real security trade-off, not just a
+        UX simplification, and it is worth stating plainly rather than
+        leaving it implicit in the diff**: the app password used to be able
+        to be any length or character set; the keypad PIN was always
+        constrained to [KEYPAD_PIN_MIN_LENGTH, KEYPAD_PIN_MAX_LENGTH] digits,
+        because that is all a 4x4 physical keypad can type. Unifying the two
+        means the *weaker* shape wins for both — the one value that now also
+        unlocks remote app access (arm/disarm, the live camera feed, every
+        setting), not just the front door, lives in a space of at most
+        10**KEYPAD_PIN_MAX_LENGTH digit combinations, rather than an
+        arbitrary-strength password. Accepted knowingly for this household's
+        own system; worth re-weighing if this backend is ever reachable from
+        somewhere less trusted than a private Tailnet.
 
-        On success, every *other* session token is revoked — `current_token`
-        (the device that made this change) keeps working, and every other
-        signed-in device is forced to re-authenticate with the new password.
-        Leaving old sessions alive would defeat the main reason to change an
-        alarm system's password.
+        Checks `old_password` first — unconstrained in shape, since it's
+        just whatever the previous value already was (digit PIN, or the
+        original free-form default; see DEFAULT_PASSWORD) — through the same
+        counted/lockout path as a failed login (see
+        [_register_failed_attempt]). Only once that succeeds is
+        `new_password` checked against [is_valid_keypad_pin] and rejected
+        with `ValueError` (the route turns that into a 422) if it isn't
+        4-8 digits. Checking the old value's *correctness* before the new
+        value's *shape* means three wrong old-value guesses still lock the
+        account out no matter what `new_password` looks like — a caller
+        can't dodge the lockout by pairing each guess with a deliberately
+        malformed new value.
+
+        On success:
+        - `_password_hash` is replaced (what `/login` compares against), and
+          `keypad_pin` is set to the same plaintext value — see the comment
+          on that field for why it has to be stored separately from the hash.
+        - every *other* session token is revoked — `current_token` (the
+          device that made this change) keeps working, and every other
+          signed-in device is forced to re-authenticate with the new value.
+          Unchanged from this method's pre-merge behavior, and just as
+          necessary now: the whole point of changing the credential that
+          guards an alarm system is that a lost/stolen/ex-housemate's
+          session stops working.
+        - persisted to disk **before** the door controller is contacted —
+          same reasoning `set_keypad_pin` used to state explicitly: a crash
+          or an unreachable board during that round trip leaves the backend
+          holding the new value rather than losing it, so a later re-send
+          is possible instead of the change silently vanishing.
+        - pushed to the door controller and, if `HOMEGUARD_SECRETS_H` is
+          configured, synced into secrets.h. Both are best-effort and
+          reported back rather than required for `ok=True`: the credential
+          itself is already changed the moment it's verified and stored
+          here, independent of whether either hardware round trip lands.
+
+        Returns `(ok, hardware_ack, secrets_synced)`. `ok=False` means
+        nothing changed anywhere — wrong `old_password`, or locked out —
+        and `hardware_ack`/`secrets_synced` are always `False` alongside it,
+        since nothing was there to push. When `ok=True`, `hardware_ack` says
+        whether the door controller acknowledged the new PIN and
+        `secrets_synced` whether secrets.h was rewritten to match; see
+        `esp32_client.send_keypad_pin` and `secrets_file.update_keypad_pin`.
+        Logged either way, but the value itself never enters the event log —
+        the same rule the ntfy topic follows — only the fact of the change
+        and the hardware outcome are.
         """
         if self.is_locked_out:
-            return False
+            return False, False, False
         self._clear_expired_lockout()
         # Both scrypt calls run in a worker thread; see `login` for why. This
         # one is the more expensive of the two — a verify plus a fresh hash is
@@ -786,17 +864,40 @@ class AppState:
             await self._register_failed_attempt(
                 f"{MAX_LOGIN_ATTEMPTS} failed password-change attempts"
             )
-            return False
-        if not new_password.strip():
-            return False
+            return False, False, False
+
+        if not is_valid_keypad_pin(new_password):
+            raise ValueError(
+                f"New password must be {KEYPAD_PIN_MIN_LENGTH}-{KEYPAD_PIN_MAX_LENGTH} "
+                "digits — it doubles as the physical keypad's PIN"
+            )
 
         self._failed_attempts = 0
         self._password_hash = await asyncio.to_thread(hash_password, new_password)
+        self.keypad_pin = new_password
         self.tokens.revoke_all(except_token=current_token)
-        self._log("Password changed", EventCategory.auth)
+        # Durable before the hardware round trip below, on purpose — see the
+        # docstring above.
+        self._persist()
+
+        from . import esp32_client, secrets_file  # deferred: esp32_client imports `state`
+
+        hardware_ack = await esp32_client.send_keypad_pin(new_password)
+        secrets_synced = secrets_file.update_keypad_pin(new_password)
+
+        self._log(
+            "Password changed"
+            if hardware_ack
+            else "Password changed — the door controller could not be reached",
+            EventCategory.auth,
+        )
+        # Persisted again so the log line above (and the hardware/secrets
+        # outcome, though those aren't themselves stored fields) survive a
+        # crash right after the change — the earlier _persist() only
+        # promised the credential itself wouldn't be lost.
         self._persist()
         await self._broadcast()
-        return True
+        return True, hardware_ack, secrets_synced
 
     # ---- Arm / disarm ---------------------------------------------------------
 
@@ -1207,21 +1308,33 @@ class AppState:
         self._persist()
         await self._broadcast()
 
-    async def log_face_recognized(self, name: str) -> bool:
+    async def log_face_recognized(self, name: str, *, live: bool = True) -> bool:
         """Records a face-recognition match and, if face-disarm is enabled,
         disarms the system. Returns whether it disarmed.
 
-        Face-disarm is **off by default**, deliberately. SFace compares face
-        embeddings; it has no liveness detection, so a printed photo or a
-        picture on a phone screen may well pass. That makes this a
-        convenience feature, not a security one — it lowers the bar to
-        disarming from "knows the PIN or the password" to "has a photo of
-        someone who lives here", which is a real downgrade for an alarm.
-        Enabling it is an informed choice the user makes in Settings.
+        Face-disarm is **off by default**, deliberately. Even accounting for
+        `live` below, this stays a convenience feature, not a security one —
+        it lowers the bar to disarming from "knows the PIN or the password"
+        to "has a photo of someone who lives here, held steady enough to
+        fool a motion check". Enabling it is an informed choice the user
+        makes in Settings.
 
-        Only disarms from `armed` or `triggered` — the states where disarming
-        is a meaningful action. Recognizing a face while already disarmed is
-        just an audit-log entry.
+        `live` is what the caller (main.py's recognize_frame) determined
+        from a short window of facial-landmark movement — see
+        `is_live_landmark_sequence` in face_recognition_service.py. SFace
+        itself only compares face embeddings and has no notion of liveness:
+        a printed photo or a picture on a phone screen matches just as well
+        as the real person, unless something else is watching for the
+        natural micro-movement a static image can't reproduce. `live`
+        defaults to True so every call site that predates this check —
+        including the direct state-layer tests of the arm/disarm machinery
+        below, which have nothing to do with the camera pipeline — keeps
+        disarming exactly as it did before liveness existed.
+
+        Only disarms from `armed` or `triggered` — the states where
+        disarming is a meaningful action. Recognizing a face while already
+        disarmed is just an audit-log entry — and so, distinctly, is a match
+        that would have disarmed but failed the liveness check (see below).
 
         That audit entry is rate-limited per person (see
         FACE_LOG_COOLDOWN). The ESP32-CAM pushes two frames a second, so
@@ -1231,28 +1344,50 @@ class AppState:
         that mattered, and every connected phone was sent ~21 KB per frame —
         about 2.6 MB a minute — to be told the same thing over and over.
         Recognition itself is unthrottled; only the *reporting* of it is.
+        The same cooldown covers the "liveness check failed" line below, for
+        the same reason: a spoofing attempt held in front of the camera
+        should not spam the log any more than a genuine sighting would.
         """
         now = datetime.now()
         last_seen = self._face_last_logged.get(name)
         recently_logged = last_seen is not None and now - last_seen < FACE_LOG_COOLDOWN
         self._face_last_logged[name] = now
 
-        should_disarm = self.face_disarm_enabled and self.alarm_state in (
+        # Whether this match would disarm if it were live — kept separate
+        # from `should_disarm` so a match defeated *only* by a failed
+        # liveness check can be told apart from one that was never going to
+        # disarm anything (face-disarm off, or not in a disarmable state).
+        disarm_eligible = self.face_disarm_enabled and self.alarm_state in (
             AlarmState.armed,
             AlarmState.triggered,
             AlarmState.entryDelay,
         )
+        should_disarm = disarm_eligible and live
 
-        # A disarm is always logged, however recently this face was seen —
-        # rate-limiting an "the alarm was just turned off" entry would be
-        # exactly the wrong thing to economise on.
         if not should_disarm:
+            if disarm_eligible and not live:
+                # Would have disarmed; the liveness check said no. That's a
+                # security-relevant signal in its own right — it's what a
+                # spoofing attempt looks like — so it gets its own line
+                # instead of being folded into a plain sighting, but the
+                # same per-person cooldown still applies to it.
+                if recently_logged:
+                    return False
+                self._log(
+                    f"Face recognized but liveness check failed: {name}",
+                    EventCategory.armDisarm,
+                )
+                await self._broadcast()
+                return False
             if recently_logged:
                 return False
             self._log(f"Face recognized: {name}", EventCategory.faceId)
             await self._broadcast()
             return False
 
+        # A disarm is always logged, however recently this face was seen —
+        # rate-limiting an "the alarm was just turned off" entry would be
+        # exactly the wrong thing to economise on.
         self._log(f"Face recognized: {name}", EventCategory.faceId)
 
         # disarm() broadcasts and resets sensors; log the reason first so the
@@ -1351,48 +1486,6 @@ class AppState:
                 # A scheduling error must never kill the loop and silently
                 # stop all future auto-arming.
                 logger.exception("Night-mode check failed")
-
-    async def set_keypad_pin(self, pin: str) -> tuple[bool, bool]:
-        """Changes the physical keypad's disarm PIN.
-
-        Returns `(hardware_ack, secrets_synced)` so the app can tell the
-        three outcomes apart: the board took it, the board is unreachable, or
-        the board took it but the source header wasn't updated.
-
-        Order matters. The PIN is stored and persisted **before** the board
-        is contacted, so an unreachable board leaves the backend holding the
-        new value rather than losing it — the user's change survives, and can
-        be re-sent. That does mean a failed push leaves the backend and the
-        board briefly disagreeing, which is the honest state of affairs and
-        is exactly what `hardware_ack=False` tells the app.
-
-        Rejects an invalid PIN by raising ValueError; the route turns that
-        into a 422. Logged as an event because changing what disarms the
-        alarm is precisely the kind of change worth an audit trail — but the
-        PIN itself never enters the log, the same rule the ntfy topic follows
-        (there's a test for that one; there's now one for this).
-        """
-        if not is_valid_keypad_pin(pin):
-            raise ValueError(
-                f"PIN must be {KEYPAD_PIN_MIN_LENGTH}-{KEYPAD_PIN_MAX_LENGTH} digits"
-            )
-
-        self.keypad_pin = pin
-        self._persist()
-
-        from . import esp32_client, secrets_file  # deferred: esp32_client imports `state`
-
-        hardware_ack = await esp32_client.send_keypad_pin(pin)
-        secrets_synced = secrets_file.update_keypad_pin(pin)
-
-        self._log(
-            "Keypad PIN changed"
-            if hardware_ack
-            else "Keypad PIN changed — the door controller could not be reached",
-            EventCategory.auth,
-        )
-        await self._broadcast()
-        return hardware_ack, secrets_synced
 
     async def set_emergency_number(self, number: str) -> None:
         """Stores the number to call when police auto-dial (if/once

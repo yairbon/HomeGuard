@@ -125,7 +125,7 @@ class LoginResult {
   /// login screen told the user "Wrong password (0 attempt(s) left)" — an
   /// accusation about their password and a fabricated lockout warning, when
   /// the actual problem was a backend URL that nothing was listening on.
-  /// Same reason [KeypadPinResult] carries one.
+  /// Same reason [ChangePasswordResult] carries one.
   final bool reachable;
 
   const LoginResult({
@@ -137,31 +137,33 @@ class LoginResult {
   });
 }
 
-/// Outcome of changing the physical keypad's disarm PIN.
+/// Outcome of changing the shared password/keypad-PIN credential.
 ///
 /// Three distinguishable results, because they need three different things
 /// said to the user:
 ///
-/// * [ok] false — the PIN was rejected (not 4-8 digits) or the backend
-///   couldn't be reached. Nothing changed anywhere.
-/// * [ok] true, [hardware] false — saved here, but the door controller
-///   didn't answer. The keypad is **still accepting the old PIN**; this is
-///   the case the user most needs told plainly.
+/// * [ok] false — the new value was rejected (not 4-8 digits), the current
+///   value didn't match, or the backend couldn't be reached. Nothing
+///   changed anywhere.
+/// * [ok] true, [hardware] false — saved here (this app can already log in
+///   with the new value), but the door controller didn't answer. The
+///   keypad is **still accepting the old code**; this is the case the user
+///   most needs told plainly.
 /// * [ok] true, [hardware] true — the board stored it in NVS and is using
-///   it now.
+///   it now, so both the app and the physical keypad are on the new code.
 ///
 /// [secretsUpdated] is a separate axis and only relevant on a development
 /// machine: it says whether `esp32/.../secrets.h` was rewritten to match, so
-/// that reflashing the board later doesn't silently restore an old PIN. It
+/// that reflashing the board later doesn't silently restore an old code. It
 /// is false on any normal install, where the backend has no source tree to
 /// write to, and that is not a failure.
-class KeypadPinResult {
+class ChangePasswordResult {
   final bool ok;
   final bool hardware;
   final bool secretsUpdated;
   final bool reachable;
 
-  const KeypadPinResult({
+  const ChangePasswordResult({
     required this.ok,
     this.hardware = false,
     this.secretsUpdated = false,
@@ -275,23 +277,18 @@ abstract class BackendService {
   /// still arm or disarm the system.
   Future<void> logout();
 
-  /// Changes the login password from [oldPassword] to [newPassword].
-  /// Returns whether the change succeeded (implementations should reject
-  /// when [oldPassword] doesn't match the current password).
-  Future<bool> changePassword(String oldPassword, String newPassword);
-
-  /// Changes the PIN typed on the physical keypad to disarm.
-  ///
-  /// Unrelated to [changePassword], which is the app's own login. This one
-  /// travels: backend -> door controller -> the board's NVS, which is the
-  /// only copy the keypad actually compares against. See [KeypadPinResult]
-  /// for why the outcome isn't a plain bool.
+  /// Changes the shared password/keypad-PIN credential from [oldPassword]
+  /// to [newPassword] — both this app's own login *and* the code typed on
+  /// the physical keypad to disarm, in one call. The new value travels:
+  /// backend -> hashed for login -> door controller -> the board's NVS,
+  /// which is the only copy the keypad actually compares against. See
+  /// [ChangePasswordResult] for why the outcome isn't a plain bool.
   ///
   /// Must be 4-8 digits — the keypad's other two keys are `*` (arm) and `#`
-  /// (submit), so anything else produces a PIN that can't be typed. The
-  /// backend and the firmware both enforce that independently; the app
+  /// (submit), so anything else produces a code that can't be typed there.
+  /// The backend and the firmware both enforce that independently; the app
   /// checks too, only so the user gets told before a round trip.
-  Future<KeypadPinResult> setKeypadPin(String pin);
+  Future<ChangePasswordResult> changePassword(String oldPassword, String newPassword);
 
   /// Arms the system in the given [mode] (see [ArmMode] for what each mode
   /// bypasses). Implementations are expected to pass through a

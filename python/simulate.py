@@ -25,6 +25,18 @@ import httpx
 BASE = os.environ.get("HOMEGUARD_BASE_URL", "http://localhost:8000")
 DEVICE_KEY = os.environ.get("HOMEGUARD_DEVICE_KEY", "simulation-device-key")
 
+# The factory-default password on a fresh install (DEFAULT_PASSWORD in
+# state.py) — free-form, so it predates the digit-only constraint
+# `change_password` now enforces on any *new* value (see that method: the
+# login password and the physical keypad's PIN are now one shared secret).
+# Valid as an old_password forever; can never be set again as a new_password
+# once changed away from — which is exactly what this script now does below,
+# so PIN_A/PIN_B (not DEFAULT_PASSWORD) are what its password-change checks
+# actually cycle between from that point on.
+DEFAULT_PASSWORD = "homeguard"
+PIN_A = "24681"
+PIN_B = "97531"
+
 # trust_env=False so an HTTP(S)_PROXY set in the environment doesn't send
 # localhost traffic through a proxy that can't route back to it.
 c = httpx.Client(base_url=BASE, timeout=10.0, trust_env=False)
@@ -52,7 +64,7 @@ def section(title):
     print(f"\n=== {title} ===")
 
 
-def authenticate(password="homeguard"):
+def authenticate(password=DEFAULT_PASSWORD):
     """Logs in and installs the returned session token on `c` for every
     later request. Returns the token."""
     token = c.post("/login", json={"password": password}).json()["token"]
@@ -78,7 +90,7 @@ check(
 check(
     "POST /change-password without a token is rejected",
     anon.post(
-        "/change-password", json={"old_password": "homeguard", "new_password": "x"}
+        "/change-password", json={"old_password": DEFAULT_PASSWORD, "new_password": "1234"}
     ).status_code
     == 401,
 )
@@ -107,7 +119,7 @@ check("wrong password rejected", body["ok"] is False)
 check("no token issued on failure", body["token"] is None, body)
 check("attempts_remaining reported", body["attempts_remaining"] == 2, body)
 
-r = c.post("/login", json={"password": "homeguard"})
+r = c.post("/login", json={"password": DEFAULT_PASSWORD})
 body = r.json()
 check("correct password accepted", body["ok"] is True)
 check("token issued on success", isinstance(body["token"], str) and len(body["token"]) > 20)
@@ -137,27 +149,39 @@ check(
     {s["type"] for s in state["sensors"]} == {"ultrasonic", "door", "vibration"},
 )
 
-r = c.post("/change-password", json={"old_password": "homeguard", "new_password": "homeguard2"})
-check("change password (correct old pw)", r.json()["ok"] is True)
+r = c.post("/change-password", json={"old_password": DEFAULT_PASSWORD, "new_password": PIN_A})
+body = r.json()
+check("change password (correct old pw)", body["ok"] is True)
+# /settings/keypad-pin was folded into this route — same two extra outcomes
+# it used to report on its own, now reported here on every credential
+# change. No door controller or HOMEGUARD_SECRETS_H is configured for this
+# script, so both are expected False rather than absent.
+check("response reports the hardware-ack outcome", body["hardware"] is False, body)
+check("response reports the secrets.h-sync outcome", body["secrets_updated"] is False, body)
 check("own token survives a password change", c.get("/state").status_code == 200)
 
-r = c.post("/login", json={"password": "homeguard"})
+r = c.post("/login", json={"password": DEFAULT_PASSWORD})
 check("old password now rejected", r.json()["ok"] is False)
 
-r = c.post("/login", json={"password": "homeguard2"})
+r = c.post("/login", json={"password": PIN_A})
 check("new password works", r.json()["ok"] is True)
 
-authenticate("homeguard2")
-r = c.post("/change-password", json={"old_password": "homeguard2", "new_password": "homeguard"})
-check("changed password back to homeguard", r.json()["ok"] is True)
+authenticate(PIN_A)
+r = c.post("/change-password", json={"old_password": PIN_A, "new_password": PIN_B})
+# Not "changed back to DEFAULT_PASSWORD" — that value can never be a
+# new_password again once the account has moved into the digits-only regime
+# (see the comment on DEFAULT_PASSWORD above), so this cycles to a second
+# PIN instead, which is what the rest of this section now assumes as the
+# account's password/PIN for the remainder of the script.
+check("changed password to a second value", r.json()["ok"] is True)
 
 # A second device's token must stop working once the password changes.
 other = httpx.Client(base_url=BASE, timeout=10.0, trust_env=False)
-other_token = other.post("/login", json={"password": "homeguard"}).json()["token"]
+other_token = other.post("/login", json={"password": PIN_B}).json()["token"]
 other.headers["Authorization"] = f"Bearer {other_token}"
 check("second device can read state", other.get("/state").status_code == 200)
-authenticate()
-c.post("/change-password", json={"old_password": "homeguard", "new_password": "homeguard"})
+authenticate(PIN_B)
+c.post("/change-password", json={"old_password": PIN_B, "new_password": PIN_B})
 check(
     "other devices' tokens are revoked by a password change",
     other.get("/state").status_code == 401,
@@ -165,7 +189,7 @@ check(
 
 # Logout must invalidate server-side, not just locally.
 throwaway = httpx.Client(base_url=BASE, timeout=10.0, trust_env=False)
-tok = throwaway.post("/login", json={"password": "homeguard"}).json()["token"]
+tok = throwaway.post("/login", json={"password": PIN_B}).json()["token"]
 throwaway.headers["Authorization"] = f"Bearer {tok}"
 check("token works before logout", throwaway.get("/state").status_code == 200)
 throwaway.post("/logout")
@@ -176,26 +200,33 @@ for i in range(3):
     r = c.post("/login", json={"password": f"nope{i}"})
 final = r.json()
 check("locked out after 3 wrong attempts", final["locked_out"] is True, final)
-r = c.post("/login", json={"password": "homeguard"})
+r = c.post("/login", json={"password": PIN_B})
 check("correct password still rejected while locked out", r.json()["ok"] is False)
 print(f"  (waiting {final['lockout_remaining_seconds']}s for lockout to clear...)")
 time.sleep(final["lockout_remaining_seconds"] + 1)
-r = c.post("/login", json={"password": "homeguard"})
+r = c.post("/login", json={"password": PIN_B})
 check("login works again after lockout expires", r.json()["ok"] is True)
-authenticate()
+authenticate(PIN_B)
 
 # /change-password used to be an unthrottled password oracle: it enforced no
 # attempt limit at all, so the 3-attempt lockout could be sidestepped entirely
 # by guessing there instead.
+#
+# new_password below ("0000") is a validly-*shaped* decoy on purpose:
+# old_password is checked, and found wrong, before new_password's
+# digits-only shape is ever considered (see AppState.change_password), so
+# this still exercises the lockout regardless of what new_password looks
+# like — a caller can't dodge it by pairing each guess with a value that
+# would 422 anyway.
 for i in range(3):
-    r = c.post("/change-password", json={"old_password": f"guess{i}", "new_password": "x"})
+    r = c.post("/change-password", json={"old_password": f"guess{i}", "new_password": "0000"})
 check(
     "wrong old-password guesses trip the same lockout",
-    c.post("/login", json={"password": "homeguard"}).json()["locked_out"] is True,
+    c.post("/login", json={"password": PIN_B}).json()["locked_out"] is True,
 )
 print("  (waiting out that lockout...)")
 time.sleep(31)
-authenticate()
+authenticate(PIN_B)
 
 # ---- Arm / disarm timing --------------------------------------------------
 section("Arm / disarm")

@@ -32,6 +32,36 @@ same across restarts. To set it explicitly instead, export
 Default login password is `homeguard`; change it from the app's Settings
 screen. It's stored as a scrypt hash in `state.json`, never in plaintext.
 
+## Login password / keypad PIN: one shared secret
+
+`POST /change-password` changes a single value that is **both** this app's
+login password **and** the physical keypad's disarm PIN. These used to be
+two independent credentials behind two endpoints (this one, plus a
+since-removed `/settings/keypad-pin`) — unified into one at the project
+owner's explicit request. A new value must be 4-8 digits: the one shape a
+4x4 physical keypad can type, which used to constrain only the keypad PIN
+and now constrains the app password too.
+
+**This is a real security trade-off, stated plainly rather than left
+implicit in the diff.** The app password used to be free-form and
+scrypt-hashed — any length, any character. The single value that replaces
+it — which unlocks not just the front door but remote arm/disarm, the live
+camera feed, and every setting — now lives in a space of at most 10⁸ digit
+combinations. That was an informed choice for this household's own system;
+it is worth re-weighing before relying on it somewhere less trusted than a
+private Tailnet. See `AppState.change_password` in `backend/state.py` for
+the full account, including why the *old* value has no such constraint (so
+the factory-default `homeguard` still works as `old_password` once) and why
+it can never be set again as a `new_password` once changed away from.
+
+The response carries `hardware` (did the door controller acknowledge the
+new PIN over the network) and `secrets_updated` (was
+`esp32/.../secrets.h` rewritten to match, gated behind `HOMEGUARD_SECRETS_H`)
+alongside `ok`. Both are the same two-outcome honesty `/settings/keypad-pin`
+used to report on its own: "saved here, but the board didn't answer" is a
+real, non-fatal outcome, distinct from both success and failure, and it stays
+that way now that one call does both jobs.
+
 ## Authentication
 
 Nothing here is open. Two credentials, for two kinds of caller:
@@ -184,7 +214,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 222 tests, ~91s
+.\venv\Scripts\python.exe -m pytest        # 231 tests, ~105s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 
