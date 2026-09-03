@@ -110,6 +110,70 @@ async def test_face_disarm_setting_survives_a_restart(monkeypatch, tmp_path):
     assert state_module.state.face_disarm_enabled is True
 
 
+# ---- Face disarm liveness ---------------------------------------------------
+#
+# `live` is what main.py's recognize_frame computes from
+# face_recognition_service.is_live_landmark_sequence (see test_liveness.py
+# for that decision in isolation) before ever calling log_face_recognized —
+# these tests are about what log_face_recognized itself does with the
+# result, independent of the camera/CV pipeline.
+
+
+async def test_live_face_still_disarms(state):
+    """Regression guard: `live` defaults to True, so every call site that
+    predates the liveness check — this one included — must keep disarming
+    exactly as it did before.
+    """
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+
+    disarmed = await state.log_face_recognized("Guy Bar", live=True)
+    assert disarmed is True
+    assert state.alarm_state == AlarmState.disarmed
+
+
+async def test_a_non_live_match_does_not_disarm(state):
+    """The whole point of the feature: a recognized face that fails the
+    liveness check must not disarm, even with face-disarm enabled and the
+    system armed — the two conditions that alone would otherwise be
+    sufficient. The attempt is still recorded, distinctly from a plain
+    sighting or an actual disarm.
+    """
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+
+    disarmed = await state.log_face_recognized("Guy Bar", live=False)
+
+    assert disarmed is False
+    assert state.alarm_state == AlarmState.armed
+    assert not any("Disarmed by Face ID" in e.message for e in state.events)
+    assert any(
+        "Face recognized but liveness check failed: Guy Bar" in e.message
+        for e in state.events
+    )
+
+
+async def test_a_non_live_match_is_logged_once_not_every_frame(state):
+    """A recognized-but-not-live match is a security-relevant signal — it's
+    what a spoofing attempt looks like — so it must reach the log, but the
+    same per-person FACE_LOG_COOLDOWN that protects plain sightings from
+    the ESP32-CAM's two-frames-a-second feed has to protect this line too,
+    or a photo held up to the camera fills the log exactly the way a
+    lingering real face used to (see
+    test_a_lingering_face_is_logged_once_not_twice_a_second above).
+    """
+    await state.set_face_disarm_enabled(True)
+    await arm_now(state, ArmMode.away)
+
+    for _ in range(20):
+        await state.log_face_recognized("Guy Bar", live=False)
+
+    entries = [e for e in state.events if "liveness check failed" in e.message]
+    assert len(entries) == 1, f"expected one rate-limited entry, got {len(entries)}"
+    assert all(e.category == EventCategory.armDisarm for e in entries)
+    assert state.alarm_state == AlarmState.armed
+
+
 # ---- Entry delay -----------------------------------------------------------
 
 

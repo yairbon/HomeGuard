@@ -140,6 +140,26 @@ class LoginResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
+    """Body for /change-password — changes the single shared secret that is
+    both this app's login password and the physical keypad's disarm PIN.
+
+    These were originally two independent credentials, each with its own
+    endpoint (this one, and a since-removed /settings/keypad-pin). Unified
+    at the project owner's explicit request; see AppState.change_password
+    for the full account, including the security trade-off that merge
+    accepts — the app password used to be free-form, and now it is bound by
+    the keypad's stricter shape.
+
+    `new_password` must be 4-8 digits, the one shape a 4x4 physical keypad
+    can type, which is now the binding constraint on *both* credentials, not
+    just the keypad's. Enforced in AppState.change_password
+    (`is_valid_keypad_pin`) rather than as a Pydantic field constraint here,
+    so a violation gets a 422 with a specific reason instead of FastAPI's
+    generic body-validation error. `old_password` carries no such
+    constraint — it is whatever the previous value was, checked the same way
+    `/login` checks it.
+    """
+
     old_password: str
     new_password: str
 
@@ -195,19 +215,6 @@ class SetEmergencyNumberRequest(BaseModel):
 
 class SetPoliceCallDelayRequest(BaseModel):
     seconds: int
-
-
-class SetKeypadPinRequest(BaseModel):
-    """Body for /settings/keypad-pin — the PIN typed on the physical keypad
-    to disarm.
-
-    Not part of `FullState`, deliberately: a PIN that rode in every state
-    broadcast would be pushed to every connected client several times a
-    minute and be sitting in each one's memory. The app sets it and never
-    reads it back, the same shape as changing the login password.
-    """
-
-    pin: str
 
 
 class SetNtfyRequest(BaseModel):

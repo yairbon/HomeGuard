@@ -448,11 +448,13 @@ class HttpBackendService implements BackendService {
     _disconnect();
   }
 
-  /// Posts the old/new password pair to `/change-password`. Returns `false`
-  /// both when the backend rejects the change and when the request fails,
-  /// with the latter distinguished on [errorStream].
+  /// Posts the old/new value pair to `/change-password`, which now changes
+  /// both this app's login and the physical keypad's PIN in one call (see
+  /// [ChangePasswordResult]). Mirrors what the old, now-removed
+  /// `/settings/keypad-pin` handler used to do — same three-field response
+  /// shape, same reachability handling.
   @override
-  Future<bool> changePassword(String oldPassword, String newPassword) async {
+  Future<ChangePasswordResult> changePassword(String oldPassword, String newPassword) async {
     final res = _report(
       await _post('/change-password', {
         'old_password': oldPassword,
@@ -460,24 +462,15 @@ class HttpBackendService implements BackendService {
       }),
       'the password change',
     );
-    return res.body['ok'] as bool? ?? false;
-  }
-
-  @override
-  Future<KeypadPinResult> setKeypadPin(String pin) async {
-    final res = _report(
-      await _post('/settings/keypad-pin', {'pin': pin}),
-      'the keypad PIN change',
-    );
     if (!res.reachable) {
-      return const KeypadPinResult(ok: false, reachable: false);
+      return const ChangePasswordResult(ok: false, reachable: false);
     }
-    return KeypadPinResult(
+    return ChangePasswordResult(
       ok: res.body['ok'] as bool? ?? false,
       // Defaults matter here: a `false` that comes from a missing field
-      // would claim the board didn't take the PIN. That's the safe direction
-      // to be wrong in — it tells the user to check the keypad rather than
-      // assuring them of something unverified.
+      // would claim the board didn't take the new code. That's the safe
+      // direction to be wrong in — it tells the user to check the keypad
+      // rather than assuring them of something unverified.
       hardware: res.body['hardware'] as bool? ?? false,
       secretsUpdated: res.body['secrets_updated'] as bool? ?? false,
     );

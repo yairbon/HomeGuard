@@ -24,7 +24,7 @@ PROTECTED_ROUTES = [
     ("post", "/disarm", None),
     ("post", "/trigger-alert", {"source": "door", "reason": "x"}),
     ("post", "/logout", None),
-    ("post", "/change-password", {"old_password": PASSWORD, "new_password": "x"}),
+    ("post", "/change-password", {"old_password": PASSWORD, "new_password": "1234"}),
     ("get", "/faces", None),
     ("post", "/faces", {"name": "x"}),
     ("delete", "/faces/1", None),
@@ -37,7 +37,6 @@ PROTECTED_ROUTES = [
     ("post", "/settings/night-mode-hours", {"arm_hour": 23, "disarm_hour": 7}),
     ("post", "/settings/emergency-number", {"number": "100"}),
     ("post", "/settings/police-call-delay", {"seconds": 30}),
-    ("post", "/settings/keypad-pin", {"pin": "1913"}),
     ("post", "/settings/ntfy", {"server": "https://ntfy.sh", "topic": "x"}),
     ("post", "/settings/ntfy/test", None),
     ("post", "/debug/simulate-face-recognition", None),
@@ -212,7 +211,7 @@ async def test_password_change_revokes_other_sessions_but_not_your_own(client, a
 
     client.headers["Authorization"] = f"Bearer {first}"
     response = await client.post(
-        "/change-password", json={"old_password": PASSWORD, "new_password": "new-secret"}
+        "/change-password", json={"old_password": PASSWORD, "new_password": "24681"}
     )
     assert response.json()["ok"] is True
 
@@ -226,10 +225,19 @@ async def test_password_change_revokes_other_sessions_but_not_your_own(client, a
 async def test_change_password_enforces_the_same_lockout_as_login(auth_client, state):
     """`/change-password` used to count no attempts at all, so the 3-attempt
     lockout guarding `/login` could be sidestepped entirely by guessing the
-    old password here instead — an unthrottled password oracle."""
+    old password here instead — an unthrottled password oracle.
+
+    `new_password` here is a validly-*shaped* decoy (4 digits) on purpose: the
+    old value is checked before the new value's shape (see
+    AppState.change_password), so every one of these three attempts fails on
+    `old_password` alone, the same as it would with any new_password at all —
+    proving the lockout can't be dodged by pairing a bad guess with a
+    malformed new value that would 422 before ever reaching the attempt
+    counter.
+    """
     for i in range(3):
         response = await auth_client.post(
-            "/change-password", json={"old_password": f"guess{i}", "new_password": "x"}
+            "/change-password", json={"old_password": f"guess{i}", "new_password": "0000"}
         )
         assert response.json()["ok"] is False
 
@@ -263,12 +271,10 @@ async def test_lockout_expires(client, state, monkeypatch):
     assert (await client.post("/login", json={"password": PASSWORD})).json()["ok"] is True
 
 
-async def test_blank_new_password_is_rejected(auth_client):
-    """A whitespace-only password would leave the system effectively open."""
-    response = await auth_client.post(
-        "/change-password", json={"old_password": PASSWORD, "new_password": "   "}
-    )
-    assert response.json()["ok"] is False
+# `new_password` shape validation (blank/whitespace, wrong length, non-digit,
+# ...) lives in test_shared_credential.py's test_invalid_new_values_are_rejected
+# alongside the same checks for the keypad-PIN half of this same value — see
+# AppState.change_password.
 
 
 # ---- Password hashing ------------------------------------------------------
@@ -453,7 +459,9 @@ async def test_changing_the_password_does_not_block_the_event_loop(state, monkey
     monkeypatch.setattr(state_module, "verify_password", slow_verify)
     monkeypatch.setattr(state_module, "hash_password", slow_hash)
 
-    ok, ticks = await _count_loop_ticks_during(state.change_password(PASSWORD, "new-one"))
+    (ok, _hardware, _synced), ticks = await _count_loop_ticks_during(
+        state.change_password(PASSWORD, "13579")
+    )
 
     assert ok is True
     assert ticks >= 5, f"the loop stalled for the whole change ({ticks} ticks)"

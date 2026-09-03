@@ -53,7 +53,6 @@ from .models import (
     SetEntryDelayRequest,
     SetFaceDisarmEnabledRequest,
     SetFaceIdEnabledRequest,
-    SetKeypadPinRequest,
     SetNightModeHoursRequest,
     SetNightModeRequest,
     SetNtfyRequest,
@@ -257,16 +256,39 @@ async def logout(token: str = Depends(require_app)):
 
 @app.post("/change-password")
 async def change_password(body: ChangePasswordRequest, token: str = Depends(require_app)):
-    """Changes the login password; see AppState.change_password for the
-    validation rules and for why every *other* session is revoked.
+    """Changes the one shared secret that is both this app's login password
+    and the physical keypad's disarm PIN — see AppState.change_password for
+    the full validation rules, why every *other* session is revoked, and the
+    security trade-off accepted by merging what used to be two separate
+    credentials (this route, and a since-removed `/settings/keypad-pin`)
+    into one.
 
-    Requires a valid session as well as the old password: this route used to
-    be reachable by anyone and enforced no attempt limit, which made it an
+    Requires a valid session as well as the old value: this route used to be
+    reachable by anyone and enforced no attempt limit, which made it an
     unthrottled oracle for guessing the password that `/login`'s 3-attempt
-    lockout was supposed to protect.
+    lockout was supposed to protect. That lockout still applies here, keyed
+    off `old_password` — three wrong guesses lock the account out regardless
+    of what `new_password` looks like.
+
+    A `new_password` that isn't 4-8 digits — the one shape a physical keypad
+    can type, now the binding constraint on both credentials — is rejected
+    with 422 rather than folded into `ok: false`, so the app can tell "the
+    current value was wrong" from "that new value can never be typed on the
+    keypad" apart.
+
+    `hardware` and `secrets_updated` report the same two outcomes
+    `/settings/keypad-pin` used to (this route absorbed it): whether the
+    door controller acknowledged the new PIN, and whether
+    `esp32/.../secrets.h` was rewritten to match. Both are `False` whenever
+    `ok` is `False` — a rejected change never reaches the hardware at all.
     """
-    ok = await state.change_password(body.old_password, body.new_password, current_token=token)
-    return {"ok": ok}
+    try:
+        ok, hardware, secrets_updated = await state.change_password(
+            body.old_password, body.new_password, current_token=token
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": ok, "hardware": hardware, "secrets_updated": secrets_updated}
 
 
 # ---- Arm / disarm -------------------------------------------------------------
@@ -434,28 +456,6 @@ async def set_ntfy(body: SetNtfyRequest):
     return {"ok": True}
 
 
-@app.post("/settings/keypad-pin", dependencies=[Depends(require_app)])
-async def set_keypad_pin(body: SetKeypadPinRequest):
-    """Changes the disarm PIN on the physical keypad.
-
-    `hardware` reports whether the door controller acknowledged — the board
-    stores the PIN in NVS, so that ack is what makes the change real. False
-    means the board was unreachable and is still accepting the old PIN; the
-    new one is saved here and can be re-sent.
-
-    `secrets_updated` reports whether `esp32/.../secrets.h` was rewritten to
-    match. That file only supplies the default for a board flashed fresh, so
-    it is a safeguard against a future reflash silently restoring an old PIN,
-    not part of applying the change. It is off unless HOMEGUARD_SECRETS_H is
-    set (see backend/secrets_file.py).
-    """
-    try:
-        hardware, secrets_updated = await state.set_keypad_pin(body.pin)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"ok": True, "hardware": hardware, "secrets_updated": secrets_updated}
-
-
 @app.post("/settings/ntfy/test", dependencies=[Depends(require_app)])
 async def test_ntfy():
     """Sends a test push, so the topic can be verified before a real
@@ -576,6 +576,11 @@ async def recognize_frame(photo: UploadFile):
     face_id up against `state.faces` (not just the recognizer's own
     label map) so a face that was deleted from state, but whose trained
     photos linger for any reason, doesn't get reported as a match.
+
+    A match is also checked for liveness (`faces.is_live`) before being
+    handed to `state.log_face_recognized` — see that method's docstring —
+    so a face-disarm decision accounts for the motion heuristic, not just
+    embedding similarity.
     """
     await state.note_camera_frame()
 
@@ -612,7 +617,8 @@ async def recognize_frame(photo: UploadFile):
     if match is None:
         return {"matched": False}
 
-    await state.log_face_recognized(match.name)
+    live = faces.is_live(match.id)
+    await state.log_face_recognized(match.name, live=live)
     return {"matched": True, "face_id": match.id, "name": match.name}
 
 

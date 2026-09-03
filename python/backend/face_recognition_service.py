@@ -36,6 +36,9 @@ checkout without the ONNX files still works rather than failing outright.
 from __future__ import annotations
 
 import logging
+from collections import deque
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -66,6 +69,78 @@ MATCH_SIMILARITY_THRESHOLD = 0.363
 # which does its own landmark-based alignment.
 LBPH_FACE_SIZE = (200, 200)
 LBPH_MATCH_DISTANCE_THRESHOLD = 80.0
+
+# --- Liveness (motion-based) tuning ----------------------------------------
+# YuNet returns 5 facial landmarks with every detection — already computed
+# on every recognize() call, for alignCrop's benefit, so reusing them here
+# costs nothing extra. The idea: a live face has small, involuntary motion
+# (breathing, postural sway, a blink) even when someone is trying to hold
+# still; a printed photo or a phone screen held up to the camera does not,
+# unless it's being visibly waved around. Track a short rolling window of
+# where those 5 points sit relative to the face's own bounding box, and
+# require some minimum spread across that window before calling a match
+# "live".
+#
+# This is a first line of defense against the easy case — a flat, static
+# photo — not a real anti-spoofing system. It does nothing against a video
+# replay, and it can likely be defeated by deliberately jiggling a printed
+# photo. A stronger, model-based anti-spoofing check is tracked separately
+# as future work; this only closes the trivial case.
+LIVENESS_WINDOW = timedelta(seconds=2.5)
+LIVENESS_MIN_SAMPLES = 3
+# Minimum average landmark movement across the window, as a fraction of face
+# size (so it scales with how close the subject is to the camera). Unlike
+# MATCH_SIMILARITY_THRESHOLD above, this is *not* a published, calibrated
+# number — there is no equivalent industry constant for "how much does a
+# real face wobble in 2.5 seconds of webcam-grade landmarks". 0.008 (0.8% of
+# face size) is a starting guess from reasoning about pixel-scale jitter,
+# not measurement against real footage, and should be expected to need
+# retuning once it's actually exercised against a live camera.
+LIVENESS_JITTER_THRESHOLD = 0.008
+
+
+def is_live_landmark_sequence(
+    samples: Sequence[Sequence[tuple[float, float]]],
+    *,
+    min_samples: int = LIVENESS_MIN_SAMPLES,
+    threshold: float = LIVENESS_JITTER_THRESHOLD,
+) -> bool:
+    """Decides whether a short history of landmark positions shows enough
+    natural motion to belong to a live face rather than a static photo.
+
+    Pure and OpenCV-free by design, so it can be unit-tested against
+    hand-built coordinate arrays without decoding an actual image — see
+    test_liveness.py. `samples` is one entry per detection, in any order
+    (order doesn't matter here, only spread does); each entry is the same
+    5 (x, y) landmark positions YuNet detects, already normalized to be
+    resolution/distance-independent (see `_normalized_landmarks`) and in
+    the same landmark order from sample to sample.
+
+    Fails closed: fewer than `min_samples` returns False — "not yet
+    established as live", not "assumed live" — so a match that has only
+    been seen once or twice doesn't get the benefit of the doubt.
+
+    The verdict itself is the (max - min) range of each landmark's x and
+    its y across the window, averaged over both axes and all landmarks
+    into a single scalar, checked against `threshold`. A live face's
+    micro-movement produces a small but non-zero range; a rigidly held
+    photo produces close to none.
+    """
+    if len(samples) < min_samples:
+        return False
+
+    landmark_count = len(samples[0])
+    if landmark_count == 0 or any(len(sample) != landmark_count for sample in samples):
+        return False
+
+    per_landmark_ranges = []
+    for i in range(landmark_count):
+        xs = [sample[i][0] for sample in samples]
+        ys = [sample[i][1] for sample in samples]
+        per_landmark_ranges.append((max(xs) - min(xs)) + (max(ys) - min(ys)))
+
+    jitter = sum(per_landmark_ranges) / len(per_landmark_ranges) / 2
+    return jitter >= threshold
 
 
 class FaceRecognitionService:
@@ -186,6 +261,19 @@ class FaceRecognitionService:
         """
         return self._backend.recognize(_decode_image(image_bytes))
 
+    def is_live(self, face_id: str) -> bool:
+        """True if face_id's recent recognitions show enough landmark
+        motion to be treated as a live face rather than a static photo.
+
+        Only meaningful right after a matching `recognize()` call, since
+        that call is what feeds the window this checks — see
+        `_DnnBackend.is_live`. The LBPH fallback has no landmarks to
+        measure and always returns True (`_LbphBackend.is_live`); it's
+        already the documented lower-fidelity path, and this doesn't add
+        complexity there.
+        """
+        return self._backend.is_live(face_id)
+
     @property
     def backend_name(self) -> str:
         """Which recognition backend is active ("sface" or "lbph"), so the
@@ -199,7 +287,9 @@ class _Backend:
 
     `prepare` turns a full camera frame into the single normalized face image
     that gets stored and compared; `train` rebuilds from stored faces;
-    `recognize` maps a frame to a face_id or None.
+    `recognize` maps a frame to a face_id or None; `is_live` says whether
+    that face_id's recent matches look like a live face rather than a
+    static photo.
     """
 
     name = "base"
@@ -211,6 +301,9 @@ class _Backend:
         raise NotImplementedError
 
     def recognize(self, image: np.ndarray) -> str | None:
+        raise NotImplementedError
+
+    def is_live(self, face_id: str) -> bool:
         raise NotImplementedError
 
 
@@ -241,6 +334,11 @@ class _DnnBackend(_Backend):
         self._recognizer = cv2.FaceRecognizerSF.create(str(sface_path), "")
         # face_id -> list of embeddings, one per enrolled photo.
         self._embeddings: dict[str, list[np.ndarray]] = {}
+        # face_id -> recent (timestamp, normalized-landmarks) samples, the
+        # rolling window is_live() judges. Pruned to LIVENESS_WINDOW on every
+        # read and write (see _prune_landmark_history) rather than capped by
+        # count, since frame rate isn't guaranteed.
+        self._landmark_history: dict[str, deque[tuple[datetime, list[tuple[float, float]]]]] = {}
 
     def _detect(self, image: np.ndarray) -> np.ndarray | None:
         """Returns YuNet's row for the largest detected face, or None.
@@ -257,6 +355,20 @@ class _DnnBackend(_Backend):
         # Largest detected face — most likely the intended subject.
         return max(faces, key=lambda f: f[2] * f[3])
 
+    def _detect_and_align(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """Runs YuNet once and returns both its raw detection row (bounding
+        box + landmarks + score) and the landmark-aligned crop SFace embeds.
+
+        Factored out so `recognize()` can get at the landmarks `is_live`
+        needs without detecting a second time — `prepare()` used to run
+        `_detect` itself and hand back only the crop, which was fine as
+        long as nothing else needed the row it discarded.
+        """
+        face = self._detect(image)
+        if face is None:
+            return None
+        return face, self._recognizer.alignCrop(image, face)
+
     def prepare(self, image: np.ndarray) -> np.ndarray | None:
         """Detects and returns a landmark-aligned 112x112 BGR crop.
 
@@ -265,10 +377,8 @@ class _DnnBackend(_Backend):
         compare an enrollment photo against a camera frame taken at a
         different angle.
         """
-        face = self._detect(image)
-        if face is None:
-            return None
-        return self._recognizer.alignCrop(image, face)
+        detected = self._detect_and_align(image)
+        return None if detected is None else detected[1]
 
     def train(self, training: dict[str, list[np.ndarray]]) -> None:
         """Computes and caches an embedding for every stored face image.
@@ -298,12 +408,17 @@ class _DnnBackend(_Backend):
         Takes the best match across all enrolled photos of a person (rather
         than, say, their average) so one good frontal enrollment photo is
         enough to match, even if their other photos are poor.
+
+        A successful match also feeds this detection's landmarks into that
+        face_id's liveness window (see `is_live`), piggybacking on the
+        detection this call already had to run rather than detecting again.
         """
         if not self._embeddings:
             return None
-        aligned = self.prepare(image)
-        if aligned is None:
+        detected = self._detect_and_align(image)
+        if detected is None:
             return None
+        face_row, aligned = detected
 
         probe = self._recognizer.feature(aligned)
         best_id: str | None = None
@@ -319,7 +434,76 @@ class _DnnBackend(_Backend):
 
         if best_score < MATCH_SIMILARITY_THRESHOLD:
             return None
+        self._record_landmark_sample(best_id, face_row)
         return best_id
+
+    def _record_landmark_sample(self, face_id: str, face_row: np.ndarray) -> None:
+        """Appends this detection's normalized landmarks to face_id's
+        rolling liveness window, then prunes anything now outside
+        LIVENESS_WINDOW. A degenerate zero-size bounding box (not expected
+        in practice, but `_normalized_landmarks` would divide by it) is
+        skipped rather than recorded.
+        """
+        normalized = _normalized_landmarks(face_row)
+        if normalized is None:
+            return
+        now = datetime.now()
+        self._landmark_history.setdefault(face_id, deque()).append((now, normalized))
+        self._prune_landmark_history(face_id, now)
+
+    def _prune_landmark_history(self, face_id: str, now: datetime | None = None) -> None:
+        """Drops samples older than LIVENESS_WINDOW for face_id.
+
+        Called on every write (so a stale sample never lingers past its
+        window) and on every `is_live` read (so a face that hasn't been
+        seen in a while, then reappears, is judged on fresh samples only —
+        jitter measured seconds or minutes apart no longer describes
+        *micro*-movement).
+        """
+        history = self._landmark_history.get(face_id)
+        if not history:
+            return
+        cutoff = (now or datetime.now()) - LIVENESS_WINDOW
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def is_live(self, face_id: str) -> bool:
+        """See FaceRecognitionService.is_live. Delegates the actual
+        decision to `is_live_landmark_sequence` once the window has been
+        pruned to the current LIVENESS_WINDOW.
+        """
+        self._prune_landmark_history(face_id)
+        history = self._landmark_history.get(face_id)
+        if not history:
+            return False
+        return is_live_landmark_sequence([landmarks for _, landmarks in history])
+
+
+def _normalized_landmarks(face_row: np.ndarray) -> list[tuple[float, float]] | None:
+    """Extracts YuNet's 5 landmarks from a detection row (see
+    `_DnnBackend._detect`'s docstring for the row layout) and expresses each
+    relative to the face's own bounding box: origin at its top-left corner,
+    scaled by its width/height. Returns None for a zero-size box, which
+    normalizing against would divide by zero — not expected from a real
+    detection, but cheap to guard against.
+
+    The bounding-box-relative frame, not just the scaling, is what makes
+    this usable for liveness at all. Scaling alone would still leave the
+    *origin* at the frame's own pixel coordinates, so a printed photo
+    jiggled by hand — the whole rigid set of 5 points translating together —
+    would move exactly like the jitter this is trying to detect, since
+    translation and liveness would be indistinguishable. Landmarks expressed
+    relative to the box the detector drew around *this* frame's face
+    instead only move when the geometry *within* the face changes — a
+    blink, a small head turn — which a flat image moved to a new position
+    or distance does not do, even if the hand holding it is not perfectly
+    steady.
+    """
+    box_x, box_y, box_w, box_h = (float(v) for v in face_row[0:4])
+    if box_w <= 0 or box_h <= 0:
+        return None
+    landmarks = face_row[4:14].reshape(5, 2)
+    return [((float(lx) - box_x) / box_w, (float(ly) - box_y) / box_h) for lx, ly in landmarks]
 
 
 class _LbphBackend(_Backend):
@@ -392,6 +576,15 @@ class _LbphBackend(_Backend):
         if distance > LBPH_MATCH_DISTANCE_THRESHOLD:
             return None
         return self._label_to_face_id.get(label)
+
+    def is_live(self, face_id: str) -> bool:
+        """Always True. This fallback path has no facial landmarks to
+        measure motion from — see the module docstring's note that LBPH is
+        kept only as a lower-fidelity fallback, not developed further. A
+        liveness signal for it would need a different mechanism entirely,
+        which is out of scope for what is already the degraded path.
+        """
+        return True
 
 
 def _decode_image(image_bytes: bytes) -> np.ndarray:

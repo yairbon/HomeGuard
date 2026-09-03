@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-// For FilteringTextInputFormatter — the keypad PIN fields accept digits only.
+// For FilteringTextInputFormatter — the new-password field accepts digits
+// only, since it doubles as the physical keypad's PIN.
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
@@ -11,19 +12,23 @@ import '../widgets/homeguard_icons.dart';
 
 /// Account and system settings screen.
 ///
-/// Covers five independent areas: a night-mode toggle, emergency-contact
-/// details plus the police-call response delay, a change-password form, the
-/// physical keypad's PIN, and the backend URL. The night-mode switch and
+/// Covers five independent areas: a night-mode toggle, push notifications,
+/// emergency-contact details plus the police-call response delay, a
+/// change-password form, and the backend URL. The night-mode switch and
 /// emergency-contact fields persist to [BackendService] as soon as they
-/// change; the password and PIN forms are only submitted when the user taps
-/// their button (see [_submitPassword], [_submitKeypadPin]). The backend URL
-/// persists to local device storage via [BackendConfig] instead — see
-/// [_saveBackendUrl].
+/// change; the password form is only submitted when the user taps its
+/// button (see [_submitPassword]). The backend URL persists to local device
+/// storage via [BackendConfig] instead — see [_saveBackendUrl].
 ///
-/// The two credential forms are unrelated despite sitting next to each
-/// other: [_submitPassword] changes how you sign in to *this app*, while
-/// [_submitKeypadPin] changes the code typed on the *hardware* keypad by the
-/// door. Only the second one leaves the backend.
+/// The password form used to sit next to an unrelated second one: this
+/// app's login and the physical keypad's disarm PIN were independent
+/// credentials. The backend merged them into a single shared secret at the
+/// project owner's explicit request (see python/README.md's "Login
+/// password / keypad PIN: one shared secret" for the full rationale), so
+/// [_submitPassword] now changes both at once — how you sign in to *this
+/// app*, and the code typed on the *hardware* keypad by the door. The new
+/// value must be 4-8 digits, the one shape a physical keypad can type, even
+/// though it is now also the app's login credential.
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -40,17 +45,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _backendUrlController = TextEditingController();
   final _ntfyServerController = TextEditingController();
   final _ntfyTopicController = TextEditingController();
-  final _pinFormKey = GlobalKey<FormState>();
-  final _pinController = TextEditingController();
-  final _pinConfirmController = TextEditingController();
-
-  bool _isSubmittingPin = false;
-  String? _pinError;
-  String? _pinSuccess;
-  // Set when the PIN was saved on the backend but the door controller didn't
-  // answer. Kept apart from _pinSuccess because it is neither a success nor a
-  // failure: the change is recorded, and the keypad is still on the old PIN.
-  String? _pinWarning;
 
   bool _isSavingNtfy = false;
   String? _ntfyMessage;
@@ -58,6 +52,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _isSubmitting = false;
   String? _error;
   String? _success;
+  // Set when the new value was saved on the backend (this app can already
+  // log in with it) but the door controller didn't answer. Kept apart from
+  // _success because it is neither a success nor a failure: the change is
+  // recorded, and the physical keypad is still on the old code.
+  String? _warning;
 
   bool _nightMode = false;
   int _nightModeArmHour = 23;
@@ -206,20 +205,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _backendUrlController.dispose();
     _ntfyServerController.dispose();
     _ntfyTopicController.dispose();
-    _pinController.dispose();
-    _pinConfirmController.dispose();
     _policeCallDelay.dispose();
     super.dispose();
   }
 
-  /// Validates and submits the change-password form.
+  /// Validates and submits the merged password/keypad-PIN form.
   ///
   /// Returns early without doing anything if form validation fails (e.g.
   /// the confirmation field doesn't match). While the request is in
   /// flight, [_isSubmitting] disables the submit button and swaps its
-  /// label for a spinner so the user can't double-submit. On success the
-  /// three password fields are cleared and a success message is shown; on
-  /// failure [_error] is set instead so the reason is visible to the user.
+  /// label for a spinner so the user can't double-submit.
+  ///
+  /// Reports three outcomes rather than two, because "saved, but the board
+  /// didn't answer" is a genuinely different situation from either success
+  /// or failure: the change is recorded and will be re-sent, but until the
+  /// door controller takes it, **the keypad still opens on the old code**.
+  /// Telling the user that plainly is the whole point — a panel that says
+  /// "updated" when the hardware disagrees is worse than one that says
+  /// nothing. (This used to be [_submitKeypadPin], a separate form for a
+  /// separate credential — see the class doc for why the two merged.)
   Future<void> _submitPassword() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
 
@@ -227,23 +231,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _isSubmitting = true;
       _error = null;
       _success = null;
+      _warning = null;
     });
 
     final backend = context.read<BackendService>();
-    final ok = await backend.changePassword(_oldController.text, _newController.text);
+    final result = await backend.changePassword(_oldController.text, _newController.text);
 
     // Guard, like every other awaited handler on this screen: the user can
     // navigate away mid-request, and setState on a disposed State throws.
     if (!mounted) return;
     setState(() {
       _isSubmitting = false;
-      if (ok) {
-        _success = 'Password changed';
+      if (!result.reachable) {
+        _error = "Couldn't reach the backend — check the URL below";
+      } else if (!result.ok) {
+        _error = 'Current password is incorrect, or the new code is not 4-8 digits';
+      } else {
         _oldController.clear();
         _newController.clear();
         _confirmController.clear();
-      } else {
-        _error = 'Current password is incorrect';
+        if (result.hardware) {
+          _success = result.secretsUpdated
+              ? 'Password and keypad PIN updated, and secrets.h synced for the next flash'
+              : 'Password and keypad PIN updated';
+        } else {
+          _warning = 'App login updated, but the door controller did not answer — '
+              'the physical keypad still uses the old code. It will be sent '
+              'again when the board is back online.';
+        }
       }
     });
   }
@@ -260,51 +275,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _nightModeDisarmHour = disarmHour;
     });
     await context.read<BackendService>().setNightModeHours(armHour, disarmHour);
-  }
-
-  /// Validates and submits the keypad-PIN form.
-  ///
-  /// Reports three outcomes rather than two, because "saved, but the board
-  /// didn't answer" is a genuinely different situation from either success
-  /// or failure: the change is recorded and will be re-sent, but until the
-  /// door controller takes it, **the keypad still opens on the old PIN**.
-  /// Telling the user that plainly is the whole point — an alarm panel that
-  /// says "PIN changed" when the hardware disagrees is worse than one that
-  /// says nothing.
-  Future<void> _submitKeypadPin() async {
-    if (!(_pinFormKey.currentState?.validate() ?? false)) return;
-
-    setState(() {
-      _isSubmittingPin = true;
-      _pinError = null;
-      _pinSuccess = null;
-      _pinWarning = null;
-    });
-
-    final backend = context.read<BackendService>();
-    final result = await backend.setKeypadPin(_pinController.text);
-
-    if (!mounted) return;
-    setState(() {
-      _isSubmittingPin = false;
-      if (!result.reachable) {
-        _pinError = "Couldn't reach the backend — check the URL below";
-      } else if (!result.ok) {
-        _pinError = 'PIN must be 4-8 digits';
-      } else {
-        _pinController.clear();
-        _pinConfirmController.clear();
-        if (result.hardware) {
-          _pinSuccess = result.secretsUpdated
-              ? 'Keypad PIN updated, and secrets.h synced for the next flash'
-              : 'Keypad PIN updated on the keypad';
-        } else {
-          _pinWarning = 'Saved, but the door controller did not answer — '
-              'the keypad still uses the old PIN. It will be sent again '
-              'when the board is back online.';
-        }
-      }
-    });
   }
 
   /// Builds the settings screen.
@@ -571,8 +541,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             children: [
                               const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
                               const SizedBox(width: 10),
-                              const Text('Change password', style: TextStyle(color: AppColors.textPrimary)),
+                              const Text('Password & keypad PIN',
+                                  style: TextStyle(color: AppColors.textPrimary)),
                             ],
+                          ),
+                          const SizedBox(height: 6),
+                          const Text(
+                            'One shared code: logs into this app, and disarms at the '
+                            'physical keypad. Sent to the door controller, which '
+                            'stores it and keeps it across reboots.',
+                            style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                           ),
                           const SizedBox(height: 16),
                           TextFormField(
@@ -585,21 +563,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           TextFormField(
                             controller: _newController,
                             obscureText: true,
-                            decoration: const InputDecoration(labelText: 'New password'),
+                            keyboardType: TextInputType.number,
+                            // Digits only: the keypad's other two keys are '*'
+                            // (arm) and '#' (submit), so a code containing
+                            // anything else could never be typed on it — and
+                            // this is now also the app's login credential.
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'New password / PIN',
+                              counterText: '',
+                            ),
                             validator: (v) =>
-                                (v == null || v.length < 4) ? 'At least 4 characters' : null,
+                                (v == null || v.length < 4) ? 'At least 4 digits' : null,
                           ),
                           const SizedBox(height: 12),
                           TextFormField(
                             controller: _confirmController,
                             obscureText: true,
-                            decoration: const InputDecoration(labelText: 'Confirm new password'),
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            maxLength: 8,
+                            decoration: const InputDecoration(
+                              labelText: 'Confirm new password / PIN',
+                              counterText: '',
+                            ),
                             validator: (v) =>
-                                v != _newController.text ? 'Passwords do not match' : null,
+                                v != _newController.text ? 'Codes do not match' : null,
                           ),
                           if (_error != null) ...[
                             const SizedBox(height: 12),
                             Text(_error!, style: const TextStyle(color: AppColors.alarm)),
+                          ],
+                          if (_warning != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_warning!, style: const TextStyle(color: AppColors.transitional)),
                           ],
                           if (_success != null) ...[
                             const SizedBox(height: 12),
@@ -616,93 +614,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                       height: 20,
                                       child: CircularProgressIndicator(strokeWidth: 2),
                                     )
-                                  : const Text('UPDATE PASSWORD'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  _SectionCard(
-                    child: Form(
-                      key: _pinFormKey,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
-                              const SizedBox(width: 10),
-                              const Text('Keypad PIN', style: TextStyle(color: AppColors.textPrimary)),
-                            ],
-                          ),
-                          const SizedBox(height: 6),
-                          const Text(
-                            'The code typed on the physical keypad to disarm. '
-                            'Sent to the door controller, which stores it and '
-                            'keeps it across reboots.',
-                            style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                          ),
-                          const SizedBox(height: 16),
-                          TextFormField(
-                            controller: _pinController,
-                            obscureText: true,
-                            keyboardType: TextInputType.number,
-                            // Digits only: the keypad's other two keys are '*'
-                            // (arm) and '#' (submit), so a PIN containing
-                            // anything else could never be typed on it.
-                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                            maxLength: 8,
-                            decoration: const InputDecoration(
-                              labelText: 'New keypad PIN',
-                              counterText: '',
-                            ),
-                            validator: (v) => (v == null || v.length < 4)
-                                ? 'At least 4 digits'
-                                : null,
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: _pinConfirmController,
-                            obscureText: true,
-                            keyboardType: TextInputType.number,
-                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                            maxLength: 8,
-                            decoration: const InputDecoration(
-                              labelText: 'Confirm keypad PIN',
-                              counterText: '',
-                            ),
-                            validator: (v) =>
-                                v != _pinController.text ? 'PINs do not match' : null,
-                          ),
-                          if (_pinError != null) ...[
-                            const SizedBox(height: 12),
-                            Text(_pinError!, style: const TextStyle(color: AppColors.alarm)),
-                          ],
-                          if (_pinWarning != null) ...[
-                            const SizedBox(height: 12),
-                            Text(
-                              _pinWarning!,
-                              style: const TextStyle(color: AppColors.transitional),
-                            ),
-                          ],
-                          if (_pinSuccess != null) ...[
-                            const SizedBox(height: 12),
-                            Text(_pinSuccess!, style: const TextStyle(color: AppColors.safe)),
-                          ],
-                          const SizedBox(height: 20),
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: _isSubmittingPin ? null : _submitKeypadPin,
-                              child: _isSubmittingPin
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(strokeWidth: 2),
-                                    )
-                                  : const Text('UPDATE KEYPAD PIN'),
+                                  : const Text('UPDATE PASSWORD & PIN'),
                             ),
                           ),
                         ],

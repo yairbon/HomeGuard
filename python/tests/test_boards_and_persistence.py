@@ -159,14 +159,17 @@ async def test_password_change_survives_a_restart(client, monkeypatch, tmp_path)
     first_boot = state_module.state
 
     token = await first_boot.login(PASSWORD)
-    assert await first_boot.change_password(PASSWORD, "after-restart", current_token=token) is True
+    ok, _hardware, _synced = await first_boot.change_password(
+        PASSWORD, "13579", current_token=token
+    )
+    assert ok is True
 
     # Restart: a brand-new AppState reading the same file.
     importlib.reload(state_module)
     second_boot = state_module.state
 
     assert await second_boot.login(PASSWORD) is None, "old password should be gone"
-    assert await second_boot.login("after-restart") is not None
+    assert await second_boot.login("13579") is not None
 
 
 async def test_faces_survive_a_restart(monkeypatch, tmp_path):
