@@ -47,6 +47,23 @@ const char* BOARD_NAME = "ultrasonic";
 const int trigPin = 14;
 const int echoPin = 12;
 
+// --- חיישן כוח שני (SW-420-style, דיגיטלי) על אותו לוח ---
+// אותו רכיב בדיוק כמו esp32/vibration_sensor — לזהות פריצה בכוח (מכה,
+// ניסיון פריצה) בחלון סמוך, בלי לפרוס לוח ESP32 רביעי-וחצי רק בשבילו.
+// יושב פיזית ליד החיישן האולטרה-סוני, אז נוח יותר לחווט אותו לכאן.
+// דגל הפסיקה, ה-ISR וה-cooldown העצמאי מועתקים 1:1 מ-vibration_sensor.ino
+// (ראה שם את ההסבר המלא למה פסיקה ולא polling — צרור פולסים של החיישן
+// יכול להיות קצר ממרווח הדגימה של הלולאה הזו, בדיוק כמו שם).
+const int forcePin = 27;
+volatile bool forceLatched = false;
+
+void IRAM_ATTR onForce() {
+  forceLatched = true;
+}
+
+unsigned long lastForceReportTime = 0;
+const unsigned long FORCE_REPORT_COOLDOWN = 5000;
+
 // --- הגדרות לוגיקת זיהוי ---
 // לא const יותר: 200 הוא רק ברירת מחדל למקרה שהכיול באתחול נכשל
 // (ראה calibrateBaseline). הערך האמיתי נקבע מחדש בכל reset.
@@ -153,6 +170,13 @@ void setup() {
   Serial.begin(115200);
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
+
+  // נרשמת לפני ה-WiFi, מאותה סיבה בדיוק כמו בלוח הרעידות העצמאי: מכה
+  // שמגיעה בזמן ההתחברות (יכולה לקחת שניות) תינעל בדגל ותדווח מיד כשיש
+  // רשת, במקום פשוט להיעלם.
+  pinMode(forcePin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(forcePin), onForce, RISING);
+  lastForceReportTime = millis() - FORCE_REPORT_COOLDOWN;
 
   // התחברות ל-WiFi
   WiFi.begin(ssid, password);
@@ -311,15 +335,19 @@ void beginRequest(HTTPClient& http, const String& url) {
 // כותרת X-Device-Key היא החובה החדשה: בלעדיה הבקנד מחזיר 401. זה מה
 // שמונע ממישהו אחר ברשת לזייף דיווח פריצה (או, גרוע מכך, לזייף דיווח
 // "המערכת נוטרלה").
-void sendAlert() {
+// sensor/reason מפורמטים כבר ל-query string (אותה מוסכמה כמו הקריאה
+// היחידה שהייתה כאן קודם) — שני סוגי החיישנים על הלוח הזה חולקים את
+// אותו גוף בקשה, שונים רק באיזה sensor= הם מדווחים.
+void sendAlert(const char* sensor, const char* reason) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send alert — WiFi disconnected");
     return;
   }
 
   HTTPClient http;
-  beginRequest(http, backendUrl("/esp32/sensor-event?sensor=ultrasonic&board=ultrasonic"
-                                "&reason=Ultrasonic%20sensor%20breached"));
+  String url = backendUrl("/esp32/sensor-event?sensor=") + sensor +
+               "&board=ultrasonic&reason=" + reason;
+  beginRequest(http, url);
   http.addHeader("X-Device-Key", DEVICE_KEY);
   int httpResponseCode = http.POST("");  // גוף ריק — כל המידע ב-query string
 
@@ -396,7 +424,7 @@ void loop() {
         // במקום להתחיל להימדד רק אחרי 5 שניות של עיוורון.
         if (millis() - lastAlertTime >= ALERT_COOLDOWN) {
           Serial.println("ALARM! Confirmed intrusion.");
-          sendAlert();
+          sendAlert("ultrasonic", "Ultrasonic%20sensor%20breached");
           lastAlertTime = millis();
         }
       }
@@ -414,6 +442,19 @@ void loop() {
       Serial.printf("WARNING: %d consecutive empty readings (~%lus) — sensor looks dead.\n",
                     consecutiveZeroReadings, ZERO_FAULT_MS / 1000);
       setFault(FAULT_NO_ECHO);
+    }
+  }
+
+  // חיישן הכוח השני: אותו דפוס latch-then-consume כמו בלוח הרעידות
+  // העצמאי — קוראים ומאפסים את הדגל מיד כדי לא לאבד/לזלוג על צרור נוסף
+  // שמגיע תוך כדי הדיווח.
+  if (forceLatched) {
+    forceLatched = false;
+    Serial.println("Force sensor triggered! (window)");
+
+    if (millis() - lastForceReportTime >= FORCE_REPORT_COOLDOWN) {
+      sendAlert("vibration", "Force%20sensor%20breached%20(window)");
+      lastForceReportTime = millis();
     }
   }
 
