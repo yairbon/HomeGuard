@@ -112,6 +112,18 @@ This replaced a single `esp32_online` boolean that latched: once any board had
 ever checked in, nothing ever set it back, so a board could lose power and the
 app would keep showing it online indefinitely.
 
+### A board reporting offline may just be a stale IP
+
+A board that never got past its first HTTP request looks identical, from the
+app's side, to one that's simply offline — but the most common real cause on
+this project has been the dev machine's IP changing (WiFi DHCP reassigns it,
+including across sessions) while a board is still flashed with the old one in
+its `secrets.h`. `ip_check.py` checks every board's `secrets.h` against this
+machine's current LAN IP once, at backend startup (see `lifespan` in
+`main.py`), and logs a loud warning naming exactly which board(s) are stale
+and what to fix. It never blocks startup and stays silent for a board whose
+`secrets.h` doesn't exist yet (a fresh checkout, or CI).
+
 ## Face recognition
 
 OpenCV's own model zoo: **YuNet** for detection, **SFace** for recognition,
