@@ -39,6 +39,7 @@ from starlette.responses import StreamingResponse
 from . import esp32_client, notifier
 from .face_recognition_service import FaceRecognitionService
 from .http_clients import build_client
+from .ip_check import log_stale_board_ips
 from .models import (
     AddFaceRequest,
     ApprovedFace,
@@ -96,12 +97,14 @@ _recognizer_lock = asyncio.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Starts the board-liveness monitor once the event loop is running, and
-    stops it cleanly on shutdown.
+    """Warns about any board still configured with a stale IP (see
+    `ip_check.py`), then starts the board-liveness monitor once the event
+    loop is running, and stops it cleanly on shutdown.
 
     The monitor can't be started from `AppState.__init__` because that runs
     at import time, before there's a loop to schedule a task on.
     """
+    log_stale_board_ips()
     state.start_monitor()
     yield
     await state.stop_monitor()
