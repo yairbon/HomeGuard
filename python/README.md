@@ -184,11 +184,15 @@ lets the camera live on a different machine.
 Off by default. When enabled (Camera tab), a recognized approved face disarms
 the system — including from a sounding alarm or mid entry-delay.
 
-**This is convenience, not security.** SFace compares face embeddings and has
-no liveness detection, so a printed photo or a picture on a phone screen may
-pass. Enabling it lowers disarming from "knows the PIN or password" to "has a
-photo of a resident". The toggle says so, and every face-disarm is attributed
-in the event log.
+**This is convenience, not security.** SFace itself compares face embeddings
+only and has no notion of liveness. Two independent checks sit in front of
+it — facial-landmark motion over a short window, and a MiniFASNetV2
+anti-spoofing model — closing both the static-photo case and the
+jiggled-photo/screen-replay case either check misses alone, but neither is a
+hardened defense and the model's threshold is still best-effort. Enabling
+face-disarm lowers disarming from "knows the PIN or password" to "presented
+a face convincing enough to pass both checks". The toggle says so, and every
+face-disarm is attributed in the event log.
 
 ## Night mode and entry delay
 
@@ -214,7 +218,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 231 tests, ~105s
+.\venv\Scripts\python.exe -m pytest        # 243 tests, ~109s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 

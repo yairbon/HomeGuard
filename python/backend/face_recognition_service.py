@@ -36,6 +36,7 @@ checkout without the ONNX files still works rather than failing outright.
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -143,6 +144,105 @@ def is_live_landmark_sequence(
     return jitter >= threshold
 
 
+# --- Liveness (model-based anti-spoofing) tuning ---------------------------
+# MiniFASNetV2 (python/models/minifasnet_v2.onnx, see MINIFASNET_LICENSE) is
+# the second, independent liveness check, combined with — not substituted
+# for — the motion heuristic above (see _DnnBackend.is_live: both must
+# pass). The two fail differently, which is the point: a rigidly held
+# printed photo has near-zero landmark jitter and never gets past the
+# motion check at all, but a *jiggled* photo or a phone/screen replay has
+# enough incidental hand-tremor jitter to clear LIVENESS_JITTER_THRESHOLD —
+# exactly what got a spoof past the motion check alone in a live test
+# (see the commit that wired this in) — while still carrying the
+# texture/frequency-domain signature of a print or a screen, which is what
+# this model was trained to see instead of motion.
+#
+# This model's contract, established by introspecting the ONNX graph
+# directly rather than trusting generic MiniFASNetV2 docs (there is no
+# first-party spec for this specific conversion — see the commit that
+# added the file for its provenance as a third-party export):
+#   - input: float32 NCHW (1, 3, 80, 80) — one 80x80 crop.
+#   - output: float32 (1, 3) — *raw logits*, not softmax. The graph's last
+#     op is a bare MatMul straight into the output tensor with nothing
+#     after it, so softmax has to happen on this side of the boundary
+#     (see is_live_spoof_logits).
+#   - which of the 3 output classes means "real" isn't recoverable from the
+#     graph at all — it's a training-time label convention, not a tensor
+#     shape. Verified empirically instead: this checkout's own already-
+#     enrolled face crops (python/faces/*/0.png, real people, not spoofs)
+#     both score above 0.97 on class index 1 when fed as raw BGR float32 in
+#     [0, 255] — no /255 normalization, the same convention this file
+#     already uses feeding SFace — and do *not* score that way under
+#     [0, 1]-normalized input, which instead produces near-identical output
+#     whether fed as BGR or RGB, a strong tell that that variant sits
+#     outside the model's trained input distribution rather than that it's
+#     making a considered call. Index 1 = real also matches
+#     minivision-ai/Silent-Face-Anti-Spoofing's own published convention
+#     (label 1 = real; {0, 2} = print/replay attack), which is a strong
+#     second signal this conversion preserved the original label order.
+ANTI_SPOOF_INPUT_SIZE = (80, 80)
+ANTI_SPOOF_REAL_CLASS_INDEX = 1
+# Softmax probability of ANTI_SPOOF_REAL_CLASS_INDEX a crop must clear to
+# count as real. Comfortably below the >0.97 this project's own enrollment
+# photos scored (see above) to leave margin for the production crop being
+# wider and background-inclusive (see ANTI_SPOOF_CROP_SCALE) rather than
+# the tight enrollment crop this was measured against, and for ordinary
+# camera/lighting variation — but still above 0.5, which (see
+# is_live_spoof_logits) is what makes clearing this threshold also
+# guarantee "real" is the single winning class rather than merely having
+# cleared some floor while a spoof class still scored higher. Like
+# LIVENESS_JITTER_THRESHOLD above, this is a starting estimate reasoned
+# from the numbers above, not a published constant, and should be expected
+# to need retuning once it's actually exercised against a real spoofing
+# attempt rather than only genuine faces.
+ANTI_SPOOF_REAL_THRESHOLD = 0.6
+# How far to expand YuNet's face box before handing it to the model, as a
+# multiple of the box's longer side. Unlike SFace's tight alignCrop, this
+# family of models is trained to look at what *surrounds* the face — a
+# photo's paper edge, a phone's bezel, screen glare — which a tight crop
+# would discard along with the evidence of a spoof (see expand_face_box).
+# This number is this project's best-effort match to
+# "4_0_0_80x80_MiniFASNetV2", the checkpoint name this architecture is
+# paired with in the original repo's own two-model ensemble — the actual
+# crop algorithm used at training time isn't recoverable from the ONNX file
+# (it's a preprocessing choice, not part of the graph), and this
+# conversion's provenance doesn't document it either. If this model needs
+# retuning once exercised against a real spoofing attempt, this crop scale
+# is a more likely culprit than ANTI_SPOOF_REAL_THRESHOLD above, which at
+# least rests on a measurement against real photos.
+ANTI_SPOOF_CROP_SCALE = 4.0
+
+
+def is_live_spoof_logits(
+    logits: Sequence[float],
+    *,
+    threshold: float = ANTI_SPOOF_REAL_THRESHOLD,
+) -> bool:
+    """Decides whether MiniFASNetV2's raw 3-class output for one face crop
+    looks like a real face rather than a print/replay spoof.
+
+    Pure and model-free by design, mirroring is_live_landmark_sequence
+    above — see test_liveness.py. `logits` is the *un-softmaxed* output
+    _DnnBackend reads back from the ONNX graph's own final layer — see the
+    tuning comment above for why softmax isn't baked into the graph.
+
+    Fails closed: anything other than exactly 3 logits returns False
+    rather than guessing at a differently-shaped output.
+
+    `threshold` is compared against the softmax probability of
+    ANTI_SPOOF_REAL_CLASS_INDEX, not a raw logit — logit magnitudes drift
+    with lighting/framing in a way a probability doesn't. See
+    ANTI_SPOOF_REAL_THRESHOLD's own comment for why clearing it also
+    guarantees "real" is the winning class, not just above some floor.
+    """
+    if len(logits) != 3:
+        return False
+    largest = max(logits)
+    exp_values = [math.exp(value - largest) for value in logits]
+    probability_real = exp_values[ANTI_SPOOF_REAL_CLASS_INDEX] / sum(exp_values)
+    return probability_real >= threshold
+
+
 class FaceRecognitionService:
     """Owns the on-disk training photos (one folder per face_id under
     `faces_dir`) and the recognizer built from them. One instance is created
@@ -167,9 +267,16 @@ class FaceRecognitionService:
         yunet = models_dir / "yunet.onnx"
         sface = models_dir / "sface.onnx"
         cascade = models_dir / "haarcascade_frontalface_default.xml"
+        # Not required the way yunet/sface are — see _DnnBackend.__init__ —
+        # because it strengthens face-disarm's liveness check rather than
+        # being load-bearing for detection/recognition itself; a checkout
+        # missing just this file should still recognize faces, just with
+        # face-disarm's model-based check failing closed rather than the
+        # whole service refusing to start.
+        antispoof = models_dir / "minifasnet_v2.onnx"
 
         if yunet.exists() and sface.exists():
-            self._backend: _Backend = _DnnBackend(yunet, sface)
+            self._backend: _Backend = _DnnBackend(yunet, sface, antispoof)
         elif cascade.exists():
             logger.warning(
                 "yunet.onnx/sface.onnx not found in %s — falling back to the legacy "
@@ -319,7 +426,7 @@ class _DnnBackend(_Backend):
 
     name = "sface"
 
-    def __init__(self, yunet_path: Path, sface_path: Path):
+    def __init__(self, yunet_path: Path, sface_path: Path, antispoof_path: Path):
         # Input size is a placeholder — `setInputSize` is called per frame in
         # `_detect`, because YuNet needs the exact dimensions of the image
         # it's about to see and camera frames aren't all one size.
@@ -332,6 +439,23 @@ class _DnnBackend(_Backend):
             DETECT_TOP_K,
         )
         self._recognizer = cv2.FaceRecognizerSF.create(str(sface_path), "")
+        if antispoof_path.exists():
+            self._antispoof: cv2.dnn.Net | None = cv2.dnn.readNetFromONNX(str(antispoof_path))
+        else:
+            # Fails closed, not open: is_live() below treats "no model
+            # loaded" the same as "model said spoof", not "skip this check
+            # and fall back to the motion check alone" — a face-disarm that
+            # silently downgraded its own security bar because a file went
+            # missing would be worse than one that stops disarming at all
+            # until the file is restored.
+            logger.warning(
+                "minifasnet_v2.onnx not found in %s — face-disarm's model-based "
+                "anti-spoofing check will fail closed (never live), so a recognized "
+                "face can no longer disarm at all until this file is restored. See "
+                "python/README.md.",
+                antispoof_path.parent,
+            )
+            self._antispoof = None
         # face_id -> list of embeddings, one per enrolled photo.
         self._embeddings: dict[str, list[np.ndarray]] = {}
         # face_id -> recent (timestamp, normalized-landmarks) samples, the
@@ -339,6 +463,13 @@ class _DnnBackend(_Backend):
         # read and write (see _prune_landmark_history) rather than capped by
         # count, since frame rate isn't guaranteed.
         self._landmark_history: dict[str, deque[tuple[datetime, list[tuple[float, float]]]]] = {}
+        # face_id -> whether the *most recent* recognize() match for that id
+        # looked real to MiniFASNetV2. Unlike landmark history this needs no
+        # window/deque: it's a single-frame classification, not a sequence
+        # one, and is_live() is only ever called immediately after a
+        # recognize() call that just matched this exact id (see main.py's
+        # recognize_frame), so "most recent" is always "from this request".
+        self._spoof_verdicts: dict[str, bool] = {}
 
     def _detect(self, image: np.ndarray) -> np.ndarray | None:
         """Returns YuNet's row for the largest detected face, or None.
@@ -410,8 +541,10 @@ class _DnnBackend(_Backend):
         enough to match, even if their other photos are poor.
 
         A successful match also feeds this detection's landmarks into that
-        face_id's liveness window (see `is_live`), piggybacking on the
-        detection this call already had to run rather than detecting again.
+        face_id's liveness window (see `is_live`) and runs the model-based
+        anti-spoofing check against this same frame (see `_is_real_face`),
+        both piggybacking on the detection this call already had to run
+        rather than detecting a second time.
         """
         if not self._embeddings:
             return None
@@ -435,6 +568,7 @@ class _DnnBackend(_Backend):
         if best_score < MATCH_SIMILARITY_THRESHOLD:
             return None
         self._record_landmark_sample(best_id, face_row)
+        self._spoof_verdicts[best_id] = self._is_real_face(image, face_row)
         return best_id
 
     def _record_landmark_sample(self, face_id: str, face_row: np.ndarray) -> None:
@@ -467,16 +601,69 @@ class _DnnBackend(_Backend):
         while history and history[0][0] < cutoff:
             history.popleft()
 
+    def _is_real_face(self, image: np.ndarray, face_row: np.ndarray) -> bool:
+        """Runs MiniFASNetV2 on the region `face_row` describes within
+        `image` and returns whether it looks like a real face rather than a
+        print/replay spoof — see the ANTI_SPOOF_* tuning comment above
+        `is_live_spoof_logits` for the model's input/output contract and
+        why the crop is wider than the face itself.
+
+        Fails closed: no loaded model (see __init__), a degenerate crop, or
+        any error out of the forward pass itself all return False — the
+        same posture as `is_live_landmark_sequence` returning False on too
+        few samples. An infrastructure problem here must never be mistaken
+        for "didn't check, so assume real".
+        """
+        if self._antispoof is None:
+            return False
+        height, width = image.shape[:2]
+        box = tuple(float(v) for v in face_row[0:4])
+        left, top, right, bottom = expand_face_box(box, (width, height), ANTI_SPOOF_CROP_SCALE)
+        if right <= left or bottom <= top:
+            return False
+        crop = image[top:bottom, left:right]
+        try:
+            # scalefactor=1.0 and no mean subtraction: this conversion
+            # expects raw [0, 255] BGR floats, not the [0, 1]-normalized
+            # convention a PyTorch `ToTensor()` export usually implies —
+            # established empirically, not assumed; see the tuning comment
+            # above ANTI_SPOOF_INPUT_SIZE for how.
+            blob = cv2.dnn.blobFromImage(
+                crop,
+                scalefactor=1.0,
+                size=ANTI_SPOOF_INPUT_SIZE,
+                mean=(0, 0, 0),
+                swapRB=False,
+            )
+            self._antispoof.setInput(blob)
+            logits = self._antispoof.forward()[0]
+        except cv2.error:
+            logger.warning("MiniFASNetV2 forward pass failed on a face crop.", exc_info=True)
+            return False
+        return is_live_spoof_logits([float(v) for v in logits])
+
     def is_live(self, face_id: str) -> bool:
-        """See FaceRecognitionService.is_live. Delegates the actual
-        decision to `is_live_landmark_sequence` once the window has been
-        pruned to the current LIVENESS_WINDOW.
+        """See FaceRecognitionService.is_live. True only if *both*
+        independent checks agree: `is_live_landmark_sequence` over the
+        pruned LIVENESS_WINDOW of recent landmark samples, and this face
+        id's most recent MiniFASNetV2 verdict (see `_is_real_face`, run
+        once per matching frame from `recognize`). Defense in depth, not
+        redundancy — see the ANTI_SPOOF_* tuning comment for what each one
+        catches that the other doesn't.
+
+        Short-circuits on the motion check first: it's a dict/deque lookup
+        against already-computed numbers, versus a cached result of a CNN
+        forward pass that already ran in `recognize` — cheaper, and no
+        reason to even consult the spoof verdict for a face with no fresh
+        motion history at all.
         """
         self._prune_landmark_history(face_id)
         history = self._landmark_history.get(face_id)
         if not history:
             return False
-        return is_live_landmark_sequence([landmarks for _, landmarks in history])
+        if not is_live_landmark_sequence([landmarks for _, landmarks in history]):
+            return False
+        return self._spoof_verdicts.get(face_id, False)
 
 
 def _normalized_landmarks(face_row: np.ndarray) -> list[tuple[float, float]] | None:
@@ -504,6 +691,47 @@ def _normalized_landmarks(face_row: np.ndarray) -> list[tuple[float, float]] | N
         return None
     landmarks = face_row[4:14].reshape(5, 2)
     return [((float(lx) - box_x) / box_w, (float(ly) - box_y) / box_h) for lx, ly in landmarks]
+
+
+def expand_face_box(
+    box: tuple[float, float, float, float],
+    image_size: tuple[int, int],
+    scale: float,
+) -> tuple[int, int, int, int]:
+    """Expands a YuNet (x, y, w, h) face box to a square `scale` times the
+    length of its longer side, centered on the same point as the original
+    box, and clamped to stay inside an image of `image_size` = (width,
+    height) — by shifting the box back into frame first and only shrinking
+    it as a last resort, so a face near an edge still gets a full-size, if
+    off-center, crop rather than a smaller and stretched one.
+
+    Pure and OpenCV-free, like `is_live_landmark_sequence` and
+    `is_live_spoof_logits` above — see test_liveness.py. Returns (left,
+    top, right, bottom) pixel bounds; callers must still check for a
+    degenerate (zero-area) result, which happens if `box` itself has zero
+    width or height.
+    """
+    x, y, w, h = box
+    width, height = image_size
+    center_x, center_y = x + w / 2, y + h / 2
+    # Can't ask for a crop bigger than the frame itself.
+    side = min(max(w, h) * scale, width, height)
+    half = side / 2
+    left, top = center_x - half, center_y - half
+    right, bottom = center_x + half, center_y + half
+    if left < 0:
+        right -= left
+        left = 0.0
+    if top < 0:
+        bottom -= top
+        top = 0.0
+    if right > width:
+        left -= right - width
+        right = float(width)
+    if bottom > height:
+        top -= bottom - height
+        bottom = float(height)
+    return int(left), int(top), int(right), int(bottom)
 
 
 class _LbphBackend(_Backend):

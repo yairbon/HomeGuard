@@ -1394,6 +1394,16 @@ class AppState:
         # event log reads in cause-then-effect order.
         self._log(f"Disarmed by Face ID: {name}", EventCategory.armDisarm)
         await self.disarm()
+
+        # Same local-state-then-hardware-command pattern as the /disarm
+        # route (main.py) — without this, a face disarm only ever flipped
+        # the software state: the app showed disarmed over the WebSocket
+        # broadcast above, but the door controller was never told, so its
+        # buzzer/lock kept running. Deferred import: esp32_client imports
+        # `state` at module level, so importing it up top would be circular.
+        from . import esp32_client
+
+        await esp32_client.send_disarm()
         return True
 
     async def set_face_disarm_enabled(self, enabled: bool) -> None:

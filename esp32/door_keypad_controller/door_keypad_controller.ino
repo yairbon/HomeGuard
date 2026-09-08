@@ -233,6 +233,8 @@ void setup() {
   // Ensure buzzers are quiet on boot
   silenceBuzzers();
 
+  loadKeypadPin();
+
   // Get initial door state
   lastDoorState = digitalRead(DOOR_SENSOR_PIN);
   isDoorOpen = (lastDoorState == HIGH); // HIGH means magnet is removed (open)

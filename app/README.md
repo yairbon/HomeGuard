@@ -1,17 +1,14 @@
-# homeguard_app
+# HomeGuard app
 
-A new Flutter project.
+Flutter client for HomeGuard (Android only — package
+`com.homeguard.homeguard_app`). Talks to the FastAPI backend in `python/`
+over REST and a `/ws` WebSocket.
 
-## Getting Started
+This is not a standalone project — see the repo root for everything that
+matters:
 
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- [`../README.md`](../README.md) — architecture, security model, running the
+  full system, test matrix
+- [`../CLAUDE.md`](../CLAUDE.md) — build environment (native Windows Gradle
+  builds are broken on the dev machine; build through WSL2 or
+  `/flutter-build`/`/flutter-run`), known gotchas
