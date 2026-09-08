@@ -125,8 +125,14 @@ jobs:
           key: arduino-esp32-3.3.11
 
       - name: Install the esp32 core
+        # --overwrite: ~/.arduino15 is both the cache path above *and* where
+        # `config init` writes arduino-cli.yaml, so a cache hit means that
+        # file already exists on every run after the first. Without this
+        # flag, config init refuses to touch it and the step fails outright
+        # -- core update-index/install are already idempotent against a
+        # cache hit, only this line wasn't.
         run: |
-          arduino-cli config init --additional-urls \
+          arduino-cli config init --overwrite --additional-urls \
             https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.11

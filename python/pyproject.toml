@@ -51,4 +51,15 @@ filterwarnings = [
     # warning is not the file it is written in. Drop this line when those
     # tests move off TestClient, or when httpx2 lands.
     "default::starlette.exceptions.StarletteDeprecationWarning",
+    # 2026-09: a newer (unpinned, transitive) anyio started warning that its
+    # own anyio.abc.BlockingPortal alias is deprecated -- raised at import
+    # time from inside starlette/testclient.py itself (a module-level type
+    # alias referencing it), which is what the same two websocket tests
+    # above import. Matched by message rather than category for the same
+    # reason class-matching isn't used above either: DeprecationWarning is
+    # the general policy's own target class, so filtering the whole class
+    # would silently swallow a real one from HomeGuard's own code too.
+    # Nothing here uses BlockingPortal directly -- drop this once anyio or
+    # starlette resolve it upstream, or alongside the httpx2 migration above.
+    "default:The anyio\\.abc\\.BlockingPortal alias is deprecated:DeprecationWarning",
 ]
