@@ -207,10 +207,11 @@ async def test_arm_reports_whether_hardware_acknowledged(auth_client):
 
 
 async def test_state_shape_matches_the_flutter_client(auth_client):
-    """`backend/models.py` mirrors `app/lib/services/backend_service.dart`
-    field-for-field. A field renamed on one side and not the other is a
-    runtime crash in the app's JSON decoding, not a compile error — so the
-    contract is pinned here.
+    """`backend/models.py` mirrors `app/lib/services/http_backend_service.dart`
+    field-for-field (the abstract `backend_service.dart` has no wire keys of
+    its own). A field renamed on one side and not the other is a runtime
+    crash in the app's JSON decoding, not a compile error — so the contract
+    is pinned here.
     """
     body = (await auth_client.get("/state")).json()
     assert set(body) == {

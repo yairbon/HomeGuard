@@ -725,8 +725,6 @@ class _SettingsLoadFailed extends StatelessWidget {
   }
 }
 
-/// Rounded, padded surface used to visually group each settings section
-/// (night mode, emergency contact, change password) on the screen.
 /// A 0-23 hour dropdown. Whole hours only, matching the backend's scheduler,
 /// which evaluates on the hour boundary — offering minutes would imply a
 /// precision `_night_mode_tick` doesn't have.
@@ -761,6 +759,8 @@ class _HourPicker extends StatelessWidget {
   }
 }
 
+/// Rounded, padded surface used to visually group each settings section
+/// (night mode, emergency contact, change password) on the screen.
 class _SectionCard extends StatelessWidget {
   const _SectionCard({required this.child});
 

@@ -13,6 +13,10 @@ folder name to match the `.ino` filename — already set up that way).
 Boards 1 and 2 are simple: they detect a breach and POST it to the
 backend. They don't know or care whether the system is armed — the
 backend decides that (see `python/backend/state.py`, `trigger_alert`).
+Board 1 also carries a second SW-420-style force sensor (same component as
+board 2) wired straight onto it for a nearby window, so it reports both
+`sensor=ultrasonic` and `sensor=vibration` (both tagged `board=ultrasonic`)
+rather than needing a fourth-and-a-half board just for one more sensor.
 
 Board 3 is different: it owns arm/disarm (it has the keypad), so it both
 sends reports to the backend *and* receives commands from it (the app's
@@ -54,7 +58,7 @@ What goes in it:
 | `WIFI_SSID` / `WIFI_PASSWORD` | your network |
 | `BACKEND_HOST` | `ipconfig` on the machine running the backend, same WiFi as the boards |
 | `DEVICE_KEY` | printed by the backend at startup, or set via `HOMEGUARD_DEVICE_KEY` |
-| `KEYPAD_PIN` | your choice; only the door controller uses it |
+| `KEYPAD_PIN` | your choice; only the door controller uses it — and only as the **factory default** for a board whose NVS has never been written (see below) |
 
 ### The device key
 
@@ -86,6 +90,14 @@ $env:HOMEGUARD_DOOR_CONTROLLER_URL = "http://<that IP>"
 Without this, the app's arm/disarm buttons still work (the backend
 simulates the timing itself), they just won't reach real hardware.
 
+### Changing the PIN after flashing
+
+The disarm PIN set in `secrets.h` only ever applies to a board whose NVS
+(flash) has never stored one. Once the app changes the password (Settings),
+the new PIN is pushed to the door controller's `/keypad-pin` route and
+persisted in NVS, and it survives power loss and reboots from then on —
+reflashing the board with an old `secrets.h` will not revert it.
+
 ## Testing the keypad without physical wiring
 
 The keypad is currently simulated through the Serial Monitor —
@@ -101,7 +113,10 @@ using the name the backend knows it by (`ultrasonic`, `vibration`,
 `door_controller` — see `BOARD_NAMES` in `python/backend/state.py`). The
 backend marks a board offline after 30 seconds of silence and the app names it
 on the dashboard, so a board that loses power is visible rather than silently
-uncovered.
+uncovered. The ultrasonic board's heartbeat can also carry an optional
+`&fault=` (e.g. `baseline_rejected`, `baseline_moved`, `no_echo`) when its
+last distance-calibration attempt didn't go cleanly — see the baseline
+sanity-check comments in `ultrasonic_sensor.ino`.
 
 The camera board (4) is the exception: it sends no heartbeat, because its
 frame pushes already are one. Every `/camera/recognize` POST calls

@@ -1,7 +1,8 @@
-"""Pydantic models. These mirror the Flutter app's BackendService types
-(app/lib/services/backend_service.dart) field-for-field and name-for-name
-so the two sides stay in lockstep — if you rename something here, rename it
-there too.
+"""Pydantic models. These mirror the Flutter app's wire types in
+app/lib/services/http_backend_service.dart (not the abstract
+backend_service.dart, which contains no wire keys) field-for-field and
+name-for-name so the two sides stay in lockstep — if you rename something
+here, rename it there too.
 """
 
 from __future__ import annotations
@@ -269,8 +270,9 @@ class FullState(BaseModel):
     boards: list[BoardStatus]
     camera_online: bool
     face_id_enabled: bool
-    # Whether a recognized face disarms the system. Off by default — SFace has
-    # no liveness detection, so this is convenience, not security.
+    # Whether a recognized face disarms the system. Off by default — even
+    # with the landmark-motion + anti-spoofing liveness checks, this stays
+    # convenience, not security.
     face_disarm_enabled: bool
     night_mode: bool
     # Whole hours (0-23) at which night mode arms and disarms.
