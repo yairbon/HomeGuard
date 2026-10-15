@@ -49,7 +49,7 @@
 
 הפתרון המוצע מבוסס על ארבעה בקרי ESP32 נפרדים: בקר חיישן אולטרה-סוני (HC-SR04) לניטור היקפי, בקר חיישן רעידות (SW-420) לזיהוי ניסיון פריצה בכוח, בקר דלת הכולל חיישן מגנטי (MC-38), קודן מטריצה 3x4 ושני זמזמים, המשמש כסמכות הבלעדית לדריכה ולנטרול, ובקר ESP32-CAM המזרים וידאו וקולט פריימים לזיהוי פנים. הבקרים מדווחים באמצעות HTTP לבקנד המבוסס FastAPI, המממש מכונת מצבים (Disarmed, Transitional, Armed, Entry Delay, Triggered), מזהה פנים באמצעות המודלים YuNet ו-SFace של ספריית OpenCV, ומשרת אפליקציית Flutter באמצעות REST ו-WebSocket. אבטחת המערכת נשענת על אימות דו-צדדי (אסימון סשן לאפליקציה ומפתח מכשיר ללוחות), שמירת סיסמה כ-hash מסוג scrypt, ונעילה לאחר שלושה ניסיונות שגויים. התראות מגיעות גם כשהאפליקציה סגורה באמצעות שירות ntfy, והגישה מרחוק מתבצעת דרך רשת פרטית מוצפנת (Tailscale).
 
-כל דרישות ה-Must (זיהוי חדירה או פריצה בכוח, נטרול באמצעות קודן פיזי ואזעקה קולית) ודרישות ה-Nice-to-have (זיהוי פנים, יומן אירועים בזמן אמת ושינוי סיסמה מהאפליקציה) מומשו. המערכת נבדקה על חומרה אמיתית בכל ארבעת הבקרים, וכן באמצעות 222 בדיקות אוטומטיות פנימיות ו-96 בדיקות מקצה לקצה מול שרת חי. במסגרת הדוח מוצגות גם מגבלות המערכת: SFace עצמו אינו מזהה חיות, ולפיכך נוספו בקנד שתי בדיקות חיות (תנועת נקודות ציון בפנים ומודל MiniFASNetV2), אך ספי ההחלטה שלהן הם הערכות ראשוניות שטרם כוילו מול ניסיונות הונאה אמיתיים. מסיבה זו נטרול לפי פנים כבוי כברירת מחדל ומוגדר כנוחות ולא כמנגנון אבטחה.
+כל דרישות ה-Must (זיהוי חדירה או פריצה בכוח, נטרול באמצעות קודן פיזי ואזעקה קולית) ודרישות ה-Nice-to-have (זיהוי פנים, יומן אירועים בזמן אמת ושינוי סיסמה מהאפליקציה) מומשו. המערכת נבדקה על חומרה אמיתית בכל ארבעת הבקרים, וכן באמצעות 258 בדיקות אוטומטיות פנימיות ו-98 בדיקות מקצה לקצה מול שרת חי, שכולן עברו. במסגרת הדוח מוצגות גם מגבלות המערכת: SFace עצמו אינו מזהה חיות, ולפיכך נוספו בקנד שתי בדיקות חיות (תנועת נקודות ציון בפנים ומודל MiniFASNetV2), אך ספי ההחלטה שלהן הם הערכות ראשוניות שטרם כוילו מול ניסיונות הונאה אמיתיים. מסיבה זו נטרול לפי פנים כבוי כברירת מחדל ומוגדר כנוחות ולא כמנגנון אבטחה.
 
 **מילות מפתח:** ESP32, מערכת אבטחה, מחשוב קצה, זיהוי פנים, FastAPI, Flutter, מכונת מצבים, IoT.
 
@@ -137,7 +137,7 @@
 
 ### 2.7 מבנה הדוח
 
-הדוח בנוי כך: פרק 3 מציג את הרקע התיאורטי והטכנולוגי ואת סקירת החלופות. פרק 4 מתאר את רכיבי המערכת, האלגוריתמים וזרימת הנתונים, ופרק 5 את מהלך הפיתוח והאתגרים. פרק 6 מציג את תוצאות הבדיקות וניתוחן, ופרק 7 מסכם ומציע כיווני המשך. בסוף הדוח מובאים רשימת המקורות והנספחים (קוד, BOM ותרשימי חיבור).
+הדוח בנוי כך: פרק 3 מציג את הרקע התיאורטי והטכנולוגי ואת סקירת החלופות. פרק 4 מתאר את תכנון המערכת ומימושה: ארכיטקטורה, רכיבי חומרה, קושחה, בקנד ואפליקציה. פרק 5 מציג את הבדיקות, הניסויים והתוצאות, ופרק 6 מסכם, תוך הצגת האתגרים והפתרונות, מגבלות הפרויקט וכיווני המשך. פרק 7 הוא רשימת המקורות, ופרק 8 הנספחים (רשימת חומרים BOM ומבנה הקבצים המצורפים).
 
 > **⚠️ תזכורת: [הכנס כאן קישור לווידאו המציג את המערכת עובדת]**
 >
@@ -241,40 +241,4 @@ Flutter היא מסגרת של Google לפיתוח ממשקי משתמש בשפ�
 
 ---
 
-## רשימת מקורות (חלקית — תאוחד לרשימה הסופית בסוף הדוח)
-
-[1] Espressif Systems, "ESP32 Series Datasheet," Espressif Systems, Shanghai, China. [Online]. Available: https://www.espressif.com/sites/default/files/documentation/esp32_datasheet_en.pdf. Accessed: *[תאריך]*.
-
-[2] Elec Freaks, "Ultrasonic Ranging Module HC-SR04," datasheet. [Online]. Available: https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf. Accessed: *[תאריך]*.
-
-[3] Texas Instruments, "LM393 Dual Differential Comparator," datasheet. [Online]. Available: https://www.ti.com/product/LM393. Accessed: *[תאריך]*.
-
-[4] Arduino Playground, "Keypad Library." [Online]. Available: https://playground.arduino.cc/Code/Keypad/. Accessed: *[תאריך]*.
-
-[5] R. T. Fielding, "Architectural styles and the design of network-based software architectures," Ph.D. dissertation, Univ. California, Irvine, CA, USA, 2000.
-
-[6] I. Fette and A. Melnikov, "The WebSocket Protocol," IETF, RFC 6455, Dec. 2011.
-
-[7] Espressif Systems, "HTTP Server," ESP-IDF Programming Guide. [Online]. Available: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/protocols/esp_http_server.html. Accessed: *[תאריך]*.
-
-[8] S. Ramírez, "FastAPI Documentation." [Online]. Available: https://fastapi.tiangolo.com/. Accessed: *[תאריך]*.
-
-[9] P. Viola and M. Jones, "Rapid object detection using a boosted cascade of simple features," in *Proc. IEEE Conf. Comput. Vis. Pattern Recognit. (CVPR)*, Kauai, HI, USA, 2001, pp. I-511–I-518.
-
-[10] W. Wu, H. Peng, and S. Yu, "YuNet: A tiny millisecond-level face detector," *Mach. Intell. Res.*, vol. 20, pp. 656–665, 2023.
-
-[11] Y. Zhong, W. Deng, J. Hu, D. Zhao, X. Li, and D. Wen, "SFace: Sigmoid-constrained hypersphere loss for robust face recognition," *IEEE Trans. Image Process.*, vol. 30, pp. 2587–2598, 2021.
-
-[12] OpenCV, "DNN-based Face Detection And Recognition," OpenCV Documentation. [Online]. Available: https://docs.opencv.org/4.x/d0/dd4/tutorial_dnn_face.html. Accessed: *[תאריך]*.
-
-[13] C. Percival and S. Josefsson, "The scrypt Password-Based Key Derivation Function," IETF, RFC 7914, Aug. 2016.
-
-[14] J. A. Donenfeld, "WireGuard: Next generation kernel network tunnel," in *Proc. Netw. Distrib. Syst. Secur. Symp. (NDSS)*, San Diego, CA, USA, 2017.
-
-[15] Tailscale, "How Tailscale works." [Online]. Available: https://tailscale.com/blog/how-tailscale-works. Accessed: *[תאריך]*.
-
-[16] ntfy, "ntfy Documentation." [Online]. Available: https://docs.ntfy.sh/. Accessed: *[תאריך]*.
-
-[17] Google, "Flutter Documentation." [Online]. Available: https://docs.flutter.dev/. Accessed: *[תאריך]*.
-
-[18] Minivision AI, "Silent-Face-Anti-Spoofing," GitHub repository. [Online]. Available: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing. Accessed: *[תאריך]*.
+*(הרשימה המלאה והמאוחדת של כל המקורות מופיעה בפרק 7 בקובץ `03_tests_summary_bom_refs.md`.)*

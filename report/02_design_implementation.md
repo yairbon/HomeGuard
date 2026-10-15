@@ -364,10 +364,10 @@ $$J = \frac{1}{2N}\sum_{i=1}^{N}\Big[(\max x_i - \min x_i) + (\max y_i - \min y_
 
 הבקנד נבדק בשתי חבילות משלימות:
 
-- **`pytest`** — בדיקות פנימיות מול אפליקציית ה-ASGI דרך `httpx.ASGITransport`, ללא שרת, ללא פורטים וללא המתנות אמיתיות (פקיעת נעילה ו-Heartbeat מיושן נבדקים על ידי הזזת חותמות זמן). כל בדיקה מקבלת מצב נקי. מספר הבדיקות כ-222.
-- **`simulate.py`** — 96 בדיקות מול שרת `uvicorn` אמיתי דרך סוקט אמיתי, כולל המתנה של 30 שניות לפקיעת נעילה ועוד 35 שניות לפקיעת Heartbeat. איטית, אך בודקת גם את שרת ה-ASGI ואת ה-WebSocket.
+- **`pytest`** — בדיקות פנימיות מול אפליקציית ה-ASGI דרך `httpx.ASGITransport`, ללא שרת, ללא פורטים וללא המתנות אמיתיות (פקיעת נעילה ו-Heartbeat מיושן נבדקים על ידי הזזת חותמות זמן). כל בדיקה מקבלת מצב נקי. מספר הבדיקות הנוכחי: 258.
+- **`simulate.py`** — 98 בדיקות מול שרת `uvicorn` אמיתי דרך סוקט אמיתי, כולל המתנה של 30 שניות לפקיעת נעילה ועוד 35 שניות לפקיעת Heartbeat. איטית, אך בודקת גם את שרת ה-ASGI ואת ה-WebSocket.
 
-בנוסף, `ruff` מבצע בדיקת סגנון, והכול רץ אוטומטית ב-GitHub Actions בכל Push. פירוט התוצאות בפרק 6.
+בנוסף, `ruff` מבצע בדיקת סגנון, והכול רץ אוטומטית ב-GitHub Actions בכל Push. פירוט התוצאות בפרק 5.
 
 ---
 
@@ -476,20 +476,8 @@ $$J = \frac{1}{2N}\sum_{i=1}^{N}\Big[(\max x_i - \min x_i) + (\max y_i - \min y_
 | **כתיבת הדוח** | *[להשלים: Google Docs / Word]* | הפקת הדוח |
 | **כלים מבוססי בינה מלאכותית** | *[להשלים/לאשר לפי הנחיות הקורס: Claude Code]* | סיוע בפיתוח וכתיבה |
 
+הספריות העיקריות בבקנד: FastAPI [8], Uvicorn [26], Pydantic [27], httpx [22], OpenCV [29] ו-NumPy [28], כאשר מודלי YuNet ו-SFace לקוחים מ-OpenCV Zoo [30]. באפליקציה: Provider [23], web_socket_channel [34], http [38], shared_preferences [35], flutter_local_notifications [36] ו-google_fonts [37], על בסיס Material Design 3 [39]. הבדיקות והאינטגרציה הרציפה נשענות על pytest [31], GitHub Actions [32] ו-arduino-cli [33].
+
 ---
 
-## מקורות נוספים לפרק 4 (יתווספו לרשימה הסופית)
-
-[19] Espressif Systems, "Non-Volatile Storage Library," ESP-IDF Programming Guide. [Online]. Available: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/storage/nvs_flash.html. Accessed: *[תאריך]*.
-
-[20] Espressif Systems, "esp32-camera: ESP32 camera driver," GitHub repository. [Online]. Available: https://github.com/espressif/esp32-camera. Accessed: *[תאריך]*.
-
-[21] FreeRTOS, "Queue Management." [Online]. Available: https://www.freertos.org/Embedded-RTOS-Queues.html. Accessed: *[תאריך]*.
-
-[22] Encode, "HTTPX Documentation." [Online]. Available: https://www.python-httpx.org/. Accessed: *[תאריך]*.
-
-[23] R. Rousselet, "provider," pub.dev package. [Online]. Available: https://pub.dev/packages/provider. Accessed: *[תאריך]*.
-
-[24] Espressif Systems, "Arduino-ESP32 Documentation." [Online]. Available: https://docs.espressif.com/projects/arduino-esp32/en/latest/. Accessed: *[תאריך]*.
-
-[25] Arduino, "attachInterrupt()," Arduino Language Reference. [Online]. Available: https://www.arduino.cc/reference/en/language/functions/external-interrupts/attachinterrupt/. Accessed: *[תאריך]*.
+*(הרשימה המלאה והמאוחדת של כל המקורות מופיעה בפרק 7 בקובץ `03_tests_summary_bom_refs.md`.)*
