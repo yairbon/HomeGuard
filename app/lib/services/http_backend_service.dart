@@ -489,6 +489,14 @@ class HttpBackendService implements BackendService {
   @override
   Future<void> arm(ArmMode mode) async {
     final res = _report(await _post('/arm', {'mode': mode.name}), 'arming');
+    if (res.reachable && res.statusCode == 409) {
+      // The door controller refused: its door is open. The backend's sentence is
+      // shown as is, and nothing was armed.
+      _errorController.add(
+        res.body['detail'] as String? ?? "Can't arm: the door is open. Close it and try again.",
+      );
+      return;
+    }
     if (res.ok && res.body['hardware'] == false) {
       _errorController.add('Armed, but the door controller board did not respond');
     }
@@ -595,13 +603,6 @@ class HttpBackendService implements BackendService {
         'the Face ID disarm toggle');
   }
 
-  /// Asks the backend's debug endpoint to simulate a face-recognition
-  /// event (see [BackendService.simulateFaceRecognition]).
-  @override
-  Future<void> simulateFaceRecognition() async {
-    _report(await _post('/debug/simulate-face-recognition'), 'the recognition test');
-  }
-
   // ---- Settings -----------------------------------------------------------------
   // No dedicated GET endpoints for these — /state already carries them
   // (see python/backend/models.py FullState), so just read from there.
@@ -624,6 +625,9 @@ class HttpBackendService implements BackendService {
       nightMode: body['night_mode'] as bool? ?? false,
       nightModeArmHour: body['night_mode_arm_hour'] as int? ?? 23,
       nightModeDisarmHour: body['night_mode_disarm_hour'] as int? ?? 7,
+      alertsEnabled: body['alerts_enabled'] as bool? ?? true,
+      alertEmails: _stringList(body['alert_emails']),
+      escalationEmails: _stringList(body['escalation_emails']),
       emergencyNumber: body['emergency_number'] as String? ?? '',
       policeCallDelaySeconds: body['police_call_delay_seconds'] as int? ?? 60,
       ntfy: NtfyConfig(
@@ -642,6 +646,26 @@ class HttpBackendService implements BackendService {
       }),
       'the night-mode hours',
     );
+  }
+
+  static List<String> _stringList(Object? value) =>
+      value is List ? value.whereType<String>().toList() : const [];
+
+  @override
+  Future<String?> setAlertEmails(List<String> alertTo, List<String> escalationTo) async {
+    final res = _report(
+      await _post('/settings/alert-emails', {'alert_to': alertTo, 'escalation_to': escalationTo}),
+      'the recipient list',
+    );
+    if (!res.reachable) return "Couldn't reach the backend.";
+    if (res.ok) return null;
+    final detail = res.body['detail'];
+    return detail is String ? detail : 'The backend refused the list (HTTP ${res.statusCode}).';
+  }
+
+  @override
+  Future<void> setAlertsEnabled(bool enabled) async {
+    _report(await _post('/settings/alerts-enabled', {'enabled': enabled}), 'the alerts switch');
   }
 
   @override
@@ -668,9 +692,15 @@ class HttpBackendService implements BackendService {
   }
 
   @override
-  Future<bool> sendTestNotification() async {
-    final res = _report(await _post('/settings/ntfy/test'), 'the test notification');
-    return res.body['ok'] as bool? ?? false;
+  Future<AlertTestResult> sendTestAlert() async {
+    final res = _report(await _post('/settings/alerts/test'), 'the test alert');
+    if (!res.reachable) {
+      return const AlertTestResult(ok: false, summary: 'Could not reach the backend.');
+    }
+    return AlertTestResult(
+      ok: res.body['ok'] as bool? ?? false,
+      summary: res.body['summary'] as String? ?? 'The backend gave no details.',
+    );
   }
 
   /// Tears down the WebSocket connection and closes every stream

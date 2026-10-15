@@ -165,20 +165,6 @@ class HomeScreen extends StatelessWidget {
               ],
               const SizedBox(height: 28),
               _RecentEvents(events: alarm.events),
-              // Demo-only escape hatch: lets anyone see the full alert flow
-              // (notification, state change, event log entry) without real
-              // sensor hardware attached. Only offered while armed (not
-              // already triggered) since triggering an already-triggered
-              // alarm again wouldn't demonstrate anything new. See
-              // AlarmService.simulateIntrusion for what it actually does.
-              if (alarm.state == AlarmState.armed)
-                TextButton(
-                  onPressed: alarm.simulateIntrusion,
-                  child: Text(
-                    'Simulate intrusion (demo)',
-                    style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                  ),
-                ),
             ],
           ),
         ),

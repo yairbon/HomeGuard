@@ -44,9 +44,33 @@ SECRETS_FILE = os.environ.get("HOMEGUARD_SECRETS_H", "")
 _PIN_LINE = re.compile(r'^(\s*#\s*define\s+KEYPAD_PIN\s+")[^"\n]*("\s*.*)$', re.MULTILINE)
 
 
+# Just the value, for reading it back (see read_keypad_pin).
+_PIN_VALUE = re.compile(r'^\s*#\s*define\s+KEYPAD_PIN\s+"([^"\n]*)"', re.MULTILINE)
+
+
 def is_enabled() -> bool:
     """Whether secrets-file syncing is switched on for this install."""
     return bool(SECRETS_FILE)
+
+
+def read_keypad_pin() -> str:
+    """The `KEYPAD_PIN` currently written in the configured header, or "" if
+    syncing is off or the file or line can't be read.
+
+    Used once, on a brand-new install, so the app's first password is the PIN
+    the door keypad was compiled with instead of a separate well-known
+    default. The caller must still validate the value: this returns whatever
+    sits between the quotes.
+    """
+    if not SECRETS_FILE:
+        return ""
+    try:
+        text = Path(SECRETS_FILE).read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read secrets header %s: %s", SECRETS_FILE, exc)
+        return ""
+    match = _PIN_VALUE.search(text)
+    return match.group(1) if match else ""
 
 
 def update_keypad_pin(pin: str) -> bool:

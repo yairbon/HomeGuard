@@ -89,16 +89,6 @@ class CameraScreen extends StatelessWidget {
             )
           else
             ...recentIds.map((e) => EventTileCompact(event: e)),
-          const SizedBox(height: 16),
-          Center(
-            child: TextButton(
-              onPressed: () => context.read<AlarmService>().simulateFaceRecognition(),
-              child: Text(
-                'Simulate recognition (demo)',
-                style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-              ),
-            ),
-          ),
         ],
       ),
     );
@@ -109,10 +99,11 @@ class CameraScreen extends StatelessWidget {
 ///
 /// Given a full card with an explicit warning rather than a plain row,
 /// because this is the one setting in the app that *lowers* what it takes to
-/// turn the alarm off. The recognizer compares face embeddings and has no
-/// liveness detection, so a printed photo or a picture on a phone screen may
-/// pass — that makes this convenience, not security, and the UI has to say
-/// so rather than let someone enable it assuming otherwise.
+/// turn the alarm off. The recognizer compares face embeddings; the backend
+/// adds two liveness checks (landmark motion and an anti-spoofing model), but
+/// a good replay on a screen may still get through — that makes this
+/// convenience, not security, and the UI has to say so rather than let
+/// someone enable it assuming otherwise.
 class _FaceDisarmToggle extends StatelessWidget {
   const _FaceDisarmToggle({required this.enabled, required this.onChanged});
 
@@ -144,8 +135,8 @@ class _FaceDisarmToggle extends StatelessWidget {
               ),
             ),
             Text(
-              'No liveness check — a photo of an approved face may be enough. '
-              'Treat this as convenience, not security.',
+              'Includes a liveness check (face motion and an anti-spoofing '
+              'model), but treat this as convenience, not security.',
               style: TextStyle(color: AppColors.transitional, fontSize: 11),
             ),
           ],
@@ -236,7 +227,12 @@ class _FeedPlaceholderState extends State<_FeedPlaceholder> with WidgetsBindingO
     }
     _retryTimer?.cancel();
     _retryTimer = null;
-    final stream = MjpegStreamClient(streamUrl: url, headers: backend.cameraFrameHeaders);
+    final stream = MjpegStreamClient(
+      streamUrl: url,
+      headers: backend.cameraFrameHeaders,
+      // The still-image fallback (see MjpegStreamClient.snapshotUrl).
+      snapshotUrl: url.replaceFirst('/camera/stream', '/camera/latest'),
+    );
     _stream = stream;
     _frameSub = stream.frames.listen(_decoder.submit);
     stream.connect();

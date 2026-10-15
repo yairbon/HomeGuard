@@ -1,11 +1,11 @@
 {
-    "name": "homeguard_app",
-    "short_name": "homeguard_app",
+    "name": "HomeGuard",
+    "short_name": "HomeGuard",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#0E1310",
+    "theme_color": "#0E1310",
+    "description": "HomeGuard home security control panel.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

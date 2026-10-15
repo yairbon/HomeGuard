@@ -399,3 +399,62 @@ async def test_a_siren_command_that_lands_is_not_repeated(state, monkeypatch):
 
     assert await esp32_client.send_trigger_alarm() is True
     assert len(attempts) == 1
+
+
+# ---- Arming with the door open -------------------------------------------------
+
+
+class _FakeBoard:
+    """Stands in for the door controller's HTTP client."""
+
+    def __init__(self, status: int | None):
+        self.status = status  # None = unreachable
+        self.calls: list[str] = []
+
+    async def post(self, url, json=None, headers=None):
+        import httpx
+
+        self.calls.append(url)
+        if self.status is None:
+            raise httpx.ConnectError("no route to host")
+        return httpx.Response(self.status, request=httpx.Request("POST", url))
+
+
+async def test_arming_is_refused_when_the_door_is_open(auth_client, state, monkeypatch):
+    from backend import esp32_client
+
+    board = _FakeBoard(409)
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", board)
+
+    reply = await auth_client.post("/arm", json={"mode": "away"})
+
+    assert reply.status_code == 409
+    assert "door is open" in reply.json()["detail"]
+    assert state.alarm_state == AlarmState.disarmed  # nothing was armed
+
+
+async def test_arming_goes_ahead_when_the_board_accepts(auth_client, state, monkeypatch):
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", _FakeBoard(200))
+
+    body = (await auth_client.post("/arm", json={"mode": "away"})).json()
+
+    assert body == {"ok": True, "hardware": True}
+    assert state.alarm_state == AlarmState.transitional
+
+
+async def test_arming_still_happens_locally_when_the_board_does_not_answer(
+    auth_client, state, monkeypatch
+):
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", _FakeBoard(None))
+
+    body = (await auth_client.post("/arm", json={"mode": "away"})).json()
+
+    assert body == {"ok": True, "hardware": False}
+    assert state.alarm_state == AlarmState.transitional

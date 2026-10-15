@@ -98,13 +98,41 @@ the new PIN is pushed to the door controller's `/keypad-pin` route and
 persisted in NVS, and it survives power loss and reboots from then on —
 reflashing the board with an old `secrets.h` will not revert it.
 
-## Testing the keypad without physical wiring
+## Door controller sounds
 
-The keypad is currently simulated through the Serial Monitor —
-intentional, so the state machine could be tested before the real 4x4
-keypad is wired. Type digits + `*` to arm, digits + `#` to submit a PIN
-(the PIN is whatever you set as `KEYPAD_PIN` in `secrets.h`). Swap in the
-`Keypad` library once the physical keypad's pin mapping is known.
+The two buzzers (GPIO23 and GPIO22) play: a click on every key press, the
+accelerating entry-delay beeps, a siren while the alarm is active, and short
+status sounds for armed, disarmed (also "arming cancelled") and wrong PIN.
+The entry delay lasts 30 s (`ENTRY_TIME_LIMIT`; the backend and app mirror
+whatever the board reports). While someone is typing a PIN the countdown
+*beeps* pause, from the first key until 1.8 s after the last one, so every key
+and the wrong-PIN / disarmed result are heard on their own; the 30 s timer
+itself never pauses. The siren alternates the two buzzers. Priority is siren >
+entry beeps > status sounds > clicks. Sound code never
+blocks `loop()`: it runs on its own task, and `setState()` is the single place
+that starts the sounds tied to a state change, so they play the same whether
+the change came from the keypad, the app or `/trigger-alarm`.
+
+Arming is refused while the door is open: the keypad's `*` prints "Door must be
+closed first" and plays a distinct refusal sound (a rapid four-pulse stutter),
+and the app's arm command is answered `409` so the backend arms nothing and the
+app shows "Can't arm: the door is open. Close it and try again."
+
+Every duration and pitch is in the `SOUNDS` block at the top of
+`door_keypad_controller.ino`. The buzzers are treated as **active** (fixed
+pitch, so sounds differ by rhythm and by which buzzer plays); building with
+`BUZZERS_ACTIVE 0` plays the table's Hz values as real pitches for passive
+piezos instead.
+
+## Testing the keypad at a desk
+
+The 3x4 keypad is wired and read directly (`getPhysicalKey()`). Characters
+typed into the Serial Monitor (9600 baud) are also accepted as key presses
+(`getSimulatedKey()`) **only in a bench build**, compiled with
+`--build-property build.extra_flags=-DENABLE_SERIAL_KEYPAD=1`; the shipped
+build ignores USB input, so nobody with a cable can type at the panel. In a
+bench build `*` arms and digits + `#` submit a PIN (whatever is stored, or the
+`KEYPAD_PIN` default in `secrets.h`).
 
 ## Heartbeats
 
@@ -159,6 +187,39 @@ them, so a slow consumer doesn't accumulate lag over a long-lived stream. On a
 board without PSRAM the fallback is `fb_count = 1`, where those two consumers
 contend for a single buffer and roughly halve each other — don't run both
 features on a PSRAM-less module.
+
+### Frame rate
+
+Measured with the previous sketch (VGA, JPEG quality 12, picture brightness
+about 120/255): 18-20 frames/s straight from the board, and 19.9-20.0 per viewer
+through the backend's camera hub with one viewer or two, so the relay loses
+nothing and the board is the limit. Three things held it back, and the sketch now
+handles each:
+
+- **WiFi modem sleep** (the default) lets the radio doze between the router's
+  beacons. `connectWiFi()` calls `WiFi.setSleep(false)` and prints
+  `WiFi power save: off` at boot. With it on, ping time to the board was 5-80 ms
+  and the worst gap between stream frames was 717 ms (340 ms with it off, in a dim
+  room).
+- **TCP waiting for small packets** (Nagle plus the receiver's delayed
+  acknowledgements) made frames arrive in bursts with holes between them.
+  `streamHandler()` sets `TCP_NODELAY` on its socket.
+- **Three chunk sends per frame** (boundary, part header, JPEG) are now one: the
+  three are copied into one PSRAM buffer and sent together, and the camera's
+  frame buffer goes back to the driver right after the copy. If the buffer cannot
+  be allocated, or a frame does not fit, it falls back to the three sends.
+
+The face-recognition push now runs every 300 ms measured from the start of one
+push to the start of the next (it used to wait 500 ms after the backend's reply,
+which made it about 1.3 a second). Raising it did not slow the stream in earlier
+tests.
+
+The sensor itself limits what is possible: with a 20 MHz clock the OV2640 tops
+out around 25 frames/s in this mode in good light, and in a dim room the exposure
+time dominates and it drops to about 16 whatever the firmware does. **These
+changes compile on core 3.3.11 but had not been flashed or measured on the board
+when this was written** — flash it, then count frames on `/stream` before
+trusting the numbers above.
 
 ### Flashing it is different from the other three
 
