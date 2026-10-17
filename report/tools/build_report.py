@@ -36,7 +36,8 @@ HEBREW = re.compile(r"[֐-׿]")
 PLACEHOLDER = re.compile(r"\[(הכנס|להשלים|לאמת|הוסף קישור|תאריך)|dd/mm/yy")
 MAX_W_IN, MAX_H_IN = 6.3, 8.0
 
-PARTS = ["01_cover_abstract_intro.md", "02_design_implementation.md", "03_tests_summary_bom_refs.md"]
+PARTS = ["HomeGuard_Report.md"]
+REFERENCES_FILE = "references.json"
 
 # --------------------------------------------------------------------------
 # 1. Markdown preprocessing
@@ -101,8 +102,38 @@ def preprocess(text: str) -> str:
     return "\n".join(out)
 
 
+def number_citations(text: str) -> str:
+    """Turns [@key] / [@a; @b] into [n] / [n, m] numbered by first appearance (IEEE), and fills
+    @@REFERENCES@@ with the matching bibliography, in the same order. Fails on unknown keys."""
+    import json
+    refs = json.loads((REPORT_DIR / REFERENCES_FILE).read_text(encoding="utf-8"))
+    order = []
+
+    def num(key):
+        if key not in refs:
+            raise KeyError(f"unknown reference key: {key}")
+        if key not in order:
+            order.append(key)
+        return order.index(key) + 1
+
+    def repl(m):
+        keys = [k.strip().lstrip("@") for k in m.group(1).split(";")]
+        nums = sorted(num(k) for k in keys)
+        # LRM on both sides: the bracket pair resolves left-to-right together with the digits,
+        # so it is never mirrored or split inside a right-to-left sentence.
+        return "\u200e[" + ", ".join(str(n) for n in nums) + "]\u200e"
+
+    text = re.sub(r"\[(@[A-Za-z0-9_]+(?:\s*;\s*@[A-Za-z0-9_]+)*)\]", repl, text)
+    unused = [k for k in refs if k not in order]
+    if unused:
+        print("WARNING: references never cited:", ", ".join(unused))
+    bib = "\n\n".join(f"[{i + 1}] {refs[k]}" for i, k in enumerate(order))
+    return text.replace("@@REFERENCES@@", bib)
+
+
 def build_master(tmp: Path) -> Path:
     md = "\n\n".join(preprocess((REPORT_DIR / p).read_text(encoding="utf-8")) for p in PARTS)
+    md = number_citations(md)
     md = md.replace("‏", "")
     path = tmp / "master.md"
     path.write_text(md, encoding="utf-8")
@@ -429,7 +460,7 @@ def replace_image_tokens(doc):
                 anchor._p.addnext(new_p)
                 from docx.text.paragraph import Paragraph
                 target = Paragraph(new_p, p._parent)
-            w, h = fit_size(f)
+            w, h = fit_size(f, max_h_in=3.0 if Path(f).stem.startswith("fig") else 4.6)
             target.add_run().add_picture(f, width=w, height=h)
             anchor = target
         cap = copy.deepcopy(p._p)
@@ -498,7 +529,8 @@ def style_special_paragraphs(doc):
             p.paragraph_format.keep_with_next = True
     # headings: chapter headings start a new page
     for p in doc.paragraphs:
-        if p.style.name == "Heading 1":
+        if p.style.name == "Heading 1" and (
+                p.text.startswith(("1.", "7.", "8.")) or "תקציר" in p.text):
             p.paragraph_format.page_break_before = True
 
 
@@ -592,7 +624,7 @@ def build_cover(doc):
     add(para(tmp, "קורס חשיפה לחומרה", 14, True, after=50))
     add(para(tmp, "HomeGuard", 30, True, after=4, ltr=True))
     add(para(tmp, "מערכת אבטחה היברידית מרובת שכבות", 18, True, after=4))
-    add(para(tmp, "מחשוב קצה על בקרי ESP32, בקנד Python עם זיהוי פנים ואפליקציית שליטה לטלפון נייד", 13, False,
+    add(para(tmp, "בקרי ESP32, בקנד ב-Python ואפליקציה לטלפון", 13, False,
              after=40))
     add(para(tmp, "תאריך הביצוע: dd/mm/yy", 14, True, after=4, hl=True))
     add(para(tmp, "תאריך ההגשה: dd/mm/yy", 14, True, after=40, hl=True))

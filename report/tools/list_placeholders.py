@@ -54,10 +54,6 @@ for i, b in enumerate(blocks):
             summary = ", ".join(f"{k} ×{v}" for k, v in kinds.items())
             items.append((heading, last_caption or "(טבלה)", f"תאים לא מלאים בטבלה: {summary}"))
 
-# references: Accessed dates
-acc = sum(1 for b in blocks if isinstance(b, Paragraph) and re.match(r"^\[\d+\]", b.text.strip())
-          and "[תאריך]" in b.text)
-
 out = ["# רשימת השלמות לפני ההגשה", "",
        "נוצר אוטומטית מקובץ ה-Word (`python report/tools/list_placeholders.py`). "
        "בכל סעיף: הסעיף בדוח, הכיתוב/הטבלה הרלוונטיים, והנוסח של הסימון שיש להחליף. "
@@ -69,6 +65,5 @@ for h, cap, text in items:
         cur = h
     short = text if len(text) < 260 else text[:257] + "..."
     out.append(f"- [ ] **{cap}** — {short}" if cap else f"- [ ] {short}")
-out += ["", f"## מקורות", f"- [ ] להשלים תאריך גישה (`Accessed`) ל-{acc} מקורות אחרי שמאמתים כל קישור."]
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out) + "\n")
 print(len(items), "items")

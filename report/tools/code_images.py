@@ -1,7 +1,6 @@
-"""Renders the report's code excerpts ("Code 1..15") and terminal outputs
-(figures 26, 27) as PNG, straight from the real source files / saved output.
+"""Renders the report's code excerpts ("Code 1..3") as PNG, straight from the real source files.
 
-    python code_images.py <repo_root> <out_dir> [terminal_dir]
+    python code_images.py <repo_root> <out_dir>
 
 Needs `pygments` and Chromium (via shot.js). Excerpts keep the ORIGINAL line
 numbers; runs of 3+ comment-only lines and long docstrings are collapsed to a
@@ -19,27 +18,17 @@ from pygments.lexers import CppLexer, DartLexer, PythonLexer
 
 REPO = Path(sys.argv[1])
 OUT = Path(sys.argv[2])
-TERM = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 OUT.mkdir(parents=True, exist_ok=True)
 HERE = Path(__file__).resolve().parent
 
 # name -> (file, [(first, last), ...]) with 1-based inclusive line numbers
 SNIPPETS = {
-    "code1": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(207, 223)]),
-    "code2": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(230, 282)]),
-    "code3": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(404, 446)]),
-    "code4": ("esp32/vibration_sensor/vibration_sensor.ino", [(54, 62), (93, 93), (166, 191)]),
-    "code5": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(783, 845)]),
-    "code6": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(324, 354)]),
-    "code7": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(500, 543)]),
-    "code8": ("esp32/esp32_cam/esp32_cam.ino", [(209, 230), (249, 270)]),
-    "code9": ("esp32/esp32_cam/esp32_cam.ino", [(113, 125), (313, 344)]),
-    "code10": ("python/backend/state.py", [(1163, 1231)]),
-    "code11": ("python/backend/face_recognition_service.py", [(534, 572), (645, 666)]),
-    "code12": ("python/backend/main.py", [(666, 721)]),
-    "code13": ("python/backend/notifier.py", [(80, 114)]),
-    "code14": ("app/lib/services/http_backend_service.dart", [(157, 179), (199, 205)]),
-    "code15": ("app/lib/services/mjpeg_stream.dart", [(30, 65)]),
+    # distance sensor: several abnormal readings in a row are an intrusion
+    "code1": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(404, 405), (413, 434)]),
+    # keypad scan: one row at a time, read the columns
+    "code2": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(627, 644)]),
+    # door board: the 30-second entry delay (time-out -> alarm, PIN -> disarm)
+    "code3": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(1110, 1142)]),
 }
 
 LEXERS = {".ino": CppLexer(), ".py": PythonLexer(), ".dart": DartLexer()}
@@ -129,30 +118,6 @@ def render(name, rel, ranges):
     print("rendered", name, f"({len(rows)} rows)")
 
 
-def terminal(name, text, title):
-    esc = html.escape(text)
-    doc = (f"<html><head><meta charset='utf-8'><style>body{{margin:0;background:#fff}}"
-           f"#box{{display:inline-block;background:#0f1411;color:#d7e0d4;padding:12px 16px;border-radius:6px;"
-           f"font-family:'DejaVu Sans Mono',monospace;font-size:13px;line-height:1.4}}"
-           f".t{{color:#8b9a8e;margin-bottom:8px}}pre{{margin:0;white-space:pre}}"
-           f".ok{{color:#43c285}}</style></head><body><div id='box'><div class='t'>{html.escape(title)}</div>"
-           f"<pre>{esc}</pre></div></body></html>")
-    hp = OUT / f"{name}.html"
-    hp.write_text(doc, encoding="utf-8")
-    subprocess.run(["node", str(HERE / "shot.js"), str(hp), str(OUT / f"{name}.png")], check=True,
-                   env={**os.environ, "PLAYWRIGHT_MODULE": os.environ.get("PLAYWRIGHT_MODULE", "playwright")})
-    hp.unlink()
-    print("rendered", name)
-
-
 if __name__ == "__main__":
     for nm, (rel, rng) in SNIPPETS.items():
         render(nm, rel, rng)
-    if TERM:
-        p = TERM / "pytest_out.txt"
-        if p.exists():
-            terminal("fig26", p.read_text(encoding="utf-8").replace(str(TERM), "...").strip(), "$ cd python && pytest -q")
-        s = TERM / "simulate_out.txt"
-        if s.exists():
-            lines = s.read_text(encoding="utf-8").splitlines()
-            terminal("fig27", "\n".join(lines[-32:]), "$ cd python && python simulate.py   (last 32 lines of the output)")

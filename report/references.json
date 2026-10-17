@@ -1,0 +1,15 @@
+{
+ "esp32": "Espressif Systems, \"ESP32 Series Datasheet,\" Espressif Systems, Shanghai, China. [Online]. Available: https://www.espressif.com/sites/default/files/documentation/esp32_datasheet_en.pdf. Accessed: Oct. 17, 2026.",
+ "arduino_esp32": "Espressif Systems, \"Arduino-ESP32 Documentation.\" [Online]. Available: https://docs.espressif.com/projects/arduino-esp32/en/latest/. Accessed: Oct. 17, 2026.",
+ "hcsr04": "Elec Freaks, \"Ultrasonic Ranging Module HC-SR04,\" datasheet. [Online]. Available: https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf. Accessed: Oct. 17, 2026.",
+ "lm393": "Texas Instruments, \"LM393 Dual Differential Comparator,\" product page. [Online]. Available: https://www.ti.com/product/LM393. Accessed: Oct. 17, 2026.",
+ "keypad": "Arduino Playground, \"Keypad Library.\" [Online]. Available: https://playground.arduino.cc/Code/Keypad/. Accessed: Oct. 17, 2026.",
+ "opencv": "OpenCV, \"opencv-contrib-python,\" Python Package Index (PyPI). [Online]. Available: https://pypi.org/project/opencv-contrib-python/. Accessed: Oct. 17, 2026.",
+ "yunet": "W. Wu, H. Peng, and S. Yu, \"YuNet: A tiny millisecond-level face detector,\" *Mach. Intell. Res.*, vol. 20, no. 5, pp. 656–665, 2023, doi: 10.1007/s11633-023-1423-y.",
+ "sface": "Y. Zhong, W. Deng, J. Hu, D. Zhao, X. Li, and D. Wen, \"SFace: Sigmoid-constrained hypersphere loss for robust face recognition,\" *IEEE Trans. Image Process.*, vol. 30, pp. 2587–2598, 2021, doi: 10.1109/TIP.2020.3048632.",
+ "fastapi": "S. Ramírez, \"FastAPI Documentation.\" [Online]. Available: https://fastapi.tiangolo.com/. Accessed: Oct. 17, 2026.",
+ "rfc6455": "I. Fette and A. Melnikov, \"The WebSocket Protocol,\" IETF, RFC 6455, Dec. 2011. [Online]. Available: https://www.rfc-editor.org/rfc/rfc6455. Accessed: Oct. 17, 2026.",
+ "smtplib": "Python Software Foundation, \"smtplib — SMTP protocol client,\" Python 3 Documentation. [Online]. Available: https://docs.python.org/3/library/smtplib.html. Accessed: Oct. 17, 2026.",
+ "flutter": "Google, \"Flutter Documentation.\" [Online]. Available: https://docs.flutter.dev/. Accessed: Oct. 17, 2026.",
+ "pytest": "pytest-dev, \"pytest Documentation.\" [Online]. Available: https://docs.pytest.org/. Accessed: Oct. 17, 2026."
+}
