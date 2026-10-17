@@ -38,8 +38,9 @@ PROTECTED_ROUTES = [
     ("post", "/settings/emergency-number", {"number": "100"}),
     ("post", "/settings/police-call-delay", {"seconds": 30}),
     ("post", "/settings/ntfy", {"server": "https://ntfy.sh", "topic": "x"}),
-    ("post", "/settings/ntfy/test", None),
-    ("post", "/debug/simulate-face-recognition", None),
+    ("post", "/settings/alerts/test", None),
+    ("post", "/settings/alerts-enabled", {"enabled": False}),
+    ("post", "/settings/alert-emails", {"alert_to": ["a@example.com"], "escalation_to": []}),
 ]
 
 DEVICE_ROUTES = [

@@ -549,3 +549,46 @@ async def test_a_camera_frame_only_broadcasts_on_the_transition(state):
     await state.note_camera_frame()
     await state.note_camera_frame()
     assert len(socket.received) == 1, "subsequent frames change nothing observable"
+
+
+# ---- The keypad PIN follows the board back ---------------------------------------
+
+
+async def _pins_sent(state, monkeypatch):
+    from backend import esp32_client
+
+    sent: list[str] = []
+
+    async def record(pin):
+        sent.append(pin)
+        return True
+
+    monkeypatch.setattr(esp32_client, "send_keypad_pin", record)
+    return sent
+
+
+async def test_the_pin_is_re_sent_when_the_door_board_comes_back(state, monkeypatch):
+    import asyncio
+
+    sent = await _pins_sent(state, monkeypatch)
+    state.keypad_pin = "4321"
+
+    await state.note_board_seen("door_controller")
+    await asyncio.sleep(0.05)
+    assert sent == ["4321"]
+
+    await state.note_board_seen("door_controller")  # still online: nothing more to say
+    await asyncio.sleep(0.05)
+    assert sent == ["4321"]
+
+
+async def test_other_boards_and_an_unset_pin_send_nothing(state, monkeypatch):
+    import asyncio
+
+    sent = await _pins_sent(state, monkeypatch)
+    state.keypad_pin = "4321"
+    await state.note_board_seen("ultrasonic")
+    state.keypad_pin = ""
+    await state.note_board_seen("door_controller")
+    await asyncio.sleep(0.05)
+    assert sent == []

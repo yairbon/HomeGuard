@@ -21,7 +21,32 @@ specifically.
 .\venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 
-Docs at `http://localhost:8000/docs` (FastAPI auto-generates this).
+The interactive API docs (`/docs`, `/redoc`, `/openapi.json`) are **off by
+default**: they have no login, so they would show the whole API to anyone on
+the network. Start with `HOMEGUARD_DOCS=1` to turn them on for development.
+
+`..\scripts\start-backend.ps1` does the same with the board addresses and
+`HOMEGUARD_BOARDS` preset (`-DoorIp` / `-CameraIp` override them), and
+`..\scripts\start-backend.cmd` opens it in its own visible window (double-click).
+The window **is** the backend: closing it stops it. It prints what happens as it
+happens (`[armDisarm] System armed (Away)`, `[alert] ALERT ...`, the email sent),
+and leaves out the boards' heartbeats and the camera's frame pushes so those lines
+stay readable; `-LogAllRequests` (or `HOMEGUARD_LOG_ALL_REQUESTS=1`) puts every
+request back, for diagnosing. A session token in a log line (the WebSocket takes it
+in the URL) is always replaced by `token=***`.
+
+### The web app, from the same port
+
+If `..\app\build\web` exists, the backend also serves the Flutter web app
+from `/`, so a phone or browser on the same network just opens
+`http://<this machine>:8000/` and logs in. Page and API share one origin, so
+there is no CORS list to maintain, and the web build defaults its backend
+address to the address it was loaded from. Build it with
+`..\scripts\build-web.ps1` (re-run after any app change; restart the backend
+only if the folder did not exist when it started). `HOMEGUARD_WEB_DIR` points
+at a build somewhere else. The files are the public compiled app, so they are
+served without a credential; every API route is still protected. Unknown paths
+are a plain 404.
 
 On the very first run the backend generates a **device key** and logs it at
 startup. Copy that value into each board's `secrets.h` (see
@@ -29,7 +54,11 @@ startup. Copy that value into each board's `secrets.h` (see
 same across restarts. To set it explicitly instead, export
 `HOMEGUARD_DEVICE_KEY` before starting.
 
-Default login password is `homeguard`; change it from the app's Settings
+On a first run the login password is the door keypad's own PIN, read from
+`KEYPAD_PIN` in the door controller's `secrets.h` when `HOMEGUARD_SECRETS_H`
+names that file (`scripts\start-backend.ps1` sets it), so the app password and
+the keypad PIN are one secret from the very start. Without that file it falls
+back to the factory default `homeguard`. Change it from the app's Settings
 screen. It's stored as a scrypt hash in `state.json`, never in plaintext.
 
 ## Login password / keypad PIN: one shared secret
@@ -71,9 +100,8 @@ Nothing here is open. Two credentials, for two kinds of caller:
 | Flutter app | Session token from `/login` (12h) | `Authorization: Bearer <token>` |
 | ESP32 boards | Shared device key | `X-Device-Key` header, or `?key=` |
 
-`/health`, `/login` and FastAPI's own docs routes (`/docs`, `/redoc`,
-`/openapi.json`) are the unauthenticated surface — note that means the full
-API schema is public. Everything else requires a credential.
+`/health` and `/login` are the unauthenticated surface (plus FastAPI's docs
+routes, only when `HOMEGUARD_DOCS=1`). Everything else requires a credential.
 `tests/test_auth.py` enumerates `app.routes` and fails if a new route is
 added without being covered, so this list cannot drift again.
 
@@ -146,7 +174,52 @@ The old path is kept as an automatic fallback: if the ONNX files are missing,
 the service logs a warning and uses Haar+LBPH rather than refusing to start.
 `FaceRecognitionService.backend_name` reports which is live.
 
-## Push notifications (ntfy)
+## Alerts: WhatsApp and email
+
+The app's own notifications only fire while it is open, and the iPhone web
+app cannot receive push at all, so an alarm is also sent as a message. Two
+channels, both configured in **one local file that is never committed**:
+`alerts.local.json` next to this README (copy `alerts.example.json`; a blank
+`alerts.local.json` already exists). The credentials never go into the app,
+`state.json` or a chat, and the file is read on every send, so editing it needs
+no restart. Either channel, or both:
+
+- **WhatsApp via CallMeBot** (free): add the bot's number to your contacts and
+  send it the activation message; it replies with a key. Both the number and the
+  exact message are on https://www.callmebot.com/blog/free-api-whatsapp-messages/
+  — copy them from there, because the bot's number has changed over time. Put
+  your own number (with country code) and the key in the `whatsapp` list. The
+  page says the free API is only for personal use and that sending to other
+  people or groups, or from your own WhatsApp number, needs a different
+  service; it is run by one person and promises no uptime. The alarm text
+  passes through their server. It is not a way to reach the emergency contact.
+- **Email** (free): a Gmail account that sends, with a Google *app password*
+  (Google account → Security → 2-Step Verification → App passwords); that
+  account and password are the only email settings in the file. **Who receives
+  the emails is edited in the app** (Settings → Alerts): one list gets every
+  alarm, and the emergency contacts are added when the alarm has not been
+  cleared after the delay set there. The `alert_to` / `escalation_to` lists in
+  the file are only the starting values, copied into `state.json` once on the
+  first start; after that the app owns them. Settings also has a master switch,
+  "Send alerts by email", that stops all outgoing messages (the siren and the
+  app are unaffected) so a bench test does not flood an inbox. Nothing dials a
+  phone. On an iPhone use the Gmail app for instant notifications; Apple's Mail
+  app only checks Gmail from time to time.
+
+Both channels need internet access from whatever network the laptop is on.
+Settings has a **SEND TEST ALERT** button (`POST /settings/alerts/test`) that
+sends a real message on every configured channel and shows which one worked,
+without ever echoing a password, key or number. Failures are logged without
+secrets and never delay or break the alarm itself; the "escalation sent" line in
+the event log is only written when a channel actually exists. The throwaway
+`simulate.py` server must point `HOMEGUARD_ALERTS_FILE` at a file that does not
+exist, or its test alarms would message you for real.
+
+## Push notifications (ntfy) — optional, API only
+
+ntfy still works if a topic is set through `POST /settings/ntfy`, but the app no
+longer shows it: it needs its own phone app, which is what the channels above
+avoid.
 
 The app's own notifications only fire while its process is alive — swipe it
 away and a break-in produces nothing. `backend/notifier.py` closes that gap by
@@ -230,7 +303,7 @@ Two suites, deliberately:
 ```powershell
 .\venv\Scripts\pip.exe install -r requirements-dev.txt
 
-.\venv\Scripts\python.exe -m pytest        # 243 tests, ~109s
+.\venv\Scripts\python.exe -m pytest        # 285 tests, ~75s
 .\venv\Scripts\python.exe -m ruff check .
 ```
 
@@ -240,14 +313,20 @@ timestamps, not by sleeping). Each test gets a fresh install via a reloaded
 state module pointed at a temp directory.
 
 ```powershell
-# In one terminal:
+# In one terminal — a THROWAWAY server, never your real one: the script
+# changes the password and arms and disarms. Its own port and state file, and
+# no HOMEGUARD_DOOR_CONTROLLER_URL / HOMEGUARD_SECRETS_H, so no real board is
+# commanded and no secrets.h is rewritten.
+$env:HOMEGUARD_STATE_FILE = "$env:TEMP\sim-state.json"
+$env:HOMEGUARD_ALERTS_FILE = "$env:TEMP\no-alerts.json"   # must not exist: no real messages
 $env:HOMEGUARD_DEVICE_KEY = "simulation-device-key"
-.\venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
-# In another (delete state.json first — it assumes the default password):
+.\venv\Scripts\python.exe -m uvicorn backend.main:app --port 8765
+# In another (it assumes the factory-default password, so start with no state file):
+$env:HOMEGUARD_BASE_URL = "http://localhost:8765"
 .\venv\Scripts\python.exe simulate.py
 ```
 
-`simulate.py` is the live counterpart: 96 checks against a real uvicorn
+`simulate.py` is the live counterpart: 95 checks against a real uvicorn
 process over a real socket, so it also covers the ASGI server, the WebSocket
 transport and genuine wall-clock timing (it really does wait out the
 30-second lockout and the 30-second board timeout — takes a couple of
@@ -265,6 +344,17 @@ is flashed and on the network. Without it, `/arm` and `/disarm` still work for
 the app, they just don't reach real hardware — and say so, via the `hardware`
 field in their response, which the app surfaces rather than silently assuming
 success.
+
+## Optional environment variables
+
+| Variable | Default | What it does |
+|---|---|---|
+| `HOMEGUARD_ALERTS_FILE` | `alerts.local.json` | Where the WhatsApp/email alert settings are read from (see "Alerts"). Point it at a missing file for any server that must not message anyone. |
+| `HOMEGUARD_FACES_DIR` | next to the state file | Where the enrolled faces' photos live (`python/faces` for a normal install). It follows `HOMEGUARD_STATE_FILE`, so a test or simulation server with its own state file gets its own photo folder and can never delete a real enrolment (that happened once: `simulate.py` deleted the real face with id 4). |
+| `HOMEGUARD_BOARDS` | every board | Comma-separated boards this install expects heartbeats from: any of `ultrasonic`, `vibration`, `door_controller`. Set `ultrasonic,door_controller` when both sensors are wired to the one ultrasonic board (its sketch also carries the vibration sensor) — otherwise `vibration` shows as permanently offline and the app raises a SENSOR OFFLINE banner for it. Unknown names are ignored with a warning. |
+| `HOMEGUARD_CORS_ORIGINS` | none | Comma-separated extra browser origins allowed to call the API, e.g. `http://localhost:5000,http://192.168.1.20:5000`. Only needed when the Flutter **web** build is served from its own port (`flutter run -d web-server`); the Android app isn't a browser and ignores CORS. Exact origins only — `*` is refused. |
+
+Both are read once at startup, so changing one needs a backend restart.
 
 ## Known gaps, deliberately not implemented
 

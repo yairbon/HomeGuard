@@ -11,9 +11,16 @@ Desktop.ini
 # Only esp32/secrets.h.example is committed — see it for the setup steps.
 esp32/*/secrets.h
 
+# arduino-cli puts its build output (binaries, sdkconfig) next to the sketch
+esp32/*/build/
+
 # Backend runtime state (password hash, device key, faces, event log).
 python/state.json
 python/state.json.tmp
+
+# Where alerts go and the credentials to send them (SMTP app password, CallMeBot
+# key). Only python/alerts.example.json is committed.
+python/alerts.local.json
 
 # Review/verification virtualenv
 python/.venv-review/

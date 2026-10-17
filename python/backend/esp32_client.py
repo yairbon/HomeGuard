@@ -92,12 +92,41 @@ async def _post(path: str, json: dict | None = None) -> bool:
         return False
 
 
-async def send_arm(mode: ArmMode) -> bool:
+async def send_arm(mode: ArmMode) -> str:
     """Tell the door controller to arm. It runs its own exit-delay
     countdown before actually going ARMED (see the sketch's EXITING
     state) and reports back via /esp32/state-change once it does.
+
+    Returns what happened, because "the board said no" and "the board did not
+    answer" call for opposite reactions:
+
+    - ``"ok"``: the board accepted.
+    - ``"door_open"``: the board answered 409 — it refuses to arm with its door
+      open (arming then would start the entry countdown the instant it
+      finished). The caller must not arm.
+    - ``"no_ack"``: no answer, no URL configured, or any other refusal. The
+      caller arms its own state anyway and says the hardware did not respond.
     """
-    return await _post("/arm", json={"mode": mode.value})
+    if not DOOR_CONTROLLER_URL:
+        logger.info("HOMEGUARD_DOOR_CONTROLLER_URL not set — skipping outbound command to /arm")
+        return "no_ack"
+    try:
+        response = await _client.post(
+            f"{DOOR_CONTROLLER_URL}/arm",
+            json={"mode": mode.value},
+            headers={"X-Device-Key": state.device_key},
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Door controller request to /arm failed: %s", exc)
+        return "no_ack"
+    if response.status_code == 409:
+        await state.note_board_seen("door_controller")  # it answered, so it is there
+        return "door_open"
+    if response.is_success:
+        await state.note_board_seen("door_controller")
+        return "ok"
+    logger.warning("Door controller answered /arm with HTTP %d", response.status_code)
+    return "no_ack"
 
 
 async def send_disarm() -> bool:

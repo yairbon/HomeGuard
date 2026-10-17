@@ -12,12 +12,12 @@ import '../widgets/homeguard_icons.dart';
 
 /// Account and system settings screen.
 ///
-/// Covers five independent areas: a night-mode toggle, push notifications,
-/// emergency-contact details plus the police-call response delay, a
-/// change-password form, and the backend URL. The night-mode switch and
-/// emergency-contact fields persist to [BackendService] as soon as they
-/// change; the password form is only submitted when the user taps its
-/// button (see [_submitPassword]). The backend URL persists to local device
+/// Covers independent areas: a night-mode toggle, the alerts card (a test
+/// button plus the "email the emergency contacts after N seconds" delay), a
+/// change-password form, and the backend URL. The night-mode switch and the
+/// delay persist to [BackendService] as soon as they change; the password
+/// form is only submitted when the user taps its button (see
+/// [_submitPassword]). The backend URL persists to local device
 /// storage via [BackendConfig] instead — see [_saveBackendUrl].
 ///
 /// The password form used to sit next to an unrelated second one: this
@@ -41,13 +41,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _oldController = TextEditingController();
   final _newController = TextEditingController();
   final _confirmController = TextEditingController();
-  final _emergencyController = TextEditingController();
   final _backendUrlController = TextEditingController();
-  final _ntfyServerController = TextEditingController();
-  final _ntfyTopicController = TextEditingController();
 
-  bool _isSavingNtfy = false;
-  String? _ntfyMessage;
+  bool _isTestingAlerts = false;
+  AlertTestResult? _alertTest;
+  final _alertEmailsController = TextEditingController();
+  final _escalationEmailsController = TextEditingController();
+  bool _isSavingEmails = false;
+  String? _emailsMessage;
+  bool _emailsOk = true;
 
   bool _isSubmitting = false;
   String? _error;
@@ -59,6 +61,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _warning;
 
   bool _nightMode = false;
+  bool _alertsEnabled = true;
   int _nightModeArmHour = 23;
   int _nightModeDisarmHour = 7;
 
@@ -112,44 +115,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _backendUrlSaved = true);
   }
 
-  /// Persists the ntfy server/topic to the backend.
-  ///
-  /// Unlike the night-mode switch, this isn't optimistic: the value only
-  /// matters if the backend actually stored it, and silently appearing to
-  /// have enabled alerts that were never saved would be worse than a
-  /// moment's latency.
-  Future<void> _saveNtfy() async {
+  /// Splits "a@x.com, b@y.com" into addresses (commas, semicolons or spaces).
+  List<String> _addresses(String text) =>
+      text.split(RegExp(r'[,;\s]+')).where((a) => a.isNotEmpty).toList();
+
+  /// Saves who gets the alert emails. Not optimistic: it only counts if the
+  /// backend accepted every address, and a typo must be named, not swallowed.
+  Future<void> _saveEmails() async {
     setState(() {
-      _isSavingNtfy = true;
-      _ntfyMessage = null;
+      _isSavingEmails = true;
+      _emailsMessage = null;
     });
-    await context.read<BackendService>().setNtfyConfig(
-          _ntfyServerController.text.trim(),
-          _ntfyTopicController.text.trim(),
+    final error = await context.read<BackendService>().setAlertEmails(
+          _addresses(_alertEmailsController.text),
+          _addresses(_escalationEmailsController.text),
         );
     if (!mounted) return;
     setState(() {
-      _isSavingNtfy = false;
-      _ntfyMessage = _ntfyTopicController.text.trim().isEmpty
-          ? 'Push notifications disabled'
-          : 'Saved';
+      _isSavingEmails = false;
+      _emailsOk = error == null;
+      _emailsMessage = error ?? 'Saved';
     });
   }
 
-  /// Saves first, then asks the backend to push a test notification —
-  /// saving first so the button tests what's on screen rather than whatever
-  /// was stored on a previous visit.
-  Future<void> _testNtfy() async {
-    await _saveNtfy();
-    if (!mounted) return;
-    setState(() => _isSavingNtfy = true);
-    final sent = await context.read<BackendService>().sendTestNotification();
+  /// Asks the backend to send a test alert over every channel set up on the
+  /// laptop, and shows what happened. Waits for the real outcome (a few
+  /// seconds at most), because "configured" and "works" are different things.
+  Future<void> _testAlerts() async {
+    setState(() {
+      _isTestingAlerts = true;
+      _alertTest = null;
+    });
+    final result = await context.read<BackendService>().sendTestAlert();
     if (!mounted) return;
     setState(() {
-      _isSavingNtfy = false;
-      _ntfyMessage = sent
-          ? 'Test sent — check the ntfy app'
-          : 'Set a topic first';
+      _isTestingAlerts = false;
+      _alertTest = result;
     });
   }
 
@@ -159,10 +160,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// which fetched the whole of `/state` (event log included) to pull out one
   /// field. More importantly, each of those getters swallowed transport
   /// failures and fell back to its own default — so an unreachable backend
-  /// produced a screen that looked fully loaded, showing a blank emergency
-  /// number and a blank ntfy topic as if that were the real configuration.
-  /// One tap on save then wrote the blanks back, turning off the only alert
-  /// channel that works when the app is closed. A null result now means
+  /// produced a screen that looked fully loaded, showing default values as if
+  /// they were the real configuration. One tap on save then wrote the
+  /// defaults back over the real settings. A null result now means
   /// exactly what it says, and the screen refuses to pretend otherwise.
   ///
   /// The `mounted` check guards the subsequent [setState] in case the user
@@ -176,12 +176,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       _nightMode = settings.nightMode;
+      _alertsEnabled = settings.alertsEnabled;
+      _alertEmailsController.text = settings.alertEmails.join(', ');
+      _escalationEmailsController.text = settings.escalationEmails.join(', ');
       _nightModeArmHour = settings.nightModeArmHour;
       _nightModeDisarmHour = settings.nightModeDisarmHour;
-      _emergencyController.text = settings.emergencyNumber;
       _policeCallDelay.value = settings.policeCallDelaySeconds.toDouble();
-      _ntfyServerController.text = settings.ntfy.server;
-      _ntfyTopicController.text = settings.ntfy.topic;
       _settingsFailed = false;
       _settingsLoaded = true;
     });
@@ -194,18 +194,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _loadSettings();
   }
 
-  /// Disposes the four text controllers backing the password-change form
-  /// (and the emergency-number field) to release their resources.
+  /// Disposes the text controllers backing the password-change form and the
+  /// backend-URL field to release their resources.
   @override
   void dispose() {
     _oldController.dispose();
     _newController.dispose();
     _confirmController.dispose();
-    _emergencyController.dispose();
     _backendUrlController.dispose();
-    _ntfyServerController.dispose();
-    _ntfyTopicController.dispose();
     _policeCallDelay.dispose();
+    _alertEmailsController.dispose();
+    _escalationEmailsController.dispose();
     super.dispose();
   }
 
@@ -282,8 +281,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Three body states, not two: a spinner while loading, a retry prompt if
   /// the load failed, and the form once real values are in hand (see
   /// [_loadSettings] for why a failure must not fall through to the form).
-  /// The sections are the night-mode switch, push notifications, emergency
-  /// contact, change-password form, keypad PIN, and backend URL, each inside
+  /// The sections are the night-mode switch, alerts, change-password form,
+  /// keypad PIN, and backend URL, each inside
   /// its own [_SectionCard]. The backend-URL section doesn't wait on
   /// [_settingsLoaded] conceptually (it loads independently in [initState])
   /// but is still gated behind the same spinner for a simpler
@@ -382,118 +381,105 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           children: [
                             const HomeGuardIcon(HGIcon.emergency, color: AppColors.system, size: 20),
                             const SizedBox(width: 10),
-                            const Text(
-                              'Push notifications',
-                              style: TextStyle(color: AppColors.textPrimary),
-                            ),
+                            const Text('Alerts', style: TextStyle(color: AppColors.textPrimary)),
                           ],
                         ),
                         const SizedBox(height: 6),
-                        Text(
-                          'Alerts reach your phone even when HomeGuard is closed. '
-                          'Install the ntfy app and subscribe to the same topic.',
-                          style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                        ),
-                        const SizedBox(height: 14),
-                        TextField(
-                          controller: _ntfyServerController,
-                          keyboardType: TextInputType.url,
-                          autocorrect: false,
-                          style: const TextStyle(color: AppColors.textPrimary),
-                          decoration: const InputDecoration(labelText: 'ntfy server'),
+                        // The master switch. Off keeps the alarm, the siren and the
+                        // app exactly as they are and only stops the outgoing
+                        // messages, so a bench test does not flood an inbox.
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _alertsEnabled,
+                          activeThumbColor: AppColors.system,
+                          onChanged: (value) async {
+                            setState(() => _alertsEnabled = value);
+                            await context.read<BackendService>().setAlertsEnabled(value);
+                          },
+                          title: const Text(
+                            'Send alerts by email',
+                            style: TextStyle(color: AppColors.textPrimary),
+                          ),
+                          subtitle: Text(
+                            _alertsEnabled
+                                ? 'On: an alarm emails you'
+                                : 'OFF: the alarm still sounds, but nothing is emailed',
+                            style: TextStyle(
+                              color: _alertsEnabled ? AppColors.textMuted : AppColors.transitional,
+                              fontSize: 12,
+                            ),
+                          ),
                         ),
                         const SizedBox(height: 10),
                         TextField(
-                          controller: _ntfyTopicController,
+                          controller: _alertEmailsController,
+                          keyboardType: TextInputType.emailAddress,
                           autocorrect: false,
                           style: const TextStyle(color: AppColors.textPrimary),
                           decoration: const InputDecoration(
-                            labelText: 'Topic (leave empty to disable)',
+                            labelText: 'Email these addresses on every alarm',
+                            hintText: 'you@example.com, partner@example.com',
                           ),
                         ),
-                        const SizedBox(height: 8),
-                        // Not a footnote: on the public ntfy.sh the topic name
-                        // is the only thing stopping a stranger from reading
-                        // this house's alarm notifications.
-                        Text(
-                          'Anyone who knows the topic name can read your alerts. '
-                          'Use a long random name, or self-host.',
-                          style: TextStyle(color: AppColors.transitional, fontSize: 11),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _escalationEmailsController,
+                          keyboardType: TextInputType.emailAddress,
+                          autocorrect: false,
+                          style: const TextStyle(color: AppColors.textPrimary),
+                          decoration: const InputDecoration(
+                            labelText: 'Also email these if the alarm is not cleared in time',
+                            hintText: 'emergency contacts (optional)',
+                          ),
                         ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: _isSavingNtfy ? null : _saveNtfy,
-                                child: const Text('SAVE'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: OutlinedButton(
-                                // Sending a test before relying on this is the
-                                // difference between "configured" and "works".
-                                onPressed: _isSavingNtfy ? null : _testNtfy,
-                                child: const Text('SEND TEST'),
-                              ),
-                            ),
-                          ],
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton(
+                            onPressed: _isSavingEmails ? null : _saveEmails,
+                            child: Text(_isSavingEmails ? 'SAVING…' : 'SAVE ADDRESSES'),
+                          ),
                         ),
-                        if (_ntfyMessage != null) ...[
-                          const SizedBox(height: 10),
+                        if (_emailsMessage != null) ...[
+                          const SizedBox(height: 8),
                           Text(
-                            _ntfyMessage!,
-                            style: TextStyle(color: AppColors.safe, fontSize: 12),
+                            _emailsMessage!,
+                            style: TextStyle(
+                              color: _emailsOk ? AppColors.safe : AppColors.alarm,
+                              fontSize: 12,
+                            ),
                           ),
                         ],
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  _SectionCard(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            const HomeGuardIcon(HGIcon.emergency, color: AppColors.system, size: 20),
-                            const SizedBox(width: 10),
-                            const Text('Emergency contact', style: TextStyle(color: AppColors.textPrimary)),
-                          ],
-                        ),
-                        const SizedBox(height: 6),
-                        // Reworded to match what actually happens. This used
-                        // to say the number would be "auto-called", which no
-                        // code anywhere did — placing a real call needs a
-                        // telephony provider. What the system does do is push
-                        // a second, urgent notification naming this contact
-                        // if nobody clears the alarm in time.
+                        const SizedBox(height: 10),
+                        // What actually happens, and where it is configured: the
+                        // credentials live in a file on the laptop, never in this
+                        // app, so there is nothing to type here — only a way to
+                        // prove the setup works before a real alarm depends on it.
                         Text(
-                          "If an alarm isn't cleared in time, an urgent notification "
-                          'tells you to call this number.',
+                          'When an alarm triggers, HomeGuard emails the addresses above, '
+                          'so it reaches you even with this page closed. If the alarm is '
+                          'not cleared in time, the emergency contacts are emailed too. '
+                          'The sending account and its password are set up on the laptop.',
                           style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                         ),
                         const SizedBox(height: 14),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _emergencyController,
-                                keyboardType: TextInputType.phone,
-                                style: const TextStyle(color: AppColors.textPrimary),
-                                decoration: const InputDecoration(labelText: 'Phone number'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            IconButton.filled(
-                              onPressed: () => context
-                                  .read<BackendService>()
-                                  .setEmergencyNumber(_emergencyController.text.trim()),
-                              icon: const Icon(Icons.save_outlined),
-                            ),
-                          ],
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton(
+                            onPressed: _isTestingAlerts ? null : _testAlerts,
+                            child: Text(_isTestingAlerts ? 'SENDING…' : 'SEND TEST ALERT'),
+                          ),
                         ),
+                        if (_alertTest != null) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            _alertTest!.summary,
+                            style: TextStyle(
+                              color: _alertTest!.ok ? AppColors.safe : AppColors.alarm,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 18),
                         // Scoped to the label + slider so a drag doesn't
                         // rebuild the rest of the screen — see the comment on
@@ -504,7 +490,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                'Escalate if not cleared within: ${delay.round()}s',
+                                'Email the emergency contacts if not cleared within: ${delay.round()}s',
                                 style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                               ),
                               Slider(
@@ -686,10 +672,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 /// The alternative — the one this replaced — was rendering the form anyway,
 /// populated entirely from the client-side defaults each getter fell back to.
 /// That is a uniquely bad failure mode for this particular screen: the
-/// defaults are an empty emergency number and an empty ntfy topic, and an
-/// empty topic *means* "push notifications off". Saving what appeared to be
-/// the current settings would have silently disabled the only alerts that
-/// arrive with the app closed.
+/// defaults are blank values that *mean* "feature off". Saving what appeared
+/// to be the current settings would have silently overwritten the real ones.
 class _SettingsLoadFailed extends StatelessWidget {
   const _SettingsLoadFailed({required this.onRetry});
 
@@ -760,7 +744,7 @@ class _HourPicker extends StatelessWidget {
 }
 
 /// Rounded, padded surface used to visually group each settings section
-/// (night mode, emergency contact, change password) on the screen.
+/// (night mode, alerts, change password) on the screen.
 class _SectionCard extends StatelessWidget {
   const _SectionCard({required this.child});
 

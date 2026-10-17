@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
@@ -8,8 +7,8 @@ import 'notification_service.dart';
 
 /// Bridges [BackendService]'s streams into a single [ChangeNotifier] the
 /// widget tree can `watch`/`read` with `provider`, and adds the small
-/// bits of derived/demo behavior the UI needs on top (triggered-alert
-/// notifications, [simulateIntrusion], [simulateFaceRecognition]).
+/// bits of derived behavior the UI needs on top (triggered-alert
+/// notifications).
 ///
 /// Must be constructed eagerly (see the `lazy: false` + comment on its
 /// provider in main.dart), not lazily on first read: its constructor is
@@ -269,20 +268,6 @@ class AlarmService extends ChangeNotifier {
   Future<void> removeFace(String id) => _backend.removeFace(id);
   Future<void> setFaceIdEnabled(bool enabled) => _backend.setFaceIdEnabled(enabled);
   Future<void> setFaceDisarmEnabled(bool enabled) => _backend.setFaceDisarmEnabled(enabled);
-
-  /// Demo-only: picks one of the currently-monitored (non-bypassed)
-  /// sensors and triggers it, so the alert flow can be seen without real
-  /// hardware. Works against either backend — triggerAlert is a real
-  /// interface method, not mock-specific.
-  void simulateIntrusion() {
-    final monitored = _sensors.where((s) => !s.bypassed).toList();
-    if (monitored.isEmpty) return;
-    final sensor = monitored[Random().nextInt(monitored.length)];
-    _backend.triggerAlert(source: sensor.type, reason: '${sensor.label} breached');
-  }
-
-  /// Demo-only pass-through (see [BackendService.simulateFaceRecognition]).
-  void simulateFaceRecognition() => _backend.simulateFaceRecognition();
 
   /// Marks [lastError] as handled, so the same message isn't shown twice on
   /// the next rebuild. Called by the widget that displayed it.

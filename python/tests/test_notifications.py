@@ -176,10 +176,10 @@ async def test_topic_is_not_written_to_the_event_log(state):
 
 
 async def test_test_notification_reports_whether_it_is_configured(state, sent):
-    assert await state.send_test_notification() is False
+    assert await state.send_test_notification() == {}
 
     await state.set_ntfy("https://ntfy.example", "topic")
-    assert await state.send_test_notification() is True
+    assert await state.send_test_notification() == {"ntfy": ""}
     await drain()
     assert len(sent) == 1
     # Not an emergency — must not use the alarm's priority or icon.

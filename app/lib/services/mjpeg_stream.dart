@@ -104,21 +104,74 @@ class MjpegFrameParser {
 /// screen just listens to [frames] and doesn't need to know a reconnect
 /// ever happened.
 class MjpegStreamClient {
-  MjpegStreamClient({required this.streamUrl, required this.headers});
+  MjpegStreamClient({required this.streamUrl, required this.headers, this.snapshotUrl});
 
   final String streamUrl;
   final Map<String, String> headers;
 
+  /// A URL that returns the latest single JPEG (the backend's `/camera/latest`),
+  /// used as a safety net: if the live stream has produced no frame for a few
+  /// seconds — some browsers will not deliver a continuous multipart stream to
+  /// a page — the client shows a refreshed still every half second instead of a
+  /// black box, and goes back to the live stream the moment it delivers a frame.
+  final String? snapshotUrl;
+
+  /// How long the stream may stay silent before the still-image fallback starts.
+  static const _stallTimeout = Duration(seconds: 4);
+  static const _snapshotInterval = Duration(milliseconds: 500);
+
   http.Client? _client;
+  http.Client? _snapshotClient;
   StreamSubscription<List<int>>? _sub;
   Timer? _reconnectTimer;
+  Timer? _stallTimer;
+  Timer? _snapshotTimer;
+  bool _snapshotInFlight = false;
   final _frames = StreamController<Uint8List>.broadcast();
   bool _disposed = false;
 
   Stream<Uint8List> get frames => _frames.stream;
 
+  /// Called for every frame that came from the live stream: the stream works,
+  /// so no fallback is needed.
+  void _streamDelivered() {
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    _snapshotTimer?.cancel();
+    _snapshotTimer = null;
+  }
+
+  /// Arms the watchdog that starts the still-image fallback (see [snapshotUrl]).
+  void _armStallWatchdog() {
+    if (snapshotUrl == null || _snapshotTimer != null) return;
+    _stallTimer ??= Timer(_stallTimeout, () {
+      _stallTimer = null;
+      if (_disposed || _snapshotTimer != null) return;
+      _snapshotTimer = Timer.periodic(_snapshotInterval, (_) => _fetchSnapshot());
+      _fetchSnapshot();
+    });
+  }
+
+  Future<void> _fetchSnapshot() async {
+    final url = snapshotUrl;
+    if (url == null || _disposed || _snapshotInFlight) return;
+    _snapshotInFlight = true;
+    try {
+      _snapshotClient ??= http.Client();
+      final response = await _snapshotClient!.get(Uri.parse(url), headers: headers);
+      if (response.statusCode == 200 && response.bodyBytes.isNotEmpty && !_frames.isClosed) {
+        _frames.add(response.bodyBytes);
+      }
+    } catch (_) {
+      // Next tick tries again; a missed still is not worth reporting.
+    } finally {
+      _snapshotInFlight = false;
+    }
+  }
+
   Future<void> connect() async {
     if (_disposed) return;
+    _armStallWatchdog();
     _client = http.Client();
     try {
       final request = http.Request('GET', Uri.parse(streamUrl))..headers.addAll(headers);
@@ -138,6 +191,7 @@ class MjpegStreamClient {
       _sub = response.stream.listen(
         (chunk) {
           for (final frame in parser.addChunk(chunk)) {
+            _streamDelivered();
             if (!_frames.isClosed) _frames.add(frame);
           }
         },
@@ -164,8 +218,11 @@ class MjpegStreamClient {
   void dispose() {
     _disposed = true;
     _reconnectTimer?.cancel();
+    _stallTimer?.cancel();
+    _snapshotTimer?.cancel();
     _sub?.cancel();
     _client?.close();
+    _snapshotClient?.close();
     _frames.close();
   }
 }
