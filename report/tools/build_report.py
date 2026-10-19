@@ -25,7 +25,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Emu, Inches, Pt, RGBColor
+from docx.shared import Emu, Inches, Mm, Pt, RGBColor
 from PIL import Image
 
 REPORT_DIR = Path(sys.argv[1])
@@ -34,7 +34,7 @@ OUT = Path(sys.argv[3])
 FONT = "Arial"
 HEBREW = re.compile(r"[֐-׿]")
 PLACEHOLDER = re.compile(r"\[(הכנס|להשלים|לאמת|הוסף קישור|תאריך)|dd/mm/yy")
-MAX_W_IN, MAX_H_IN = 6.3, 8.0
+MAX_W_IN, MAX_H_IN = 6.25, 8.0  # A4 text width: 8.27 in minus 2 in of margins
 
 PARTS = ["HomeGuard_Report.md"]
 REFERENCES_FILE = "references.json"
@@ -182,9 +182,21 @@ def make_reference(path: Path):
     doc = Document(str(path))
     st = doc.styles
     sec = doc.sections[0]
-    sec.page_width, sec.page_height = Inches(8.5), Inches(11)
+    sec.page_width, sec.page_height = Mm(210), Mm(297)  # A4
     for m in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
         setattr(sec, m, Inches(1))
+    # docDefaults still points at the theme font (Calibri); anything that no style
+    # overrides would fall back to it, so make Arial the default too
+    dd = st.element.find(qn("w:docDefaults"))
+    if dd is not None:
+        rpr_d = dd.find(".//" + qn("w:rPr"))
+        rf_d = rpr_d.find(qn("w:rFonts")) if rpr_d is not None else None
+        if rf_d is not None:
+            for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+                rf_d.set(qn(a), FONT)
+            for a in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
+                if rf_d.get(qn(a)) is not None:
+                    del rf_d.attrib[qn(a)]
 
     def style_pf(style, size=12, bold=None, italic=None, spacing=1.5, before=0, after=6, align=None,
                  keep_next=None, color=RGBColor(0, 0, 0), bidi=True):
@@ -226,9 +238,10 @@ def make_reference(path: Path):
         if n in names:
             style_pf(names[n], 12, spacing=1.5, after=6,
                      align=WD_ALIGN_PARAGRAPH.JUSTIFY if n in ("Body Text", "First Paragraph") else None)
-    # table cell text: single spacing, 11pt
+    # table cell text: 12pt like the body, single spacing (list items are moved to
+    # Body Text in style_special_paragraphs, so they keep 1.5)
     if "Compact" in names:
-        style_pf(names["Compact"], 11, spacing=1.0, after=2, align=None)
+        style_pf(names["Compact"], 12, spacing=1.0, after=2, align=None)
         names["Compact"].base_style = names["Normal"]
     sizes = {"Heading 1": (18, 18, 8), "Heading 2": (14, 14, 6), "Heading 3": (13, 10, 4),
              "Heading 4": (12, 8, 4), "Heading 5": (12, 6, 3), "Heading 6": (12, 6, 3)}
@@ -238,15 +251,17 @@ def make_reference(path: Path):
                      align=None, keep_next=True)
     for n in ("Caption", "Image Caption"):
         if n in names:
-            style_pf(names[n], 11, bold=False, italic=False, spacing=1.0, before=2, after=10,
-                     align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x33, 0x33, 0x33))
+            style_pf(names[n], 12, bold=False, italic=False, spacing=1.0, before=2, after=10,
+                     align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0, 0, 0))
     if "Verbatim Char" in names:
+        # inline code (the keypad keys * and #): Arial like everything else, bold to stand out
         vc = names["Verbatim Char"]
-        vc.font.name = "Courier New"
-        vc.font.size = Pt(10.5)
+        vc.font.name = FONT
+        vc.font.size = Pt(12)
+        vc.font.bold = True
         rf = vc.element.get_or_add_rPr().find(qn("w:rFonts"))
         for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-            rf.set(qn(a), "Courier New")
+            rf.set(qn(a), FONT)
     if "Hyperlink" in names:
         names["Hyperlink"].font.color.rgb = RGBColor(0x1A, 0x56, 0xC0)
     doc.save(str(path))
@@ -416,6 +431,9 @@ def style_table(table):
                 if ri == 0:
                     for r in p.runs:
                         r.font.bold = True
+                # a short table is kept on one page; long ones may break (the header row repeats)
+                if len(table.rows) <= 10 and ri < len(table.rows) - 1:
+                    p.paragraph_format.keep_with_next = True
 
 
 def fit_size(path, max_w_in=MAX_W_IN, max_h_in=MAX_H_IN):
@@ -484,6 +502,11 @@ def replace_image_tokens(doc):
 
 def style_special_paragraphs(doc):
     for p in doc.paragraphs:
+        # body-level paragraphs in Compact are list items (table cells are not in
+        # doc.paragraphs): give them the body formatting, Arial 12 at 1.5 spacing
+        if p.style.name == "Compact":
+            p.style = doc.styles["Body Text"]
+            p.paragraph_format.space_after = Pt(3)
         txt = p.text.strip()
         if not txt:
             continue
@@ -492,6 +515,10 @@ def style_special_paragraphs(doc):
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.keep_with_next = False
         elif re.match(r"^טבלה \d+:", txt):
+            # the sentence that introduces the table stays on the same page as its caption
+            idx = next(i for i, q in enumerate(doc.paragraphs) if q._p is p._p)
+            if idx > 0 and not doc.paragraphs[idx - 1].style.name.startswith("Heading"):
+                doc.paragraphs[idx - 1].paragraph_format.keep_with_next = True
             p.style = doc.styles["Image Caption"]
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.keep_with_next = True
@@ -510,7 +537,7 @@ def style_special_paragraphs(doc):
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             pf = p.paragraph_format
             pf.left_indent, pf.first_line_indent = Inches(0.4), Inches(-0.4)
-            pf.line_spacing, pf.space_after = 1.15, Pt(6)
+            pf.line_spacing, pf.space_after = 1.5, Pt(4)
         elif txt.startswith("[הכנס"):
             ppr = p._p.get_or_add_pPr()
             bdr = OxmlElement("w:pBdr")
@@ -530,7 +557,7 @@ def style_special_paragraphs(doc):
     # headings: chapter headings start a new page
     for p in doc.paragraphs:
         if p.style.name == "Heading 1" and (
-                p.text.startswith(("1.", "7.", "8.")) or "תקציר" in p.text):
+                p.text.startswith(("1.", "7.")) or "תקציר" in p.text):
             p.paragraph_format.page_break_before = True
 
 
@@ -577,7 +604,7 @@ def add_page_number_footer(doc):
             fc.set(qn("w:fldCharType"), kind)
             run._r.append(fc)
     run.font.name = FONT
-    run.font.size = Pt(11)
+    run.font.size = Pt(12)
 
 
 def para(doc_or_cell, text="", size=12, bold=False, align=WD_ALIGN_PARAGRAPH.CENTER, before=0, after=6, hl=False,
@@ -708,6 +735,10 @@ def normalize_order(root):
 
 def fix_sections(doc):
     for sec in doc.element.body.iter(qn("w:sectPr")):
+        pgsz = sec.find(qn("w:pgSz"))
+        if pgsz is not None:  # A4, whatever the reference document said
+            pgsz.set(qn("w:w"), "11906")
+            pgsz.set(qn("w:h"), "16838")
         pg = sec.find(qn("w:pgMar"))
         if pg is not None:
             for a, v in (("w:header", "708"), ("w:footer", "708"), ("w:gutter", "0")):
