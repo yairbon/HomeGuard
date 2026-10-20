@@ -42,6 +42,12 @@ MAX_LOGIN_ATTEMPTS = 3
 LOCKOUT_DURATION = timedelta(seconds=30)
 ARMING_EXIT_DELAY = timedelta(seconds=3)
 
+# The sensors Home mode ignores: the two on the sensor board (distance and
+# vibration), so people can move around inside while the system is armed. The
+# door sensor stays monitored in both modes — an opened door still starts the
+# entry countdown.
+HOME_BYPASSED_SENSORS = frozenset({SensorType.ultrasonic, SensorType.vibration})
+
 # How long past the door controller's own entry-delay deadline the backend
 # waits before raising the alarm itself. See `_entry_delay_watchdog`: the
 # controller is meant to report the outcome, and this is the fallback for when
@@ -1022,8 +1028,9 @@ class AppState:
     def _apply_bypass(self, mode: ArmMode) -> None:
         """Resets every sensor to ok and applies `mode`'s bypass rules.
 
-        Home mode bypasses the vibration sensor (people moving around inside
-        shouldn't trip it); Away mode bypasses nothing. Factored out of
+        Home mode bypasses the distance and vibration sensors (people moving
+        around inside shouldn't trip them); the door sensor stays active. Away
+        mode bypasses nothing. Factored out of
         `_finish_arming` so `report_state_from_esp32` can apply the exact
         same rules when the door controller is what puts the system into
         `armed` — previously that path had no way to do this and Home mode's
@@ -1034,7 +1041,7 @@ class AppState:
                 type=s.type,
                 label=s.label,
                 ok=True,
-                bypassed=(mode == ArmMode.home and s.type == SensorType.vibration),
+                bypassed=(mode == ArmMode.home and s.type in HOME_BYPASSED_SENSORS),
             )
             for s in self.sensors
         ]
@@ -1170,7 +1177,7 @@ class AppState:
         # The controller reports only armed/disarmed, never which mode was
         # requested — so the mode comes from `_arm_mode`, which `arm()`
         # recorded when the request came in. That's what lets Home mode's
-        # vibration bypass survive the controller winning the race to set
+        # sensor bypass survive the controller winning the race to set
         # `armed`; arming from the physical keypad (which the app never told
         # us a mode for) falls back to the last mode used, defaulting to Away
         # — the stricter of the two, so an unknown mode never silently
@@ -1272,10 +1279,10 @@ class AppState:
             # expiry arrives here as the controller's door alert.
             return
 
-        # A bypassed sensor (e.g. vibration in Home mode) is expected to
-        # keep firing physically — that board doesn't know about arm
+        # A bypassed sensor (distance or vibration in Home mode) is expected
+        # to keep firing physically — that board doesn't know about arm
         # modes, it just reports. It's this check, not the board, that
-        # makes Home mode's "ignore vibration" promise actually hold.
+        # makes Home mode's "ignore these sensors" promise actually hold.
         if source is not None:
             reporting_sensor = next((s for s in self.sensors if s.type == source), None)
             if reporting_sensor is not None and reporting_sensor.bypassed:

@@ -255,6 +255,8 @@ time.sleep(3.5)
 state = c.get("/state").json()
 vib = next(s for s in state["sensors"] if s["type"] == "vibration")
 check("vibration sensor is bypassed in Home mode", vib["bypassed"] is True, vib)
+dist = next(s for s in state["sensors"] if s["type"] == "ultrasonic")
+check("distance sensor is bypassed in Home mode", dist["bypassed"] is True, dist)
 
 r = c.post(
     "/trigger-alert", json={"source": "vibration", "reason": "test vibration while bypassed"}
@@ -262,6 +264,16 @@ r = c.post(
 state = c.get("/state").json()
 check(
     "bypassed vibration sensor does NOT escalate to alarm",
+    state["alarm_state"] == "armed",
+    f"expected still 'armed', got {state['alarm_state']}",
+)
+
+r = c.post(
+    "/trigger-alert", json={"source": "ultrasonic", "reason": "test distance while bypassed"}
+)
+state = c.get("/state").json()
+check(
+    "bypassed distance sensor does NOT escalate to alarm",
     state["alarm_state"] == "armed",
     f"expected still 'armed', got {state['alarm_state']}",
 )

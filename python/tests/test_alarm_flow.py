@@ -66,12 +66,12 @@ async def test_arm_is_ignored_unless_disarmed(state):
     assert state.alarm_state == AlarmState.triggered
 
 
-async def test_home_mode_bypasses_vibration_only(state):
+async def test_home_mode_bypasses_distance_and_vibration(state):
     await arm_now(state, ArmMode.home)
     by_type = {s.type: s for s in state.sensors}
     assert by_type[SensorType.vibration].bypassed is True
+    assert by_type[SensorType.ultrasonic].bypassed is True
     assert by_type[SensorType.door].bypassed is False
-    assert by_type[SensorType.ultrasonic].bypassed is False
 
 
 async def test_away_mode_bypasses_nothing(state):
@@ -79,13 +79,21 @@ async def test_away_mode_bypasses_nothing(state):
     assert all(not s.bypassed for s in state.sensors)
 
 
-async def test_bypassed_sensor_does_not_escalate(state):
-    """The Home-mode promise: the vibration board keeps physically firing
-    (it has no idea the system is in Home mode), and the backend is what
-    decides to ignore it."""
+@pytest.mark.parametrize("sensor", [SensorType.vibration, SensorType.ultrasonic])
+async def test_bypassed_sensor_does_not_escalate(state, sensor):
+    """The Home-mode promise: the sensor board keeps physically firing (it has
+    no idea the system is in Home mode), and the backend is what decides to
+    ignore it."""
     await arm_now(state, ArmMode.home)
-    await state.trigger_alert(SensorType.vibration, "someone walking around inside")
+    await state.trigger_alert(sensor, "someone walking around inside")
     assert state.alarm_state == AlarmState.armed
+
+
+@pytest.mark.parametrize("sensor", [SensorType.vibration, SensorType.ultrasonic])
+async def test_away_mode_escalates_on_every_board_sensor(state, sensor):
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(sensor, "intrusion")
+    assert state.alarm_state == AlarmState.triggered
 
 
 async def test_non_bypassed_sensor_escalates(state):
@@ -108,18 +116,20 @@ async def test_alerts_are_ignored_when_not_armed(state, initial):
 async def test_controller_report_reapplies_home_bypass(state):
     """The bug this closes: the door controller reports only armed/disarmed,
     never the mode. When its report was what put the system into `armed`
-    (rather than our own exit-delay timer), Home mode's vibration bypass was
+    (rather than our own exit-delay timer), Home mode's sensor bypass was
     silently lost — so a Home-armed system would alarm on someone walking
-    past the vibration sensor indoors.
+    past the distance or vibration sensor indoors.
     """
     await state.arm(ArmMode.home)  # records the mode, still transitional
     await state.report_state_from_esp32(armed=True)
 
     assert state.alarm_state == AlarmState.armed
-    vibration = next(s for s in state.sensors if s.type == SensorType.vibration)
-    assert vibration.bypassed is True, "Home mode's bypass was lost on the controller's report"
+    for sensor in (SensorType.vibration, SensorType.ultrasonic):
+        reading = next(s for s in state.sensors if s.type == sensor)
+        assert reading.bypassed is True, "Home mode's bypass was lost on the controller's report"
 
     await state.trigger_alert(SensorType.vibration, "movement inside")
+    await state.trigger_alert(SensorType.ultrasonic, "walking past the sensor")
     assert state.alarm_state == AlarmState.armed
 
 

@@ -130,7 +130,7 @@ class HomeScreen extends StatelessWidget {
                                 child: _ArmModeCard(
                                   icon: HGIcon.armHome,
                                   title: 'ARM HOME',
-                                  subtitle: 'Perimeter only — move around inside',
+                                  subtitle: 'Door only — move around inside',
                                   onTap: canArm ? () => alarm.arm(ArmMode.home) : null,
                                 ),
                               ),

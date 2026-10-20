@@ -1,7 +1,9 @@
-# HomeGuard ESP32 Firmware — 4 Boards
+# HomeGuard ESP32 Firmware — 3 Boards
 
-Four separate ESP32 boards, each its own sketch (Arduino IDE requires the
-folder name to match the `.ino` filename — already set up that way).
+Four sketches, each in its own folder (Arduino IDE requires the folder name to
+match the `.ino` filename — already set up that way). In the final build three
+physical boards are used: board 1 also carries the vibration sensor, so board
+2's standalone sketch is not flashed onto a board of its own.
 
 | Board | Sketch | Role |
 |---|---|---|

@@ -873,8 +873,8 @@ bool authorized() {
 // (see esp32_client.py send_arm). Note: isHomeMode below only affects
 // the Serial log — this board's state machine doesn't branch on Home vs
 // Away; that distinction is enforced entirely on the backend side
-// (state.py bypasses the vibration sensor's alerts in Home mode
-// regardless of what this board reports).
+// (state.py bypasses the distance and vibration sensors' alerts in Home
+// mode regardless of what this board reports).
 void handleRemoteArm() {
   if (!authorized()) return;
   String body = server.arg("plain");
