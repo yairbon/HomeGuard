@@ -622,8 +622,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                         const SizedBox(height: 6),
                         Text(
-                          'Where the app looks for the backend. Use a private-network '
-                          '(e.g. Tailscale) address to reach it off your home WiFi.',
+                          'Where the app looks for the backend: the address of the '
+                          'computer that runs it, on your home WiFi.',
                           style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                         ),
                         const SizedBox(height: 14),

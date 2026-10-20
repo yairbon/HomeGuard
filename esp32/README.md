@@ -165,8 +165,8 @@ Two independent jobs, on two independent paths:
    `multipart/x-mixed-replace` MJPEG feed. The backend connects to it and
    relays the bytes on to the app (`/camera/stream` in
    `python/backend/main.py`), so the phone never talks to this board directly
-   and the feed works from anywhere the backend is reachable (Tailscale
-   included), not just on the local WiFi.
+   and the feed works from anywhere the backend is reachable, not just on
+   the local WiFi.
 
 The stream server uses **`esp_http_server`, not Arduino's `WebServer`** — and
 that's load-bearing, not a style choice. `httpd_start()` runs the handler on
