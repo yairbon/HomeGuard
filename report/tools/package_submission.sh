@@ -17,7 +17,7 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/HomeGuard_Submission/code"
 cp "$pdf" "$stage/HomeGuard_Submission/$(basename "$pdf")"
 for extra in "$@"; do cp "$extra" "$stage/HomeGuard_Submission/$(basename "$extra")"; done
-git -C "$root" archive HEAD -- . ':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report' | tar -x -C "$stage/HomeGuard_Submission/code"
+git -C "$root" archive HEAD -- . ':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report' ':(exclude)submission' | tar -x -C "$stage/HomeGuard_Submission/code"
 # a 3D-model folder is expected by the course; create it only if there is something to put in it
 if [ -d "$root/3d" ]; then cp -r "$root/3d" "$stage/HomeGuard_Submission/3d"; fi
 out_abs="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
