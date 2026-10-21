@@ -18,9 +18,8 @@ def main() -> None:
         sys.exit(__doc__)
     pdf_path, zip_path, out_path = (Path(a) for a in sys.argv[1:])
     with pikepdf.open(pdf_path) as pdf:
-        spec = pikepdf.AttachedFileSpec.from_filepath(
-            pdf, zip_path, mime_type="application/zip", description="HomeGuard source code"
-        )
+        # the MIME type (application/zip) is guessed from the file name
+        spec = pikepdf.AttachedFileSpec.from_filepath(pdf, zip_path, description="HomeGuard source code")
         pdf.attachments[zip_path.name] = spec
         pdf.save(out_path)
     with pikepdf.open(out_path) as pdf:
