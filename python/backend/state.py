@@ -1033,6 +1033,14 @@ class AppState:
         if self.alarm_state != AlarmState.disarmed:
             return
         self._arm_mode = mode
+        if mode == ArmMode.home:
+            # Home means someone stays inside, so there is nobody to walk out
+            # and no exit delay to wait for: armed at once.
+            self.alarm_state = AlarmState.armed
+            self._apply_bypass(mode)
+            self._log("System armed (Home)", EventCategory.armDisarm)
+            await self._broadcast()
+            return
         self._log(
             f"Arming ({'Away' if mode == ArmMode.away else 'Home'}) — exit now",
             EventCategory.armDisarm,
@@ -1051,9 +1059,9 @@ class AppState:
     def _apply_bypass(self, mode: ArmMode) -> None:
         """Resets every sensor to ok and applies `mode`'s bypass rules.
 
-        Home mode bypasses the distance and vibration sensors (people moving
-        around inside shouldn't trip them); the door sensor stays active. Away
-        mode bypasses nothing. Factored out of
+        Home mode bypasses both perimeter sensors, the ultrasonic one and the
+        vibration one (people moving around inside shouldn't trip them); the
+        door sensor stays live. Away mode bypasses nothing. Factored out of
         `_finish_arming` so `report_state_from_esp32` can apply the exact
         same rules when the door controller is what puts the system into
         `armed` — previously that path had no way to do this and Home mode's
@@ -1593,6 +1601,19 @@ class AppState:
         self._persist()
         await self._broadcast()
 
+    async def set_alerts_enabled(self, enabled: bool) -> None:
+        """Switches messages that leave the house on or off (email, WhatsApp,
+        ntfy). The alarm itself — siren, app state, event log — is unaffected;
+        only the outgoing messages stop, so a bench test does not flood an inbox.
+        Logged, because "why did no email arrive" must be answerable later."""
+        self.alerts_enabled = enabled
+        self._log(
+            "Alerts switched on" if enabled else "Alerts switched OFF — no messages will be sent",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
+
     async def set_alert_clip(self, enabled: bool, seconds: int) -> None:
         """Whether the breach email carries a video of the last few seconds, and
         how many (5-60, clamped). The camera frames are kept either way."""
@@ -1602,19 +1623,6 @@ class AppState:
             f"Alert video on, last {self.clip_seconds} s"
             if enabled
             else "Alert video switched off",
-            EventCategory.info,
-        )
-        self._persist()
-        await self._broadcast()
-
-    async def set_alerts_enabled(self, enabled: bool) -> None:
-        """Switches messages that leave the house on or off (email, WhatsApp,
-        ntfy). The alarm itself — siren, app state, event log — is unaffected;
-        only the outgoing messages stop, so a bench test does not flood an inbox.
-        Logged, because "why did no email arrive" must be answerable later."""
-        self.alerts_enabled = enabled
-        self._log(
-            "Alerts switched on" if enabled else "Alerts switched OFF — no messages will be sent",
             EventCategory.info,
         )
         self._persist()

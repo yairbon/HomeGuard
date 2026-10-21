@@ -21,6 +21,7 @@ the actual sketch if you change either side.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 
@@ -36,6 +37,41 @@ logger = logging.getLogger("esp32_client")
 # Find it by opening the Arduino IDE's Serial Monitor after that board
 # boots — it prints its assigned IP on connect.
 DOOR_CONTROLLER_URL = os.environ.get("HOMEGUARD_DOOR_CONTROLLER_URL", "")
+
+
+def private_board_address(host: str | None) -> str | None:
+    """`host` if it is an ordinary private IPv4 address a board on the local
+    network could have, else None. Loopback, link-local, multicast, unspecified
+    and public addresses are refused, so a request that did not come from the
+    local network never changes where commands are sent."""
+    try:
+        ip = ipaddress.ip_address(host or "")
+    except ValueError:
+        return None
+    if ip.version != 4 or not ip.is_private:
+        return None
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return None
+    return str(ip)
+
+
+def learn_door_address(host: str | None) -> bool:
+    """Points door commands at the address the door board's own request came
+    from. The configured value (HOMEGUARD_DOOR_CONTROLLER_URL) is only the
+    starting point: a router or a phone hotspot hands out different addresses,
+    and a stale one made every arm and disarm silently miss the board. Returns
+    whether the address changed. Authentication is untouched: the caller has
+    already proved it holds the device key."""
+    global DOOR_CONTROLLER_URL
+    address = private_board_address(host)
+    if address is None:
+        return False
+    new = f"http://{address}"
+    if new == DOOR_CONTROLLER_URL:
+        return False
+    logger.info("Door controller address: %s -> %s", DOOR_CONTROLLER_URL or "(none)", new)
+    DOOR_CONTROLLER_URL = new
+    return True
 
 # `build_client` is what supplies `trust_env=False` here, and that matters
 # more on this client than on any other: the target is a bare LAN IP, and a

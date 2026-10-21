@@ -567,15 +567,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             children: [
                               const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
                               const SizedBox(width: 10),
-                              const Text('Password & keypad PIN',
+                              const Text('Change PIN / password',
                                   style: TextStyle(color: AppColors.textPrimary)),
                             ],
                           ),
                           const SizedBox(height: 6),
                           const Text(
-                            'One shared code: logs into this app, and disarms at the '
-                            'physical keypad. Sent to the door controller, which '
-                            'stores it and keeps it across reboots.',
+                            'This is also the keypad PIN: 4 to 8 digits. One shared '
+                            'code that logs into this app and disarms at the physical '
+                            'keypad. Sent to the door controller, which stores it and '
+                            'keeps it across reboots.',
                             style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                           ),
                           const SizedBox(height: 16),

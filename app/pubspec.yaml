@@ -36,6 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   provider: ^6.1.2
+
+  # A clock the tests can drive: the entry countdown is computed from a deadline.
+  clock: ^1.1.1
   google_fonts: ^6.2.1
   flutter_local_notifications: ^18.0.1
   http: ^1.2.2

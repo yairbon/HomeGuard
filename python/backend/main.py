@@ -27,6 +27,7 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     WebSocket,
@@ -36,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
-from . import alerts, esp32_client, notifier
+from . import alerts, announce, esp32_client, notifier
 from .camera_hub import CameraHub
 from .face_recognition_service import FaceRecognitionService
 from .http_clients import build_client
@@ -166,9 +167,19 @@ async def lifespan(app: FastAPI):
     # then made from the 1-2 stills a second the camera pushes for face recognition.
     record = os.environ.get("HOMEGUARD_RECORD_CAMERA", "1").strip() != "0"
     recorder = asyncio.create_task(_record_camera()) if CAMERA_STREAM_URL and record else None
+    # HOMEGUARD_ANNOUNCE=0 stops the UDP broadcast that lets the boards find this computer.
+    announcer = (
+        asyncio.create_task(
+            announce.announce_forever(int(os.environ.get("HOMEGUARD_PORT", "8000")))
+        )
+        if os.environ.get("HOMEGUARD_ANNOUNCE", "1").strip() != "0"
+        else None
+    )
     yield
     if recorder is not None:
         recorder.cancel()
+    if announcer is not None:
+        announcer.cancel()
     await state.stop_monitor()
     # Every outbound client this process owns, closed on the way out. Leaving
     # them to the garbage collector means sockets to the door controller and
@@ -193,6 +204,7 @@ app = FastAPI(
 )
 
 _cors_logger = logging.getLogger("cors")
+logger = logging.getLogger("homeguard")
 
 
 def extra_cors_origins(raw: str) -> list[str]:
@@ -709,7 +721,7 @@ async def set_police_call_delay(body: SetPoliceCallDelayRequest):
 
 
 @app.post("/esp32/heartbeat", dependencies=[Depends(require_device)])
-async def esp32_heartbeat(board: str = Query(...)):
+async def esp32_heartbeat(request: Request, board: str = Query(...)):
     """Called every 10 seconds by each board to report that it's alive.
 
     `board` identifies which one, so the app can show each of the three
@@ -720,6 +732,8 @@ async def esp32_heartbeat(board: str = Query(...)):
     AppState.note_board_seen.
     """
     await state.note_board_seen(board)
+    if board == "door_controller" and request.client:
+        esp32_client.learn_door_address(request.client.host)
     return {"ok": True}
 
 
@@ -792,7 +806,7 @@ state.camera_frame_source = lambda: _latest_camera_frame
 
 
 @app.post("/camera/recognize", dependencies=[Depends(require_app_or_device)])
-async def recognize_frame(photo: UploadFile):
+async def recognize_frame(request: Request, photo: UploadFile):
     """Runs face recognition on a single camera frame. Marks the camera
     online unconditionally (a frame arrived, whether or not it matched),
     then short-circuits to "not matched" if face ID is toggled off —
@@ -808,6 +822,10 @@ async def recognize_frame(photo: UploadFile):
     embedding similarity.
     """
     await state.note_camera_frame()
+    # The camera's own push (device key, not an app token) tells us where it is.
+    presented = request.headers.get("x-device-key", "")
+    if request.client and hmac.compare_digest(presented, state.device_key):
+        learn_camera_address(request.client.host)
 
     # Read (and cache for /camera/latest) before the face-ID toggle check
     # below — the live view should keep working even with recognition
@@ -865,6 +883,21 @@ async def latest_camera_frame():
 # IP the same way as the door controller: check its Serial Monitor output
 # after boot.
 CAMERA_STREAM_URL = os.environ.get("HOMEGUARD_CAMERA_STREAM_URL", "")
+
+
+def learn_camera_address(host: str | None) -> bool:
+    """Points the live-stream reader at the address the camera's own push came
+    from (see esp32_client.learn_door_address for why). Returns whether it changed."""
+    global CAMERA_STREAM_URL
+    address = esp32_client.private_board_address(host)
+    if address is None:
+        return False
+    new = f"http://{address}/stream"
+    if new == CAMERA_STREAM_URL:
+        return False
+    logger.info("Camera stream address: %s -> %s", CAMERA_STREAM_URL or "(none)", new)
+    CAMERA_STREAM_URL = new
+    return True
 
 # A dedicated client, deliberately separate from esp32_client.py's `_client`
 # (tuned for short 3s command POSTs to the door controller) and from any

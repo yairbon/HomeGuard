@@ -182,3 +182,58 @@ def test_pushed_stills_are_ignored_while_the_live_stream_delivers(state):
     state._stream_frame_at = time.time() - 10  # the stream went quiet
     state.record_clip_frame(jpeg(3))
     assert len(state.clip_frames) == 2
+
+
+# ---- Boards found by their own requests ---------------------------------------
+
+
+def test_only_private_lan_addresses_are_learned():
+    from backend import esp32_client as c
+
+    assert c.private_board_address("192.168.68.55") == "192.168.68.55"
+    assert c.private_board_address("172.20.10.3") == "172.20.10.3"
+    for bad in ("127.0.0.1", "8.8.8.8", "169.254.1.1", "0.0.0.0", "::1", "", None, "x"):
+        assert c.private_board_address(bad) is None
+
+
+def test_the_door_address_follows_the_door_boards_requests(monkeypatch):
+    from backend import esp32_client as c
+
+    monkeypatch.setattr(c, "DOOR_CONTROLLER_URL", "http://192.168.68.123")
+    assert c.learn_door_address("172.20.10.5") is True
+    assert c.DOOR_CONTROLLER_URL == "http://172.20.10.5"
+    assert c.learn_door_address("172.20.10.5") is False  # no change
+    assert c.learn_door_address("8.8.8.8") is False  # a public address never redirects commands
+    assert c.DOOR_CONTROLLER_URL == "http://172.20.10.5"
+
+
+def test_the_camera_address_follows_its_pushes(monkeypatch):
+    from backend import main as m
+
+    monkeypatch.setattr(m, "CAMERA_STREAM_URL", "http://192.168.68.125/stream")
+    assert m.learn_camera_address("172.20.10.6") is True
+    assert m.CAMERA_STREAM_URL == "http://172.20.10.6/stream"
+    assert m.learn_camera_address("127.0.0.1") is False
+
+
+# ---- The backend announces itself to the boards ----------------------------------
+
+
+def test_announcement_text_and_address_filter():
+    from backend import announce
+
+    assert announce.message(8000) == b"HOMEGUARD 1 8000"
+    got = announce.private_addresses(
+        [
+            "192.168.68.110",
+            "172.20.10.2",
+            "10.1.2.3",
+            "127.0.0.1",
+            "169.254.5.5",
+            "8.8.8.8",
+            "::1",
+            "x",
+            "192.168.68.110",
+        ]
+    )
+    assert got == ["192.168.68.110", "172.20.10.2", "10.1.2.3"]

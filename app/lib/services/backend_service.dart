@@ -13,9 +13,8 @@ import 'dart:typed_data';
 /// person walking in is actually racing.
 enum AlarmState { disarmed, transitional, armed, entryDelay, triggered }
 
-/// Away arms every sensor. Home keeps only the door sensor armed and bypasses
-/// the distance (ultrasonic) and vibration sensors, so people can move around
-/// inside.
+/// Away arms every sensor. Home arms only the door sensor: it bypasses both
+/// perimeter sensors (ultrasonic and vibration), so people can move around inside.
 enum ArmMode { away, home }
 
 enum EventCategory { auth, armDisarm, alert, faceId, info }

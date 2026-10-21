@@ -66,7 +66,7 @@ async def test_arm_is_ignored_unless_disarmed(state):
     assert state.alarm_state == AlarmState.triggered
 
 
-async def test_home_mode_bypasses_distance_and_vibration(state):
+async def test_home_mode_bypasses_both_perimeter_sensors(state):
     await arm_now(state, ArmMode.home)
     by_type = {s.type: s for s in state.sensors}
     assert by_type[SensorType.vibration].bypassed is True
@@ -468,3 +468,12 @@ async def test_arming_still_happens_locally_when_the_board_does_not_answer(
 
     assert body == {"ok": True, "hardware": False}
     assert state.alarm_state == AlarmState.transitional
+
+
+async def test_home_mode_arms_at_once_with_no_exit_delay(state):
+    """Home means someone stays inside, so nobody walks out: no transitional."""
+    await state.arm(ArmMode.home)
+    assert state.alarm_state == AlarmState.armed
+    assert state._arming_task is None
+    by_type = {s.type: s for s in state.sensors}
+    assert by_type[SensorType.ultrasonic].bypassed and by_type[SensorType.vibration].bypassed

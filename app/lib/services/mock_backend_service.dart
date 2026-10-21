@@ -259,8 +259,8 @@ class MockBackendService implements BackendService {
   /// nothing sensible to transition from). Immediately moves to
   /// [AlarmState.transitional] so the UI can show an exit-delay
   /// countdown, then after a fixed delay flips to [AlarmState.armed] and
-  /// marks each sensor's bypass state (distance and vibration are
-  /// bypassed in Home mode — see [ArmMode]). The delay is a fixed demo value standing in
+  /// marks each sensor's bypass state (ultrasonic and vibration are bypassed in
+  /// Home mode — see [ArmMode]). The delay is a fixed demo value standing in
   /// for whatever exit-delay the real hardware/backend would use.
   @override
   Future<void> arm(ArmMode mode) async {
