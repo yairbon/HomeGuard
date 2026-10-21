@@ -53,7 +53,7 @@ def emails(monkeypatch):
     """Records every email instead of speaking SMTP."""
     sent: list[dict] = []
 
-    def fake(cfg, recipients, subject, body, photo=None):
+    def fake(cfg, recipients, subject, body, photo=None, clip_frames=None):
         sent.append(
             {
                 "to": recipients,

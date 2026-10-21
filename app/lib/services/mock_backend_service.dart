@@ -62,6 +62,8 @@ class MockBackendService implements BackendService {
   int _nightModeArmHour = 23;
   int _nightModeDisarmHour = 7;
   bool _alertsEnabled = true;
+  bool _clipEnabled = true;
+  int _clipSeconds = 60;
   List<String> _alertEmails = [];
   List<String> _escalationEmails = [];
   String _emergencyNumber = '';
@@ -414,6 +416,8 @@ class MockBackendService implements BackendService {
         nightModeArmHour: _nightModeArmHour,
         nightModeDisarmHour: _nightModeDisarmHour,
         alertsEnabled: _alertsEnabled,
+        clipEnabled: _clipEnabled,
+        clipSeconds: _clipSeconds,
         alertEmails: _alertEmails,
         escalationEmails: _escalationEmails,
         emergencyNumber: _emergencyNumber,
@@ -441,6 +445,12 @@ class MockBackendService implements BackendService {
     _alertEmails = List.of(alertTo);
     _escalationEmails = List.of(escalationTo);
     return null;
+  }
+
+  @override
+  Future<void> setAlertClip(bool enabled, int seconds) async {
+    _clipEnabled = enabled;
+    _clipSeconds = seconds.clamp(5, 60);
   }
 
   @override

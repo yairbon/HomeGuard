@@ -37,8 +37,8 @@ class AlarmState(StrEnum):
 
 
 class ArmMode(StrEnum):
-    """Which arm profile was requested. `home` bypasses the vibration
-    sensor (people moving around inside shouldn't trip it); `away`
+    """Which arm profile was requested. `home` bypasses both perimeter
+    sensors, ultrasonic and vibration (people moving around inside shouldn't trip them); `away`
     bypasses nothing. The actual bypass assignment happens in
     AppState._finish_arming, not here — this enum is just the selector.
     """
@@ -217,6 +217,14 @@ class SetAlertsEnabledRequest(BaseModel):
     enabled: bool
 
 
+class SetAlertClipRequest(BaseModel):
+    """Body for /settings/alert-clip: whether the breach email carries a video
+    and its length in seconds (clamped to 5-60 server-side)."""
+
+    enabled: bool
+    seconds: int = 60
+
+
 class SetNightModeHoursRequest(BaseModel):
     """When night mode arms and disarms, as whole hours (0-23). Clamped
     server-side rather than validated here, so an out-of-range value from an
@@ -298,6 +306,9 @@ class FullState(BaseModel):
     # Off means an alarm still sounds and shows in the app, it just sends no
     # message — for testing without flooding an inbox.
     alerts_enabled: bool
+    # Video clip in the breach email: on/off and its length in seconds (5-60).
+    clip_enabled: bool = True
+    clip_seconds: int = 60
     # Who the alert emails go to; edited from the app. The sending account and
     # its password stay in the local alerts file, never here.
     alert_emails: list[str]

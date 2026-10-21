@@ -41,6 +41,7 @@ from pathlib import Path
 
 import httpx
 
+from . import clip
 from .http_clients import build_client
 
 logger = logging.getLogger("alerts")
@@ -210,19 +211,31 @@ def _send_email_blocking(
     subject: str,
     body: str,
     photo: bytes | None = None,
+    clip_frames: tuple[tuple[float, bytes], ...] | None = None,
 ):
     """One SMTP conversation. Blocking; always called through `asyncio.to_thread`."""
+    # The video is made here, in the worker thread, so encoding a minute of frames
+    # never holds up the event loop; if that fails the email simply goes without it.
+    video = clip.encode_clip(clip_frames) if clip_frames else None
     message = EmailMessage()
     message["From"] = cfg.sender
     message["To"] = ", ".join(recipients)
     message["Subject"] = subject
     # The time matters: a phone can show an email long after it was sent.
     note = "\nA picture from the camera is attached." if photo else ""
+    if video:
+        note += "\nA video of the last minute from the camera is attached."
+    elif clip_frames:
+        note += "\n(A video of the last minute could not be made.)"
     message.set_content(
         f"{body}{note}\n\nTime: {datetime.now():%A %d %B %Y, %H:%M:%S}\nHomeGuard"
     )
     if photo:
         message.add_attachment(photo, maintype="image", subtype="jpeg", filename="camera.jpg")
+    if video:
+        message.add_attachment(
+            video, maintype="video", subtype="mp4", filename="camera-last-minute.mp4"
+        )
     context = ssl.create_default_context()
     if cfg.port == 465:
         with smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=_EMAIL_TIMEOUT, context=context) as smtp:
@@ -242,6 +255,7 @@ async def send_email(
     *,
     escalation: bool,
     photo: bytes | None = None,
+    clip_frames: tuple[tuple[float, bytes], ...] | None = None,
 ) -> str:
     """Emails the right people. Returns "" on success, else a short reason that
     is safe to show (no secrets)."""
@@ -250,7 +264,7 @@ async def send_email(
         return "email is not set up"
     try:
         await asyncio.to_thread(
-            _send_email_blocking, cfg.email, recipients, subject, body, photo
+            _send_email_blocking, cfg.email, recipients, subject, body, photo, clip_frames
         )
     except smtplib.SMTPAuthenticationError:
         logger.warning("Email alert failed: the SMTP login was refused (wrong app password?).")
@@ -314,13 +328,14 @@ async def deliver(
     *,
     escalation: bool = False,
     photo: bytes | None = None,
+    clip: tuple[tuple[float, bytes], ...] | None = None,
 ) -> dict[str, str]:
     """Sends one alert over every configured channel, concurrently. Returns a
     result per channel ("" = delivered). Never raises."""
     jobs: dict[str, asyncio.Future] = {}
     if cfg.recipients(escalation=escalation):
         jobs["email"] = asyncio.ensure_future(
-            send_email(cfg, title, message, escalation=escalation, photo=photo)
+            send_email(cfg, title, message, escalation=escalation, photo=photo, clip_frames=clip)
         )
     for index, target in enumerate(cfg.whatsapp):
         label = "whatsapp" if len(cfg.whatsapp) == 1 else f"whatsapp {index + 1}"

@@ -626,6 +626,8 @@ class HttpBackendService implements BackendService {
       nightModeArmHour: body['night_mode_arm_hour'] as int? ?? 23,
       nightModeDisarmHour: body['night_mode_disarm_hour'] as int? ?? 7,
       alertsEnabled: body['alerts_enabled'] as bool? ?? true,
+      clipEnabled: body['clip_enabled'] as bool? ?? true,
+      clipSeconds: body['clip_seconds'] as int? ?? 60,
       alertEmails: _stringList(body['alert_emails']),
       escalationEmails: _stringList(body['escalation_emails']),
       emergencyNumber: body['emergency_number'] as String? ?? '',
@@ -661,6 +663,14 @@ class HttpBackendService implements BackendService {
     if (res.ok) return null;
     final detail = res.body['detail'];
     return detail is String ? detail : 'The backend refused the list (HTTP ${res.statusCode}).';
+  }
+
+  @override
+  Future<void> setAlertClip(bool enabled, int seconds) async {
+    _report(
+      await _post('/settings/alert-clip', {'enabled': enabled, 'seconds': seconds}),
+      'the alert video setting',
+    );
   }
 
   @override

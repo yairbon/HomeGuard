@@ -241,6 +241,8 @@ class AppSettings {
     required this.nightModeArmHour,
     required this.nightModeDisarmHour,
     required this.alertsEnabled,
+    this.clipEnabled = true,
+    this.clipSeconds = 60,
     required this.alertEmails,
     required this.escalationEmails,
     required this.emergencyNumber,
@@ -267,6 +269,11 @@ class AppSettings {
   /// means an alarm still sounds and shows in the app, it just sends no
   /// message — for testing without flooding an inbox.
   final bool alertsEnabled;
+
+  /// Whether the breach email carries a video of the last [clipSeconds] seconds
+  /// from the camera (5-60).
+  final bool clipEnabled;
+  final int clipSeconds;
 
   /// Who is emailed when an alarm triggers, and who is added if it is still not
   /// cleared after the delay (the emergency contacts). The sending account and
@@ -467,6 +474,10 @@ abstract class BackendService {
 
   /// Switches outgoing alert messages on or off (see [AppSettings.alertsEnabled]).
   Future<void> setAlertsEnabled(bool enabled);
+
+  /// Turns the video clip in the breach email on or off and sets its length
+  /// (see [AppSettings.clipSeconds]).
+  Future<void> setAlertClip(bool enabled, int seconds);
 
   /// Sets who is emailed (see [AppSettings.alertEmails]). Returns null when
   /// saved, or a sentence to show the user when it was refused (for instance a

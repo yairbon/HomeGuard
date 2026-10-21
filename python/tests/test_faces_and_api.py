@@ -229,6 +229,8 @@ async def test_state_shape_matches_the_flutter_client(auth_client):
         "night_mode_arm_hour",
         "night_mode_disarm_hour",
         "alerts_enabled",
+        "clip_enabled",
+        "clip_seconds",
         "alert_emails",
         "escalation_emails",
         "emergency_number",

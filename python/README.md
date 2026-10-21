@@ -206,6 +206,14 @@ no restart. Either channel, or both:
   phone. On an iPhone use the Gmail app for instant notifications; Apple's Mail
   app only checks Gmail from time to time.
 
+  **Video in the alarm email.** The backend watches the ESP32-CAM's stream and keeps
+  the last minute of frames in memory (`clip.py`). When an alarm fires it encodes
+  the last 5-60 seconds into an MP4 (H.264, under 10 MB) in a worker thread and
+  attaches it next to the picture. Settings has a switch and a length slider
+  (`POST /settings/alert-clip`, saved in `state.json`; on and 60 s by default).
+  Without the stream the camera's stills for face recognition are used instead; if
+  no video can be made the email goes out with the picture only.
+
 Both channels need internet access from whatever network the laptop is on.
 Settings has a **SEND TEST ALERT** button (`POST /settings/alerts/test`) that
 sends a real message on every configured channel and shows which one worked,
@@ -351,6 +359,7 @@ success.
 | `HOMEGUARD_ALERTS_FILE` | `alerts.local.json` | Where the WhatsApp/email alert settings are read from (see "Alerts"). Point it at a missing file for any server that must not message anyone. |
 | `HOMEGUARD_FACES_DIR` | next to the state file | Where the enrolled faces' photos live (`python/faces` for a normal install). It follows `HOMEGUARD_STATE_FILE`, so a test or simulation server with its own state file gets its own photo folder and can never delete a real enrolment (that happened once: `simulate.py` deleted the real face with id 4). |
 | `HOMEGUARD_BOARDS` | every board | Comma-separated boards this install expects heartbeats from: any of `ultrasonic`, `vibration`, `door_controller`. Set `ultrasonic,door_controller` when both sensors are wired to the one ultrasonic board (its sketch also carries the vibration sensor) — otherwise `vibration` shows as permanently offline and the app raises a SENSOR OFFLINE banner for it. Unknown names are ignored with a warning. |
+| `HOMEGUARD_RECORD_CAMERA` | `1` | Set to `0` to stop the always-on recording of the camera stream; the alarm video is then made from the stills the camera pushes for face recognition. |
 | `HOMEGUARD_CORS_ORIGINS` | none | Comma-separated extra browser origins allowed to call the API, e.g. `http://localhost:5000,http://192.168.1.20:5000`. Only needed when the Flutter **web** build is served from its own port (`flutter run -d web-server`); the Android app isn't a browser and ignores CORS. Exact origins only — `*` is refused. |
 
 Both are read once at startup, so changing one needs a backend restart.

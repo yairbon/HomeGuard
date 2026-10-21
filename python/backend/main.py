@@ -51,6 +51,7 @@ from .models import (
     LoginRequest,
     LoginResponse,
     SensorType,
+    SetAlertClipRequest,
     SetAlertEmailsRequest,
     SetAlertsEnabledRequest,
     SetEmergencyNumberRequest,
@@ -161,7 +162,13 @@ async def lifespan(app: FastAPI):
     """
     log_stale_board_ips()
     state.start_monitor()
+    # HOMEGUARD_RECORD_CAMERA=0 turns the always-on recording off: the alarm clip is
+    # then made from the 1-2 stills a second the camera pushes for face recognition.
+    record = os.environ.get("HOMEGUARD_RECORD_CAMERA", "1").strip() != "0"
+    recorder = asyncio.create_task(_record_camera()) if CAMERA_STREAM_URL and record else None
     yield
+    if recorder is not None:
+        recorder.cancel()
     await state.stop_monitor()
     # Every outbound client this process owns, closed on the way out. Leaving
     # them to the garbage collector means sockets to the door controller and
@@ -632,6 +639,13 @@ async def set_alert_emails(body: SetAlertEmailsRequest):
     return {"ok": True}
 
 
+@app.post("/settings/alert-clip", dependencies=[Depends(require_app)])
+async def set_alert_clip(body: SetAlertClipRequest):
+    """Whether the breach email carries a video of the last seconds, and how long."""
+    await state.set_alert_clip(body.enabled, body.seconds)
+    return {"ok": True}
+
+
 @app.post("/settings/alerts-enabled", dependencies=[Depends(require_app)])
 async def set_alerts_enabled(body: SetAlertsEnabledRequest):
     """Master switch for messages that leave the house (email, WhatsApp, ntfy).
@@ -802,6 +816,7 @@ async def recognize_frame(photo: UploadFile):
     image_bytes = await photo.read()
     global _latest_camera_frame
     _latest_camera_frame = image_bytes
+    state.record_clip_frame(image_bytes)
 
     if not state.face_id_enabled:
         return {"matched": False}
@@ -905,6 +920,43 @@ async def _open_camera_stream() -> httpx.Response:
 # camera can serve only one stream at a time, so each app opening the Camera tab
 # used to push the previous one off.
 _camera_hub = CameraHub(_open_camera_stream)
+
+
+_FRAME_HEADER = re.compile(rb"Content-Length: (\d+)\r\n\r\n")
+
+
+async def _record_camera() -> None:
+    """Watches the camera's stream all the time, as one more viewer of the hub,
+    and hands every frame to the alarm-clip buffer (about 20 a second, against
+    the 1-2 stills a second the camera pushes for face recognition). App viewers
+    share the same connection. If the camera is unreachable it tries again every
+    few seconds."""
+    while True:
+        if not state.clip_enabled:  # the app's switch: off means leave the camera alone
+            await asyncio.sleep(2)
+            continue
+        chunks = None
+        try:
+            _, chunks = await _camera_hub.subscribe()
+            buf = b""
+            async for chunk in chunks:
+                if not state.clip_enabled:
+                    break
+                buf += chunk
+                while (m := _FRAME_HEADER.search(buf)) and len(buf) >= m.end() + int(m.group(1)):
+                    end = m.end() + int(m.group(1))
+                    state.record_clip_frame(buf[m.end() : end], stream=True)
+                    buf = buf[end:]
+                if len(buf) > 2_000_000:
+                    buf = b""
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # unreachable camera, bad status, dropped stream: just retry
+            pass
+        finally:
+            if chunks is not None:
+                await chunks.aclose()  # lets the hub release the camera if nobody else watches
+        await asyncio.sleep(5 if state.clip_enabled else 0)
 
 
 @app.get("/camera/stream", dependencies=[Depends(require_app)])
