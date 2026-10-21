@@ -690,7 +690,6 @@ def build_cover(doc):
     cover.append(add_t)
     add(para(tmp, "", 6, after=14))
     add(para(tmp, "שמות המנחים: אריאלה צברי, עידן הבר", 13, True, after=2))
-    add(para(tmp, "[לאמת מול הנחיית הפרויקט]", 11, False, after=0, hl=True))
     for el in cover:
         first.addprevious(el)
 

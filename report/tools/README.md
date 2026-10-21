@@ -13,7 +13,10 @@ python report/tools/build_report.py report report/figures report/HomeGuard_Repor
 # 3. רשימת השלמות שנותרו
 python report/tools/list_placeholders.py report/HomeGuard_Report.docx report/TODO_before_submission.md
 
-# 4. אחרי שיוצאים PDF סופי מ-Word: חבילת הגשה
+# 4. אחרי שיוצאים PDF סופי מ-Word: ZIP של הקוד בלבד (בלי הדוח), ואפשר לשבץ אותו בתוך ה-PDF
+report/tools/package_code_zip.sh HomeGuard_Code.zip            # --light: בלי קבצי המודל
+python report/tools/embed_zip.py HomeGuard_Report.pdf HomeGuard_Code.zip HomeGuard_Report_final.pdf
+# (חלופה, ZIP שכולל גם את הדוח:)
 report/tools/package_submission.sh <HomeGuard_Report.pdf> HomeGuard_Submission.zip [HomeGuard_Report.docx]   # קבצים נוספים אחרי שם ה-ZIP נכנסים לתיקייה העליונה
 ```
 
