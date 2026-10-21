@@ -14,6 +14,7 @@
 """
 import copy
 import math
+import os
 import re
 import subprocess
 import sys
@@ -27,6 +28,10 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Emu, Inches, Mm, Pt, RGBColor
 from PIL import Image
+
+# Optional: a picture of Guy's signature for the cover table. Kept outside the repository on purpose
+# (set HOMEGUARD_SIGNATURE_GUY to the file); without it the cell stays empty for signing by hand.
+SIGNATURE_GUY = os.environ.get("HOMEGUARD_SIGNATURE_GUY", "")
 
 REPORT_DIR = Path(sys.argv[1])
 FIGS = Path(sys.argv[2])
@@ -692,6 +697,10 @@ def build_cover(doc):
     add(para(tmp, "שמות המנחים: אריאלה צברי, עידן הבר", 13, True, after=2))
     for el in cover:
         first.addprevious(el)
+    if SIGNATURE_GUY and Path(SIGNATURE_GUY).exists():
+        # added here, not while the cover is built in the scratch document: the picture's
+        # relationship must belong to the real document
+        doc.tables[0].cell(4, 1).paragraphs[0].add_run().add_picture(SIGNATURE_GUY, width=Inches(0.9))
 
 
 ORDERS = {
