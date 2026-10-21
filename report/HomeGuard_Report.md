@@ -289,6 +289,8 @@ $$d = \frac{v \cdot \Delta t}{2}$$
 | זיהוי פנים | OpenCV (YuNet ו-SFace) |
 | תקשורת | HTTP, WebSocket, SMTP |
 | אפליקציה | Flutter (Dart), לטלפון Android ולדפדפן |
+| פיתוח האפליקציה | האפליקציה פותחה בשיתוף עם Claude (Anthropic) |
+| תרשימים | Mermaid, ליצירת תרשימי הזרימה והמצבים (איורים 1, 2 ו-4) |
 | בדיקות | pytest |
 | ניהול קוד | Git ו-GitHub |
 
