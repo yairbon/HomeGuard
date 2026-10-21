@@ -83,7 +83,7 @@ def preprocess(text: str) -> str:
             out.append("")
             handled = False
             if len(paras) == 2 and "[הכנס" in paras[0]:
-                m = re.match(r"\*\*(איור|קוד) (\d+): (.*)\*\*$", paras[1])
+                m = re.match(r"\*\*(איור|קטע קוד) (\d+): (.*)\*\*$", paras[1])
                 if m:
                     files = figure_files(m.group(1), m.group(2))
                     if files:
@@ -484,7 +484,7 @@ def replace_image_tokens(doc):
                 anchor._p.addnext(new_p)
                 from docx.text.paragraph import Paragraph
                 target = Paragraph(new_p, p._parent)
-            w, h = fit_size(f, max_h_in=3.0 if Path(f).stem.startswith("fig") else 4.6)
+            w, h = fit_size(f, max_h_in=3.2 if Path(f).stem.startswith("fig") else 4.6)
             target.add_run().add_picture(f, width=w, height=h)
             anchor = target
         cap = copy.deepcopy(p._p)
@@ -516,7 +516,7 @@ def style_special_paragraphs(doc):
         txt = p.text.strip()
         if not txt:
             continue
-        if re.match(r"^(איור|קוד) \d+:", txt) and p.style.name != "Image Caption":
+        if re.match(r"^(איור|קטע קוד) \d+:", txt) and p.style.name != "Image Caption":
             p.style = doc.styles["Image Caption"]
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.keep_with_next = False

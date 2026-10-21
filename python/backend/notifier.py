@@ -14,7 +14,7 @@ Why ntfy rather than Firebase Cloud Messaging
 ---------------------------------------------
 FCM needs a Firebase project and a `google-services.json` that only the
 project owner can create, and adding the Gradle plugin without that file
-breaks the Android build outright (see ../CLAUDE.md). ntfy needs neither: the
+breaks the Android build outright. ntfy needs neither: the
 backend POSTs to a topic URL, and the user installs the ntfy Android app and
 subscribes to the same topic. No account, no new Flutter dependency, no
 change to the app's build at all — and the topic can be served by ntfy.sh or

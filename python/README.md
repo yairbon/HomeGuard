@@ -162,7 +162,7 @@ build step.
 That last point is why the obvious alternatives were rejected:
 `face_recognition` wraps dlib and `insightface` ships a Cython extension;
 both need a working MSVC/CMake toolchain on Windows, which is exactly the
-class of problem this project has already lost days to (see `../CLAUDE.md`).
+class of problem this project has already lost days to.
 
 This replaced a Haar cascade + LBPH pipeline. Haar misses turned, occluded
 and small faces; LBPH compares local texture histograms and is very sensitive
@@ -228,8 +228,7 @@ receives independently of HomeGuard.
 
 Chosen over Firebase Cloud Messaging because FCM needs a Firebase project and
 a `google-services.json` only the project owner can create, and adding the
-Gradle plugin without that file breaks the Android build outright (see
-`../CLAUDE.md`). ntfy needs no account, no new Flutter dependency, and no
+Gradle plugin without that file breaks the Android build outright. ntfy needs no account, no new Flutter dependency, and no
 change to the app's build.
 
 Set the server and topic in the app's Settings screen, then install the ntfy

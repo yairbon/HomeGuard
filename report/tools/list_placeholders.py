@@ -35,7 +35,7 @@ for i, b in enumerate(blocks):
         elif t.startswith("[הכנס"):
             cap = ""
             for nb in blocks[i + 1:i + 3]:
-                if isinstance(nb, Paragraph) and re.match(r"^(איור|קוד) \d+:", nb.text.strip()):
+                if isinstance(nb, Paragraph) and re.match(r"^(איור|קטע קוד) \d+:", nb.text.strip()):
                     cap = nb.text.strip()
                     break
             items.append((heading, cap or "(ללא כיתוב)", t))

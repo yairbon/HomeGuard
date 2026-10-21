@@ -208,9 +208,8 @@ class MjpegStreamClient {
     _client?.close();
     if (_disposed) return;
     // Mirrors HttpBackendService's existing WebSocket reconnect interval
-    // (same 3s cadence, same reasons: a network glitch, the adb-reverse USB
-    // tunnel dropping, a Tailscale hiccup — see CLAUDE.md's remote-access
-    // section for why those are the real, observed failure modes here).
+    // (same 3s cadence, same reasons: a network glitch or the adb-reverse
+    // USB tunnel dropping, both of them failure modes seen in practice).
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(seconds: 3), connect);
   }

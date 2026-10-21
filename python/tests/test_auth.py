@@ -95,7 +95,7 @@ def test_every_route_is_covered_by_a_table():
     """The drift guard on the tables above.
 
     Those tables are the project's stated defence against shipping an
-    endpoint that forgot its `Depends(require_app)` (CLAUDE.md says as much),
+    endpoint that forgot its `Depends(require_app)`,
     but they are hand-maintained — and by the time this test was written they
     had silently fallen eight routes behind, including `/face-disarm-enabled`
     (which controls whether a photograph can disarm the alarm) and

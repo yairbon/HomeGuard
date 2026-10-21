@@ -4,7 +4,7 @@
 
 ```bash
 # 1. תמונות (דורש node, playwright עם Chromium, `npm i mermaid@10.9.3` ליד diagrams.js, ו-pygments ל-Python)
-node report/tools/diagrams.js report/figures                 # איור 1 (מבנה) ואיור 3 (מצבים)
+node report/tools/diagrams.js report/figures                 # איור 1 (מבנה), איור 2 (תרשים זרימה) ואיור 4 (מצבים)
 python report/tools/code_images.py . report/figures          # קוד 1-3, מצולמים מקבצי המקור
 
 # 2. מסמך Word (דורש pandoc ו-python-docx)
