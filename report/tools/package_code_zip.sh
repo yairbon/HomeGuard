@@ -9,7 +9,7 @@
 set -euo pipefail
 out="${1:?usage: package_code_zip.sh <out.zip> [--light]}"
 root="$(git rev-parse --show-toplevel)"
-excludes=(':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report' ':(exclude)docs/*.pdf')
+excludes=(':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report' ':(exclude)docs/*.pdf' ':(exclude)submission')
 if [ "${2:-}" = "--light" ]; then
   excludes+=(':(exclude)python/models/*.onnx')
 fi
