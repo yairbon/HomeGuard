@@ -1,17 +1,18 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import 'package:homeguard_app/main.dart';
 import 'package:homeguard_app/services/backend_service.dart';
 import 'package:homeguard_app/services/mock_backend_service.dart';
+import 'package:homeguard_app/widgets/sensor_status_panel.dart';
 
 /// Pumps the app with a mock backend and lets the mock's deferred initial
 /// stream emissions land.
 ///
 /// [MockBackendService] publishes its first values on a microtask (so
 /// listeners have time to subscribe), so a single `pump()` isn't always
-/// enough — this settles the initial frames deterministically.
+/// enough â€” this settles the initial frames deterministically.
 Future<void> pumpApp(WidgetTester tester, {BackendService? backend}) async {
   // The default 800x600 test surface is wider and much shorter than any
   // phone, which pushes the dashboard's arm controls below the fold. Sizing
@@ -30,7 +31,7 @@ Future<void> pumpApp(WidgetTester tester, {BackendService? backend}) async {
 /// Scrolls [label] into view before tapping it.
 ///
 /// The dashboard is a scroll view, and `tap` on an off-screen widget aims at
-/// coordinates outside the viewport and silently hits nothing — so this is
+/// coordinates outside the viewport and silently hits nothing â€” so this is
 /// what makes the arming tests deterministic regardless of surface size.
 Future<void> tapLabel(WidgetTester tester, String label) async {
   await tester.ensureVisible(find.text(label));
@@ -51,7 +52,7 @@ void main() {
   setUpAll(() {
     // Fonts are bundled as assets (see pubspec.yaml), but the test asset
     // bundle doesn't serve them, and google_fonts would otherwise try a real
-    // HTTP fetch — which fails slowly and noisily in a test run. Disabling
+    // HTTP fetch â€” which fails slowly and noisily in a test run. Disabling
     // runtime fetching makes it fall straight back to the default font.
     GoogleFonts.config.allowRuntimeFetching = false;
   });
@@ -117,6 +118,27 @@ void main() {
       // MockBackendService reports all three boards healthy.
       expect(find.text('SENSORS OFFLINE'), findsNothing);
       expect(find.text('SENSOR OFFLINE'), findsNothing);
+    });
+  });
+
+  group('SensorStatusPanel', () {
+    testWidgets('says NOT CONNECTED instead of OK for a sensor whose board is offline',
+        (tester) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SensorStatusPanel(
+            sensors: const [
+              SensorReading(type: SensorType.door, label: 'Door sensor', ok: true),
+              SensorReading(type: SensorType.ultrasonic, label: 'Ultrasonic sensor', ok: true),
+              SensorReading(type: SensorType.vibration, label: 'Vibration sensor', ok: true),
+            ],
+            offlineBoards: const [BoardStatus(name: 'ultrasonic', online: false)],
+          ),
+        ),
+      ));
+      // The ultrasonic board carries both the ultrasonic and the vibration sensor.
+      expect(find.text('NOT CONNECTED'), findsNWidgets(2));
+      expect(find.text('OK'), findsOneWidget);
     });
   });
 
@@ -198,7 +220,7 @@ void main() {
         await tester.tap(find.text('UNLOCK'));
         await tester.pump(const Duration(milliseconds: 800));
       }
-      // There is no UNLOCK button left to press — which is the point. A
+      // There is no UNLOCK button left to press â€” which is the point. A
       // lockout the right password walks straight through is not a lockout,
       // and the UI enforces that by refusing to offer the action at all.
       await tester.enterText(find.byType(TextFormField), 'homeguard');
@@ -238,7 +260,7 @@ void main() {
 
       // The backend pushes this number exactly once (`begin_entry_delay`
       // broadcasts and nothing re-sends), so without a local ticker the
-      // display froze at the seeded value until the alarm fired — on the one
+      // display froze at the seeded value until the alarm fired â€” on the one
       // screen where the number is the whole point.
       await tester.pump(const Duration(seconds: 1));
       expect(find.textContaining('alarm in 19s'), findsOneWidget);

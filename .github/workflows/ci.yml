@@ -187,8 +187,8 @@ jobs:
 
   # Deliberately not built here: the Android APK. It needs the Android
   # SDK/NDK — several GB of runner setup for a course project that builds
-  # locally through WSL2 (see CLAUDE.md for why native Windows builds don't
-  # work on the dev machine). Verified by hand with `/flutter-build`.
+  # locally through WSL2 (native Windows builds don't work on the dev
+  # machine; see README.md). Verified by hand with `/flutter-build`.
   #
   # The four ESP32 sketches used to be in this list too, on the grounds that
   # they were "verified by hand". They were not: `vibration_sensor/secrets.h`

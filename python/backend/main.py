@@ -16,7 +16,7 @@ import asyncio
 import hmac
 import logging
 import os
-import random
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,16 +27,18 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.background import BackgroundTask
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
-from . import esp32_client, notifier
+from . import alerts, announce, esp32_client, notifier
+from .camera_hub import CameraHub
 from .face_recognition_service import FaceRecognitionService
 from .http_clients import build_client
 from .ip_check import log_stale_board_ips
@@ -50,6 +52,9 @@ from .models import (
     LoginRequest,
     LoginResponse,
     SensorType,
+    SetAlertClipRequest,
+    SetAlertEmailsRequest,
+    SetAlertsEnabledRequest,
     SetEmergencyNumberRequest,
     SetEntryDelayRequest,
     SetFaceDisarmEnabledRequest,
@@ -60,9 +65,44 @@ from .models import (
     SetPoliceCallDelayRequest,
     TriggerAlertRequest,
 )
-from .state import BOARD_FOR_SENSOR, state
+from .state import BOARD_FOR_SENSOR, STATE_FILE, state
 
 logging.basicConfig(level=logging.INFO)
+
+
+class _QuietRoutineTraffic(logging.Filter):
+    """Keeps the console readable: the boards' heartbeats and the camera's frame
+    pushes arrive many times a minute and would bury everything that matters.
+    Set HOMEGUARD_LOG_ALL_REQUESTS=1 to see every request again (for diagnosing)."""
+
+    _ROUTINE = ("/esp32/heartbeat", "/camera/recognize", "/camera/latest")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        path = args[2] if isinstance(args, tuple) and len(args) >= 3 else ""
+        return not (isinstance(path, str) and path.startswith(self._ROUTINE))
+
+
+class _RedactSessionToken(logging.Filter):
+    """The WebSocket takes its session token in the URL (browsers cannot set
+    headers on it), and uvicorn logs that URL. A token on a console that gets
+    filmed or shared is a login, so it never reaches a log line."""
+
+    _token = re.compile(r"(token=)[^&\s\"']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._token.sub(r"\1***", str(record.msg))
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._token.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args
+            )
+        return True
+
+
+for _name in ("uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_name).addFilter(_RedactSessionToken())
+if os.environ.get("HOMEGUARD_LOG_ALL_REQUESTS", "").strip().lower() not in ("1", "true", "yes"):
+    logging.getLogger("uvicorn.access").addFilter(_QuietRoutineTraffic())
 
 # This file lives at python/backend/main.py, so two levels up is python/ —
 # where faces/ (training photos) and models/ (the detector/recognizer model
@@ -71,8 +111,25 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Created once at import time (not per-request) since loading the models and
 # training the recognizer are relatively expensive — and so a missing model
 # file fails the app at startup instead of on the first camera request.
+
+def default_faces_dir(state_file: Path, base_dir: Path) -> Path:
+    """Where the enrolled face photos live.
+
+    Next to the state file: the photos and the list of approved faces are one
+    dataset (ids in the list name folders on disk), so they must always be
+    chosen together. This used to be fixed at python/faces, which let a second
+    backend started with its own temporary state (a test or simulation) share
+    the real photo folder, and its test faces, which reuse small ids, deleted a
+    real person's enrolment. `HOMEGUARD_FACES_DIR` overrides it explicitly.
+    """
+    explicit = os.environ.get("HOMEGUARD_FACES_DIR")
+    if explicit:
+        return Path(explicit)
+    return state_file.parent / "faces" if state_file.parent != base_dir else base_dir / "faces"
+
+
 faces = FaceRecognitionService(
-    faces_dir=BASE_DIR / "faces",
+    faces_dir=default_faces_dir(STATE_FILE, BASE_DIR),
     models_dir=BASE_DIR / "models",
 )
 
@@ -106,7 +163,23 @@ async def lifespan(app: FastAPI):
     """
     log_stale_board_ips()
     state.start_monitor()
+    # HOMEGUARD_RECORD_CAMERA=0 turns the always-on recording off: the alarm clip is
+    # then made from the 1-2 stills a second the camera pushes for face recognition.
+    record = os.environ.get("HOMEGUARD_RECORD_CAMERA", "1").strip() != "0"
+    recorder = asyncio.create_task(_record_camera()) if CAMERA_STREAM_URL and record else None
+    # HOMEGUARD_ANNOUNCE=0 stops the UDP broadcast that lets the boards find this computer.
+    announcer = (
+        asyncio.create_task(
+            announce.announce_forever(int(os.environ.get("HOMEGUARD_PORT", "8000")))
+        )
+        if os.environ.get("HOMEGUARD_ANNOUNCE", "1").strip() != "0"
+        else None
+    )
     yield
+    if recorder is not None:
+        recorder.cancel()
+    if announcer is not None:
+        announcer.cancel()
     await state.stop_monitor()
     # Every outbound client this process owns, closed on the way out. Leaving
     # them to the garbage collector means sockets to the door controller and
@@ -114,22 +187,124 @@ async def lifespan(app: FastAPI):
     # closed" warnings on every shutdown.
     await notifier.aclose()
     await esp32_client.aclose()
+    await _camera_hub.aclose()
     await _cam_stream_client.aclose()
 
 
-app = FastAPI(title="HomeGuard Backend", lifespan=lifespan)
+# The interactive API docs (/docs, /redoc, /openapi.json) are not behind a
+# credential, so they would hand the full API schema to anyone on the network.
+# Off unless HOMEGUARD_DOCS=1, for development.
+_docs_enabled = os.environ.get("HOMEGUARD_DOCS", "").strip().lower() in ("1", "true", "yes")
+app = FastAPI(
+    title="HomeGuard Backend",
+    lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
+
+_cors_logger = logging.getLogger("cors")
+logger = logging.getLogger("homeguard")
+
+
+def extra_cors_origins(raw: str) -> list[str]:
+    """Parses `HOMEGUARD_CORS_ORIGINS` — a comma-separated list of exact
+    origins, e.g. `http://localhost:5000,http://100.64.0.7:5000` — into the
+    extra browser origins the API should answer.
+
+    Needed only when the Flutter *web* build is served from its own port
+    (`flutter run -d web-server`), because the browser then treats the API as
+    cross-origin. A bare `*` is refused, for the reason given at the
+    middleware below, rather than silently honored.
+    """
+    origins: list[str] = []
+    for item in raw.split(","):
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            _cors_logger.warning(
+                "HOMEGUARD_CORS_ORIGINS: ignoring '*' — list exact origins instead."
+            )
+            continue
+        origins.append(origin)
+    return origins
+
 
 # The app is a native Android client, which is not a browser and so is not
 # subject to CORS at all — these origins exist only for the FastAPI `/docs`
 # page and any local browser-based debugging. Restricted to localhost rather
 # than `*` because a wildcard here, combined with credentialed requests from
 # a browser, would let any web page the user visits drive this API.
+# `HOMEGUARD_CORS_ORIGINS` adds exact origins on top, opt-in, for the web build.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        *extra_cors_origins(os.environ.get("HOMEGUARD_CORS_ORIGINS", "")),
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---- Web app (optional) ----------------------------------------------------------
+
+
+def app_stream_content_type(upstream_content_type: str) -> str:
+    """Relabels the camera stream so a browser hands the raw bytes to the app.
+
+    Safari (and every Apple networking stack) recognises
+    `multipart/x-mixed-replace` and takes the stream apart itself, delivering
+    the image parts without the "--boundary" lines. The app's own parser needs
+    those lines (it is what finds where each frame starts and ends), so on an
+    iPhone the live view stayed black. Any other media type is left alone by
+    that machinery. The boundary parameter is kept untouched: it is how the
+    parser knows what to look for in the bytes. Only the app reads this route."""
+    media, separator, parameters = upstream_content_type.partition(";")
+    if media.strip().lower() != "multipart/x-mixed-replace":
+        return upstream_content_type
+    return "application/octet-stream" + separator + parameters
+
+
+class _AlwaysRevalidateStaticFiles(StaticFiles):
+    """Serves the web app with `Cache-Control: no-cache`.
+
+    Without any Cache-Control, a browser may keep using a file for a while on
+    its own guess (a fraction of the time since it last changed), so after a
+    rebuild a phone could keep showing the previous app for hours. `no-cache`
+    means "check with the server every time"; the ETag makes that check a cheap
+    304 when nothing changed, so a normal reload always picks up a new build.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+def mount_web_app(target: FastAPI, directory: Path) -> bool:
+    """Serves the built Flutter web app (`flutter build web`, see
+    `scripts/build-web.ps1`) from `/`, so the page and the API share one
+    origin and one port: no CORS list to maintain, and nothing to type into
+    the app's "Backend connection" box, because the web build defaults to the
+    address it was loaded from.
+
+    Must be called after every route is registered: a mount at `/` matches
+    anything, but Starlette tries routes in order, so everything declared
+    before it still wins. Unknown paths get a plain 404, not the index page.
+
+    The files are the public, compiled app — no state, secrets or data — so
+    serving them without a credential is deliberate; every API route is still
+    behind `require_app` / `require_device` exactly as before. Returns whether
+    anything was mounted; with no build present (CI, API-only use) the backend
+    behaves exactly as it did.
+    """
+    if not (directory / "index.html").is_file():
+        return False
+    target.mount("/", _AlwaysRevalidateStaticFiles(directory=directory, html=True), name="web-app")
+    return True
 
 
 # ---- Authentication dependencies -----------------------------------------------
@@ -299,20 +474,27 @@ async def change_password(body: ChangePasswordRequest, token: str = Depends(requ
 
 @app.post("/arm", dependencies=[Depends(require_app)])
 async def arm(body: ArmRequest):
-    """Starts arming: updates our own local state first (so the app gets
-    an immediate `transitional` response/broadcast), then separately
-    tells the door controller board to arm. NOTE: these two steps aren't
-    atomic — if the request to the board fails (offline, unreachable),
-    local state still proceeds through its own exit-delay timer to
-    `armed` regardless, so the app's view can end up ahead of what the
-    real hardware is doing. The controller's own state reports (via
-    /esp32/state-change) are what ultimately reconcile this. `hardware`
-    in the response says whether the board actually acknowledged, so the
-    app can surface the difference instead of assuming success.
+    """Starts arming. The door controller board is asked first, because it
+    can refuse: with its door open, arming would start the entry countdown the
+    moment it finished, so it answers 409 and nothing is armed (409 here too,
+    with a sentence the app shows as is).
+
+    Otherwise our own state starts its exit delay. NOTE: arming here and on the
+    board aren't atomic — if the board is offline or unreachable, local state
+    still proceeds through its own exit-delay timer to `armed` regardless, so
+    the app's view can end up ahead of what the real hardware is doing. The
+    controller's own state reports (via /esp32/state-change) are what
+    ultimately reconcile this. `hardware` in the response says whether the
+    board actually acknowledged, so the app can surface the difference instead
+    of assuming success.
     """
+    outcome = await esp32_client.send_arm(body.mode)
+    if outcome == "door_open":
+        raise HTTPException(
+            status_code=409, detail="Can't arm: the door is open. Close it and try again."
+        )
     await state.arm(body.mode)
-    reached = await esp32_client.send_arm(body.mode)
-    return {"ok": True, "hardware": reached}
+    return {"ok": True, "hardware": outcome == "ok"}
 
 
 @app.post("/disarm", dependencies=[Depends(require_app)])
@@ -326,8 +508,9 @@ async def disarm():
 
 @app.post("/trigger-alert", dependencies=[Depends(require_app)])
 async def trigger_alert(body: TriggerAlertRequest):
-    """Demo/testing entry point — mirrors the app's "simulate intrusion"
-    button. Real sensor triggers come through /esp32/sensor-event.
+    """Manual alarm trigger for an authenticated caller (`simulate.py` uses
+    it; the app no longer has a button for it). Real sensor triggers come
+    through /esp32/sensor-event. Does nothing unless the system is armed.
     """
     await state.trigger_alert(body.source, body.reason)
     return {"ok": True}
@@ -451,6 +634,38 @@ async def set_night_mode_hours(body: SetNightModeHoursRequest):
     return {"ok": True}
 
 
+@app.post("/settings/alert-emails", dependencies=[Depends(require_app)])
+async def set_alert_emails(body: SetAlertEmailsRequest):
+    """Sets who is emailed when an alarm triggers (`alert_to`) and who is added
+    when it stays uncleared (`escalation_to`). A malformed address is a 422
+    naming it, never silently dropped."""
+    alert_to, bad_alert = alerts.parse_addresses(body.alert_to)
+    escalation_to, bad_escalation = alerts.parse_addresses(body.escalation_to)
+    invalid = bad_alert + bad_escalation
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail="These do not look like email addresses: " + ", ".join(invalid),
+        )
+    await state.set_alert_emails(list(alert_to), list(escalation_to))
+    return {"ok": True}
+
+
+@app.post("/settings/alert-clip", dependencies=[Depends(require_app)])
+async def set_alert_clip(body: SetAlertClipRequest):
+    """Whether the breach email carries a video of the last seconds, and how long."""
+    await state.set_alert_clip(body.enabled, body.seconds)
+    return {"ok": True}
+
+
+@app.post("/settings/alerts-enabled", dependencies=[Depends(require_app)])
+async def set_alerts_enabled(body: SetAlertsEnabledRequest):
+    """Master switch for messages that leave the house (email, WhatsApp, ntfy).
+    The alarm itself is unaffected."""
+    await state.set_alerts_enabled(body.enabled)
+    return {"ok": True}
+
+
 @app.post("/settings/ntfy", dependencies=[Depends(require_app)])
 async def set_ntfy(body: SetNtfyRequest):
     """Configures push notifications (see backend/notifier.py) — the channel
@@ -459,19 +674,36 @@ async def set_ntfy(body: SetNtfyRequest):
     return {"ok": True}
 
 
-@app.post("/settings/ntfy/test", dependencies=[Depends(require_app)])
-async def test_ntfy():
-    """Sends a test push, so the topic can be verified before a real
-    break-in depends on it. `ok: false` means no topic is configured;
-    delivery itself isn't waited on."""
-    sent = await state.send_test_notification()
-    return {"ok": sent}
+@app.post("/settings/alerts/test", dependencies=[Depends(require_app)])
+async def test_alerts():
+    """Sends a test alert over every configured channel (email, WhatsApp,
+    ntfy) and reports what happened, so setup can be verified before a real
+    break-in depends on it. Waits for the outcome, so it can take a few
+    seconds. `ok` is true only if every configured channel delivered;
+    `summary` is a sentence the app shows as is, never containing a secret."""
+    results = await state.send_test_notification()
+    if not results:
+        return {
+            "ok": False,
+            "results": {},
+            "summary": "No alert channel is set up yet. Fill in alerts.local.json "
+            "on the laptop (see python/README.md), then try again.",
+        }
+    failures = {name: reason for name, reason in results.items() if reason}
+    if failures:
+        summary = "; ".join(f"{name}: {reason}" for name, reason in failures.items())
+    else:
+        summary = "Test sent via " + ", ".join(results) + ". Check your phone."
+    if not state.alerts_enabled:
+        summary += " (Alerts are switched off, so a real alarm will NOT send anything.)"
+    return {"ok": not failures, "results": results, "summary": summary}
 
 
 @app.post("/settings/police-call-delay", dependencies=[Depends(require_app)])
 async def set_police_call_delay(body: SetPoliceCallDelayRequest):
-    """Sets the delay (seconds) before the not-yet-implemented
-    auto-dial-emergency-number behavior would fire."""
+    """Sets how long (seconds) an alarm may stay uncleared before the
+    "still not cleared" alert goes out to the emergency contacts (see
+    `_escalate_after_delay`). Nothing dials a phone."""
     await state.set_police_call_delay(body.seconds)
     return {"ok": True}
 
@@ -489,7 +721,7 @@ async def set_police_call_delay(body: SetPoliceCallDelayRequest):
 
 
 @app.post("/esp32/heartbeat", dependencies=[Depends(require_device)])
-async def esp32_heartbeat(board: str = Query(...)):
+async def esp32_heartbeat(request: Request, board: str = Query(...)):
     """Called every 10 seconds by each board to report that it's alive.
 
     `board` identifies which one, so the app can show each of the three
@@ -500,6 +732,8 @@ async def esp32_heartbeat(board: str = Query(...)):
     AppState.note_board_seen.
     """
     await state.note_board_seen(board)
+    if board == "door_controller" and request.client:
+        esp32_client.learn_door_address(request.client.host)
     return {"ok": True}
 
 
@@ -567,10 +801,12 @@ async def esp32_state_change(body: Esp32StateChangeRequest):
 # camera would). Lets /camera/latest serve something closer to a live view
 # than the app's old static placeholder, without a real video stream.
 _latest_camera_frame: bytes | None = None
+# Lets an alarm email attach the newest picture (see AppState._alert_photo).
+state.camera_frame_source = lambda: _latest_camera_frame
 
 
 @app.post("/camera/recognize", dependencies=[Depends(require_app_or_device)])
-async def recognize_frame(photo: UploadFile):
+async def recognize_frame(request: Request, photo: UploadFile):
     """Runs face recognition on a single camera frame. Marks the camera
     online unconditionally (a frame arrived, whether or not it matched),
     then short-circuits to "not matched" if face ID is toggled off —
@@ -586,6 +822,10 @@ async def recognize_frame(photo: UploadFile):
     embedding similarity.
     """
     await state.note_camera_frame()
+    # The camera's own push (device key, not an app token) tells us where it is.
+    presented = request.headers.get("x-device-key", "")
+    if request.client and hmac.compare_digest(presented, state.device_key):
+        learn_camera_address(request.client.host)
 
     # Read (and cache for /camera/latest) before the face-ID toggle check
     # below — the live view should keep working even with recognition
@@ -594,6 +834,7 @@ async def recognize_frame(photo: UploadFile):
     image_bytes = await photo.read()
     global _latest_camera_frame
     _latest_camera_frame = image_bytes
+    state.record_clip_frame(image_bytes)
 
     if not state.face_id_enabled:
         return {"matched": False}
@@ -643,6 +884,21 @@ async def latest_camera_frame():
 # after boot.
 CAMERA_STREAM_URL = os.environ.get("HOMEGUARD_CAMERA_STREAM_URL", "")
 
+
+def learn_camera_address(host: str | None) -> bool:
+    """Points the live-stream reader at the address the camera's own push came
+    from (see esp32_client.learn_door_address for why). Returns whether it changed."""
+    global CAMERA_STREAM_URL
+    address = esp32_client.private_board_address(host)
+    if address is None:
+        return False
+    new = f"http://{address}/stream"
+    if new == CAMERA_STREAM_URL:
+        return False
+    logger.info("Camera stream address: %s -> %s", CAMERA_STREAM_URL or "(none)", new)
+    CAMERA_STREAM_URL = new
+    return True
+
 # A dedicated client, deliberately separate from esp32_client.py's `_client`
 # (tuned for short 3s command POSTs to the door controller) and from any
 # client used for /camera/recognize. A stream connection sits open for
@@ -663,15 +919,8 @@ _cam_stream_client = build_client(
 )
 
 
-@app.get("/camera/stream", dependencies=[Depends(require_app)])
-async def proxy_camera_stream():
-    """Proxies the ESP32-CAM's own MJPEG multipart stream through to the
-    app, chunk by chunk, without buffering a frame (let alone the whole
-    stream) in memory and without blocking this process's single event
-    loop for anyone else on it (the WebSocket broadcast included) — every
-    call in this chain is async, so unlike camera_worker.py (a separate
-    *process*, specifically because cv2.VideoCapture.read() blocks) this
-    genuinely belongs in the main backend process.
+async def _open_camera_stream() -> httpx.Response:
+    """Opens the ESP32-CAM's own MJPEG stream (the hub's one upstream connection).
 
     Uses httpx's manual streaming mode (send(..., stream=True)) rather than
     the `async with client.stream(...)` context manager, on purpose: it
@@ -697,41 +946,71 @@ async def proxy_camera_stream():
     if upstream.status_code != 200:
         await upstream.aclose()
         raise HTTPException(status_code=502, detail=f"Camera returned HTTP {upstream.status_code}")
+    return upstream
 
-    # Forwarded verbatim: the ESP32-CAM's own multipart boundary token is
-    # baked into every "--<boundary>" delimiter already present in the byte
-    # stream, so substituting a different Content-Type here would desync
-    # from the bytes and break the app's parser.
-    content_type = upstream.headers.get(
-        "content-type", "multipart/x-mixed-replace; boundary=frame"
-    )
 
-    async def relay():
+# One connection to the camera, shared by every viewer (see camera_hub.py): the
+# camera can serve only one stream at a time, so each app opening the Camera tab
+# used to push the previous one off.
+_camera_hub = CameraHub(_open_camera_stream)
+
+
+_FRAME_HEADER = re.compile(rb"Content-Length: (\d+)\r\n\r\n")
+
+
+async def _record_camera() -> None:
+    """Watches the camera's stream all the time, as one more viewer of the hub,
+    and hands every frame to the alarm-clip buffer (about 20 a second, against
+    the 1-2 stills a second the camera pushes for face recognition). App viewers
+    share the same connection. If the camera is unreachable it tries again every
+    few seconds."""
+    while True:
+        if not state.clip_enabled:  # the app's switch: off means leave the camera alone
+            await asyncio.sleep(2)
+            continue
+        chunks = None
         try:
-            async for chunk in upstream.aiter_raw():
-                yield chunk
-        except httpx.StreamError:
-            # Upstream dropped mid-frame. Headers are already committed (the
-            # 200 was sent), so there's nothing left to report — just stop;
-            # `background` below still closes the upstream connection.
-            return
+            _, chunks = await _camera_hub.subscribe()
+            buf = b""
+            async for chunk in chunks:
+                if not state.clip_enabled:
+                    break
+                buf += chunk
+                while (m := _FRAME_HEADER.search(buf)) and len(buf) >= m.end() + int(m.group(1)):
+                    end = m.end() + int(m.group(1))
+                    state.record_clip_frame(buf[m.end() : end], stream=True)
+                    buf = buf[end:]
+                if len(buf) > 2_000_000:
+                    buf = b""
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # unreachable camera, bad status, dropped stream: just retry
+            pass
+        finally:
+            if chunks is not None:
+                await chunks.aclose()  # lets the hub release the camera if nobody else watches
+        await asyncio.sleep(5 if state.clip_enabled else 0)
 
-    return StreamingResponse(
-        relay(), media_type=content_type, background=BackgroundTask(upstream.aclose)
-    )
 
+@app.get("/camera/stream", dependencies=[Depends(require_app)])
+async def proxy_camera_stream():
+    """Relays the ESP32-CAM's MJPEG multipart stream to the app, chunk by chunk,
+    without buffering a frame (let alone the whole stream) in memory and without
+    blocking this process's single event loop for anyone else on it (the
+    WebSocket broadcast included) — every call in this chain is async, so unlike
+    camera_worker.py (a separate *process*, specifically because
+    cv2.VideoCapture.read() blocks) this genuinely belongs in the main backend
+    process.
 
-@app.post("/debug/simulate-face-recognition", dependencies=[Depends(require_app)])
-async def simulate_face_recognition():
-    """Demo/testing entry point — mirrors the app's "simulate recognition"
-    button. Picks a random approved face, same idea as /trigger-alert for
-    sensors.
+    Any number of viewers can watch at once: they all share the hub's single
+    upstream connection. The bytes are forwarded verbatim — the camera's own
+    multipart boundary token is baked into every "--<boundary>" delimiter
+    already present in the stream, so the boundary parameter must stay exactly as
+    the camera sent it. Only the media type is relabelled, see
+    `app_stream_content_type`.
     """
-    if not state.faces:
-        return {"ok": False}
-    face = random.choice(state.faces)
-    await state.log_face_recognized(face.name)
-    return {"ok": True, "name": face.name}
+    content_type, chunks = await _camera_hub.subscribe()
+    return StreamingResponse(chunks, media_type=app_stream_content_type(content_type))
 
 
 # ---- WebSocket: real-time state push to the app --------------------------------
@@ -768,3 +1047,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(def
         pass
     finally:
         state.unregister(websocket)
+
+
+# Last, on purpose — see mount_web_app. HOMEGUARD_WEB_DIR overrides where the
+# build is looked for; the default is where `flutter build web` puts it.
+_web_dir = Path(
+    os.environ.get("HOMEGUARD_WEB_DIR")
+    or Path(__file__).resolve().parents[2] / "app" / "build" / "web"
+)
+if mount_web_app(app, _web_dir):
+    logging.getLogger("web").info("Serving the web app from %s", _web_dir)

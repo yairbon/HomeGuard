@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
@@ -62,6 +61,11 @@ class MockBackendService implements BackendService {
   bool _nightMode = false;
   int _nightModeArmHour = 23;
   int _nightModeDisarmHour = 7;
+  bool _alertsEnabled = true;
+  bool _clipEnabled = true;
+  int _clipSeconds = 60;
+  List<String> _alertEmails = [];
+  List<String> _escalationEmails = [];
   String _emergencyNumber = '';
   int _policeCallDelaySeconds = 60;
   String _ntfyServer = 'https://ntfy.sh';
@@ -255,8 +259,8 @@ class MockBackendService implements BackendService {
   /// nothing sensible to transition from). Immediately moves to
   /// [AlarmState.transitional] so the UI can show an exit-delay
   /// countdown, then after a fixed delay flips to [AlarmState.armed] and
-  /// marks each sensor's bypass state (vibration is bypassed in Home
-  /// mode — see [ArmMode]). The delay is a fixed demo value standing in
+  /// marks each sensor's bypass state (ultrasonic and vibration are bypassed in
+  /// Home mode — see [ArmMode]). The delay is a fixed demo value standing in
   /// for whatever exit-delay the real hardware/backend would use.
   @override
   Future<void> arm(ArmMode mode) async {
@@ -275,7 +279,8 @@ class MockBackendService implements BackendService {
                 type: s.type,
                 label: s.label,
                 ok: true,
-                bypassed: mode == ArmMode.home && s.type == SensorType.vibration,
+                bypassed: mode == ArmMode.home &&
+                    (s.type == SensorType.vibration || s.type == SensorType.ultrasonic),
               ))
           .toList();
       _logEvent(
@@ -334,17 +339,6 @@ class MockBackendService implements BackendService {
     _state = AlarmState.triggered;
     _logEvent('ALERT — $reason', EventCategory.alert);
     _emitState();
-  }
-
-  /// Picks a random approved face and logs a "recognized" event for it,
-  /// standing in for what a real camera + face-recognition model would
-  /// report. No-ops if there are no approved faces or face-ID is off, to
-  /// mirror how the real flow couldn't recognize anyone in either case.
-  @override
-  Future<void> simulateFaceRecognition() async {
-    if (_faces.isEmpty || !_faceIdEnabled) return;
-    final face = _faces[Random().nextInt(_faces.length)];
-    _logEvent('Face recognized: ${face.name}', EventCategory.faceId);
   }
 
   /// Adds [name] to the approved-faces list, assigning it the next
@@ -421,6 +415,11 @@ class MockBackendService implements BackendService {
         nightMode: _nightMode,
         nightModeArmHour: _nightModeArmHour,
         nightModeDisarmHour: _nightModeDisarmHour,
+        alertsEnabled: _alertsEnabled,
+        clipEnabled: _clipEnabled,
+        clipSeconds: _clipSeconds,
+        alertEmails: _alertEmails,
+        escalationEmails: _escalationEmails,
         emergencyNumber: _emergencyNumber,
         policeCallDelaySeconds: _policeCallDelaySeconds,
         ntfy: NtfyConfig(server: _ntfyServer, topic: _ntfyTopic),
@@ -436,6 +435,32 @@ class MockBackendService implements BackendService {
     await Future.delayed(const Duration(milliseconds: 200));
     _nightModeArmHour = armHour.clamp(0, 23);
     _nightModeDisarmHour = disarmHour.clamp(0, 23);
+  }
+
+  @override
+  Future<String?> setAlertEmails(List<String> alertTo, List<String> escalationTo) async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    final bad = [...alertTo, ...escalationTo].where((a) => !a.contains('@')).toList();
+    if (bad.isNotEmpty) return 'These do not look like email addresses: ${bad.join(', ')}';
+    _alertEmails = List.of(alertTo);
+    _escalationEmails = List.of(escalationTo);
+    return null;
+  }
+
+  @override
+  Future<void> setAlertClip(bool enabled, int seconds) async {
+    _clipEnabled = enabled;
+    _clipSeconds = seconds.clamp(5, 60);
+  }
+
+  @override
+  Future<void> setAlertsEnabled(bool enabled) async {
+    await Future.delayed(const Duration(milliseconds: 200));
+    _alertsEnabled = enabled;
+    _logEvent(
+      enabled ? 'Alerts switched on' : 'Alerts switched OFF — no messages will be sent',
+      EventCategory.info,
+    );
   }
 
   @override
@@ -467,13 +492,12 @@ class MockBackendService implements BackendService {
     _ntfyTopic = topic.trim();
   }
 
-  /// Reports success whenever a topic is set. The mock has no network, so
-  /// nothing is actually sent — enough for UI work, and the real delivery
-  /// path is covered by the backend's own tests.
+  /// The mock has no network, so nothing is actually sent — enough for UI
+  /// work; the real delivery path is covered by the backend's own tests.
   @override
-  Future<bool> sendTestNotification() async {
+  Future<AlertTestResult> sendTestAlert() async {
     await Future.delayed(const Duration(milliseconds: 200));
-    return _ntfyTopic.isNotEmpty;
+    return const AlertTestResult(ok: true, summary: 'Test sent via the mock (nothing real).');
   }
 
   /// Clears every sensor back to "ok" and not bypassed. Used on disarm so

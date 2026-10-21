@@ -21,6 +21,7 @@ the actual sketch if you change either side.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 
@@ -36,6 +37,41 @@ logger = logging.getLogger("esp32_client")
 # Find it by opening the Arduino IDE's Serial Monitor after that board
 # boots — it prints its assigned IP on connect.
 DOOR_CONTROLLER_URL = os.environ.get("HOMEGUARD_DOOR_CONTROLLER_URL", "")
+
+
+def private_board_address(host: str | None) -> str | None:
+    """`host` if it is an ordinary private IPv4 address a board on the local
+    network could have, else None. Loopback, link-local, multicast, unspecified
+    and public addresses are refused, so a request that did not come from the
+    local network never changes where commands are sent."""
+    try:
+        ip = ipaddress.ip_address(host or "")
+    except ValueError:
+        return None
+    if ip.version != 4 or not ip.is_private:
+        return None
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return None
+    return str(ip)
+
+
+def learn_door_address(host: str | None) -> bool:
+    """Points door commands at the address the door board's own request came
+    from. The configured value (HOMEGUARD_DOOR_CONTROLLER_URL) is only the
+    starting point: a router or a phone hotspot hands out different addresses,
+    and a stale one made every arm and disarm silently miss the board. Returns
+    whether the address changed. Authentication is untouched: the caller has
+    already proved it holds the device key."""
+    global DOOR_CONTROLLER_URL
+    address = private_board_address(host)
+    if address is None:
+        return False
+    new = f"http://{address}"
+    if new == DOOR_CONTROLLER_URL:
+        return False
+    logger.info("Door controller address: %s -> %s", DOOR_CONTROLLER_URL or "(none)", new)
+    DOOR_CONTROLLER_URL = new
+    return True
 
 # `build_client` is what supplies `trust_env=False` here, and that matters
 # more on this client than on any other: the target is a bare LAN IP, and a
@@ -92,12 +128,41 @@ async def _post(path: str, json: dict | None = None) -> bool:
         return False
 
 
-async def send_arm(mode: ArmMode) -> bool:
+async def send_arm(mode: ArmMode) -> str:
     """Tell the door controller to arm. It runs its own exit-delay
     countdown before actually going ARMED (see the sketch's EXITING
     state) and reports back via /esp32/state-change once it does.
+
+    Returns what happened, because "the board said no" and "the board did not
+    answer" call for opposite reactions:
+
+    - ``"ok"``: the board accepted.
+    - ``"door_open"``: the board answered 409 — it refuses to arm with its door
+      open (arming then would start the entry countdown the instant it
+      finished). The caller must not arm.
+    - ``"no_ack"``: no answer, no URL configured, or any other refusal. The
+      caller arms its own state anyway and says the hardware did not respond.
     """
-    return await _post("/arm", json={"mode": mode.value})
+    if not DOOR_CONTROLLER_URL:
+        logger.info("HOMEGUARD_DOOR_CONTROLLER_URL not set — skipping outbound command to /arm")
+        return "no_ack"
+    try:
+        response = await _client.post(
+            f"{DOOR_CONTROLLER_URL}/arm",
+            json={"mode": mode.value},
+            headers={"X-Device-Key": state.device_key},
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Door controller request to /arm failed: %s", exc)
+        return "no_ack"
+    if response.status_code == 409:
+        await state.note_board_seen("door_controller")  # it answered, so it is there
+        return "door_open"
+    if response.is_success:
+        await state.note_board_seen("door_controller")
+        return "ok"
+    logger.warning("Door controller answered /arm with HTTP %d", response.status_code)
+    return "no_ack"
 
 
 async def send_disarm() -> bool:

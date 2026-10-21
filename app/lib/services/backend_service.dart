@@ -13,8 +13,8 @@ import 'dart:typed_data';
 /// person walking in is actually racing.
 enum AlarmState { disarmed, transitional, armed, entryDelay, triggered }
 
-/// Away arms every sensor. Home arms the perimeter (ultrasonic + door) but
-/// bypasses the vibration sensor, so people can move around inside.
+/// Away arms every sensor. Home arms only the door sensor: it bypasses both
+/// perimeter sensors (ultrasonic and vibration), so people can move around inside.
 enum ArmMode { away, home }
 
 enum EventCategory { auth, armDisarm, alert, faceId, info }
@@ -196,6 +196,16 @@ enum EnrollFaceOutcome {
   failed,
 }
 
+/// What the Settings screen's test-alert button gets back: whether every
+/// configured channel delivered, and a sentence to show as is (it never holds
+/// a password or key).
+class AlertTestResult {
+  const AlertTestResult({required this.ok, required this.summary});
+
+  final bool ok;
+  final String summary;
+}
+
 /// Push-notification target: an ntfy server and topic.
 ///
 /// On the public ntfy.sh the topic name is the only thing keeping strangers
@@ -229,6 +239,11 @@ class AppSettings {
     required this.nightMode,
     required this.nightModeArmHour,
     required this.nightModeDisarmHour,
+    required this.alertsEnabled,
+    this.clipEnabled = true,
+    this.clipSeconds = 60,
+    required this.alertEmails,
+    required this.escalationEmails,
     required this.emergencyNumber,
     required this.policeCallDelaySeconds,
     required this.ntfy,
@@ -248,6 +263,22 @@ class AppSettings {
   /// to move it.
   final int nightModeArmHour;
   final int nightModeDisarmHour;
+
+  /// Master switch for messages that leave the house (email, WhatsApp). Off
+  /// means an alarm still sounds and shows in the app, it just sends no
+  /// message — for testing without flooding an inbox.
+  final bool alertsEnabled;
+
+  /// Whether the breach email carries a video of the last [clipSeconds] seconds
+  /// from the camera (5-60).
+  final bool clipEnabled;
+  final int clipSeconds;
+
+  /// Who is emailed when an alarm triggers, and who is added if it is still not
+  /// cleared after the delay (the emergency contacts). The sending account and
+  /// its password live on the laptop, never here.
+  final List<String> alertEmails;
+  final List<String> escalationEmails;
 
   /// The configured emergency contact number (empty string if unset).
   final String emergencyNumber;
@@ -431,10 +462,6 @@ abstract class BackendService {
   /// and 0 at all other times.
   Stream<int> get entryDelayStream;
 
-  /// Demo-only: simulates the camera recognizing one of the approved
-  /// faces, so the flow can be seen without a real camera/model.
-  Future<void> simulateFaceRecognition();
-
   // Settings — loaded once by SettingsScreen, no need to stream these
   /// Reads every backend-stored setting in a single request, or null if the
   /// backend couldn't be reached (see [AppSettings] for why that distinction
@@ -443,6 +470,18 @@ abstract class BackendService {
 
   /// Enables/disables night mode.
   Future<void> setNightMode(bool enabled);
+
+  /// Switches outgoing alert messages on or off (see [AppSettings.alertsEnabled]).
+  Future<void> setAlertsEnabled(bool enabled);
+
+  /// Turns the video clip in the breach email on or off and sets its length
+  /// (see [AppSettings.clipSeconds]).
+  Future<void> setAlertClip(bool enabled, int seconds);
+
+  /// Sets who is emailed (see [AppSettings.alertEmails]). Returns null when
+  /// saved, or a sentence to show the user when it was refused (for instance a
+  /// malformed address) or could not be sent.
+  Future<String?> setAlertEmails(List<String> alertTo, List<String> escalationTo);
 
   /// Sets the hours night mode arms and disarms at. Both are whole hours in
   /// 0-23; the backend clamps rather than rejecting.
@@ -461,10 +500,10 @@ abstract class BackendService {
   /// process is alive: swipe it away and a break-in produces nothing.
   Future<void> setNtfyConfig(String server, String topic);
 
-  /// Sends a test push so the user can confirm the topic works before
-  /// relying on it. Returns false if no topic is configured; delivery
-  /// itself isn't confirmed.
-  Future<bool> sendTestNotification();
+  /// Sends a test alert over every channel set up on the backend (email,
+  /// WhatsApp, ntfy) and reports what happened, so the user can confirm
+  /// alerts really arrive before relying on them. See [AlertTestResult].
+  Future<AlertTestResult> sendTestAlert();
 
   /// Releases any resources (stream controllers, sockets, timers) held by
   /// the implementation. Must be called when the service is no longer

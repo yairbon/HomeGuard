@@ -15,13 +15,16 @@ import asyncio
 import json
 import logging
 import os
+import time
+from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
 from fastapi import WebSocket
 
-from . import notifier
+from . import alerts, clip, notifier, secrets_file
 from .models import (
     AlarmState,
     ApprovedFace,
@@ -40,6 +43,12 @@ logger = logging.getLogger("state")
 MAX_LOGIN_ATTEMPTS = 3
 LOCKOUT_DURATION = timedelta(seconds=30)
 ARMING_EXIT_DELAY = timedelta(seconds=3)
+
+# The sensors Home mode ignores: the two on the sensor board (distance and
+# vibration), so people can move around inside while the system is armed. The
+# door sensor stays monitored in both modes — an opened door still starts the
+# entry countdown.
+HOME_BYPASSED_SENSORS = frozenset({SensorType.ultrasonic, SensorType.vibration})
 
 # How long past the door controller's own entry-delay deadline the backend
 # waits before raising the alarm itself. See `_entry_delay_watchdog`: the
@@ -78,12 +87,39 @@ NIGHT_MODE_CHECK_INTERVAL = 60.0
 # pushes frames to /camera/recognize and never heartbeats.) Kept as plain
 # strings (not a SensorType) because the door controller is not a sensor —
 # it's the arm/disarm authority that also happens to own the door reed switch.
-#
-# Also the allow-list for `note_board_seen`: `board` arrives as a query string
+ALL_BOARD_NAMES = ("ultrasonic", "vibration", "door_controller")
+
+
+def expected_boards(raw: str) -> tuple[str, ...]:
+    """Parses `HOMEGUARD_BOARDS` into the boards this install expects to hear from.
+
+    The ultrasonic sketch also carries the vibration (force) sensor, so an
+    install with both sensors wired to one ESP32 has no board that will ever
+    heartbeat as `vibration`. Left in the list it would show as permanently
+    offline, and the app raises a "SENSOR OFFLINE" banner for it. That setup
+    is `HOMEGUARD_BOARDS=ultrasonic,door_controller`.
+
+    Unset or empty means every board, and that is the deliberate default: a
+    board that is expected but never comes up is exactly the failure the
+    offline banner exists to show, so dropping one is something an install
+    opts into rather than something a typo can do. Unknown names are ignored
+    with a warning, and a value with no valid name falls back to every board
+    for the same reason. Order is always [ALL_BOARD_NAMES]'s, however the
+    variable lists them.
+    """
+    wanted = {item.strip() for item in raw.split(",") if item.strip()}
+    unknown = sorted(wanted - set(ALL_BOARD_NAMES))
+    if unknown:
+        logger.warning("HOMEGUARD_BOARDS: ignoring unknown board name(s): %s", ", ".join(unknown))
+    return tuple(name for name in ALL_BOARD_NAMES if name in wanted) or ALL_BOARD_NAMES
+
+
+# The boards this install expects heartbeats from — what `/state` reports, and
+# the allow-list for `note_board_seen`: `board` arrives as a query string
 # from the network, so without this check `_board_last_seen` was a dict an
 # authenticated-but-buggy (or hostile) caller could grow without bound, one
 # key per name it invented.
-BOARD_NAMES = ("ultrasonic", "vibration", "door_controller")
+BOARD_NAMES = expected_boards(os.environ.get("HOMEGUARD_BOARDS", ""))
 
 # Which board owns each sensor, for reports that don't name one. Only the door
 # is a surprise: the door reed switch hangs off the *controller*, so a door
@@ -194,6 +230,14 @@ STATE_FILE = Path(
 )
 
 
+def _clamp_clip_seconds(value) -> int:
+    """The video length setting as a whole number of seconds between 5 and 60."""
+    try:
+        return max(5, min(int(clip.CLIP_SECONDS), int(value)))
+    except (TypeError, ValueError):
+        return int(clip.CLIP_SECONDS)
+
+
 class AppState:
     """Single in-process instance (see `state` at the bottom of this file)
     holding every piece of mutable system state, plus the logic that
@@ -206,7 +250,8 @@ class AppState:
         """Sets up initial state — disarmed, all sensors ok, no boards seen
         yet — then overlays whatever was persisted from a previous run (see
         [_load]). The defaults here are what a brand-new install gets: the
-        password "homeguard" and two pre-approved faces.
+        password (the door keypad's PIN when `HOMEGUARD_SECRETS_H` points at
+        its secrets.h, else "homeguard") and no approved faces.
         """
         # Left empty on purpose — the default password is hashed in [_load],
         # and only if nothing was persisted. scrypt is deliberately expensive
@@ -224,11 +269,12 @@ class AppState:
             SensorReading(type=SensorType.vibration, label="Vibration sensor", ok=True),
         ]
         self.events: list[SecurityEvent] = []
-        self.faces: list[ApprovedFace] = [
-            ApprovedFace(id="1", name="Guy Bar"),
-            ApprovedFace(id="2", name="Yair Bonfil"),
-        ]
-        self._next_face_id = 3  # ids "1"/"2" are taken by the seed faces above
+        # A fresh install has nobody approved: the people who may disarm by
+        # face are enrolled from the app. (It used to ship two hardcoded
+        # developer names with no photos, which showed up as approved people
+        # who could never match anything.)
+        self.faces: list[ApprovedFace] = []
+        self._next_face_id = 1
         # When the last camera frame arrived. `camera_online` is *derived*
         # from this rather than being a stored flag, for exactly the reason
         # the per-board `esp32_online` flag was replaced by
@@ -248,6 +294,24 @@ class AppState:
         # why letting a face turn the alarm off is a security trade-off.
         self.face_disarm_enabled = False
         self.night_mode = False
+        # Master switch for messages that leave the house; see FullState.
+        self.alerts_enabled = True
+        # The video clip in the breach email: on/off and how many seconds (5-60).
+        self.clip_enabled = True
+        self.clip_seconds = 60
+        # Who the alert emails go to, set from the app. On the first start after
+        # this existed they are carried over from the local alerts file (see
+        # `_load`), so nobody has to type them twice.
+        self.alert_emails: list[str] = []
+        self.escalation_emails: list[str] = []
+        self._pin_resync_task: asyncio.Task | None = None
+        # Returns the newest camera frame (JPEG bytes) or None. Set by main.py,
+        # which owns the frame cache; used to attach a picture to alarm emails.
+        self.camera_frame_source: Callable[[], bytes | None] | None = None
+        # The last minute of camera frames as (unix time, JPEG), for the video
+        # clip in the alarm email. In memory only: a restart starts it empty.
+        self.clip_frames: deque[tuple[float, bytes]] = deque(maxlen=clip.MAX_FRAMES)
+        self._stream_frame_at = 0.0  # when the live stream last delivered a frame
         # Whole hours (0-23): when night mode arms and disarms. Defaults to
         # arming at 23:00 and disarming at 07:00.
         self.night_mode_arm_hour = 23
@@ -348,12 +412,40 @@ class AppState:
             )
             data = {}
 
-        # The one place the default password is hashed, and only on an install
-        # that has never been started; see the note in `__init__`.
-        self._password_hash = _scalar(data, "password_hash", "") or hash_password(DEFAULT_PASSWORD)
+        # The one place the first password is hashed, and only on an install
+        # that has never been started; see the note in `__init__`. It starts
+        # as the door keypad's own PIN when the backend can read it from the
+        # board's secrets.h, so app password and PIN are one secret from the
+        # first minute rather than after the first password change; without
+        # that file it falls back to the well-known factory default.
+        stored_hash = _scalar(data, "password_hash", "")
+        first_run_pin = ""
+        if stored_hash:
+            self._password_hash = stored_hash
+        else:
+            candidate = secrets_file.read_keypad_pin()
+            if is_valid_keypad_pin(candidate):
+                first_run_pin = candidate
+                self._password_hash = hash_password(candidate)
+            else:
+                self._password_hash = hash_password(DEFAULT_PASSWORD)
         self.face_id_enabled = _scalar(data, "face_id_enabled", self.face_id_enabled)
         self.face_disarm_enabled = _scalar(data, "face_disarm_enabled", self.face_disarm_enabled)
         self.night_mode = _scalar(data, "night_mode", self.night_mode)
+        self.alerts_enabled = _scalar(data, "alerts_enabled", self.alerts_enabled)
+        self.clip_enabled = _scalar(data, "clip_enabled", self.clip_enabled)
+        self.clip_seconds = _clamp_clip_seconds(_scalar(data, "clip_seconds", self.clip_seconds))
+        stored_alert, stored_escalation = data.get("alert_emails"), data.get("escalation_emails")
+        if isinstance(stored_alert, list) or isinstance(stored_escalation, list):
+            self.alert_emails = list(alerts.parse_addresses(stored_alert)[0])
+            self.escalation_emails = list(alerts.parse_addresses(stored_escalation)[0])
+        else:
+            # First start with recipients living here: carry over what the local
+            # alerts file already says, once; from then on the app owns them.
+            seed = alerts.load_config().email
+            if seed is not None:
+                self.alert_emails = list(seed.alert_to)
+                self.escalation_emails = list(seed.escalation_to)
         # Clamped on the way in as well as in the setters: a hand-edited hour
         # of 99 gives a night-mode schedule that can never fire, and a negative
         # escalation delay fires it instantly (see MIN_POLICE_CALL_DELAY).
@@ -373,14 +465,14 @@ class AppState:
         # field that gets relayed to hardware, and state.json is a plain file
         # a user may well have opened and edited.
         stored_pin = data.get("keypad_pin", "")
-        self.keypad_pin = stored_pin if is_valid_keypad_pin(stored_pin) else ""
+        self.keypad_pin = stored_pin if is_valid_keypad_pin(stored_pin) else first_run_pin
 
         faces = data.get("faces")
         if isinstance(faces, list):
             try:
                 self.faces = [ApprovedFace(**f) for f in faces]
             except (TypeError, ValueError) as exc:
-                logger.warning("Persisted faces are malformed (%s) — keeping seed faces.", exc)
+                logger.warning("Persisted faces are malformed (%s) — starting with none.", exc)
 
         events = data.get("events")
         if isinstance(events, list):
@@ -437,6 +529,11 @@ class AppState:
             "face_id_enabled": self.face_id_enabled,
             "face_disarm_enabled": self.face_disarm_enabled,
             "night_mode": self.night_mode,
+            "alerts_enabled": self.alerts_enabled,
+            "clip_enabled": self.clip_enabled,
+            "clip_seconds": self.clip_seconds,
+            "alert_emails": self.alert_emails,
+            "escalation_emails": self.escalation_emails,
             "night_mode_arm_hour": self.night_mode_arm_hour,
             "night_mode_disarm_hour": self.night_mode_disarm_hour,
             "emergency_number": self.emergency_number,
@@ -571,8 +668,21 @@ class AppState:
             known and datetime.now() - self._board_last_seen[board] < BOARD_TIMEOUT
         )
         self._board_last_seen[board] = datetime.now()
+        if board == "door_controller" and not previously and self.keypad_pin:
+            # The keypad board has just (re)appeared, or this backend just
+            # started. A PIN changed while it was unplugged never reached it, so
+            # the keypad would still be on the old code while the app says the
+            # new one: say it again. Harmless when it already matches.
+            self._pin_resync_task = asyncio.create_task(self._resync_keypad_pin())
         if not previously or was_online != self.esp32_online:
             await self._broadcast()
+
+    async def _resync_keypad_pin(self) -> None:
+        """Pushes the current PIN to the door controller (see `note_board_seen`)."""
+        from . import esp32_client  # deferred: esp32_client imports `state`
+
+        if await esp32_client.send_keypad_pin(self.keypad_pin):
+            logger.info("Keypad PIN re-sent to the door controller.")
 
     async def _monitor_boards(self) -> None:
         """Background loop that re-broadcasts when a board's derived
@@ -668,6 +778,11 @@ class AppState:
             face_id_enabled=self.face_id_enabled,
             face_disarm_enabled=self.face_disarm_enabled,
             night_mode=self.night_mode,
+            alerts_enabled=self.alerts_enabled,
+            clip_enabled=self.clip_enabled,
+            clip_seconds=self.clip_seconds,
+            alert_emails=self.alert_emails,
+            escalation_emails=self.escalation_emails,
             night_mode_arm_hour=self.night_mode_arm_hour,
             night_mode_disarm_hour=self.night_mode_disarm_hour,
             emergency_number=self.emergency_number,
@@ -688,6 +803,11 @@ class AppState:
             0, SecurityEvent(timestamp=datetime.now(), message=message, category=category)
         )
         del self.events[MAX_EVENTS:]
+        # Also on the console: the backend's window then tells the story as it
+        # happens (armed, door opened, alarm, email sent) instead of a wall of
+        # routine HTTP lines. Event messages never carry a secret by design (see
+        # set_ntfy and set_alert_emails).
+        logger.info("[%s] %s", category.value, message)
 
     # ---- Auth ---------------------------------------------------------------
 
@@ -913,6 +1033,14 @@ class AppState:
         if self.alarm_state != AlarmState.disarmed:
             return
         self._arm_mode = mode
+        if mode == ArmMode.home:
+            # Home means someone stays inside, so there is nobody to walk out
+            # and no exit delay to wait for: armed at once.
+            self.alarm_state = AlarmState.armed
+            self._apply_bypass(mode)
+            self._log("System armed (Home)", EventCategory.armDisarm)
+            await self._broadcast()
+            return
         self._log(
             f"Arming ({'Away' if mode == ArmMode.away else 'Home'}) — exit now",
             EventCategory.armDisarm,
@@ -931,8 +1059,9 @@ class AppState:
     def _apply_bypass(self, mode: ArmMode) -> None:
         """Resets every sensor to ok and applies `mode`'s bypass rules.
 
-        Home mode bypasses the vibration sensor (people moving around inside
-        shouldn't trip it); Away mode bypasses nothing. Factored out of
+        Home mode bypasses both perimeter sensors, the ultrasonic one and the
+        vibration one (people moving around inside shouldn't trip them); the
+        door sensor stays live. Away mode bypasses nothing. Factored out of
         `_finish_arming` so `report_state_from_esp32` can apply the exact
         same rules when the door controller is what puts the system into
         `armed` — previously that path had no way to do this and Home mode's
@@ -943,7 +1072,7 @@ class AppState:
                 type=s.type,
                 label=s.label,
                 ok=True,
-                bypassed=(mode == ArmMode.home and s.type == SensorType.vibration),
+                bypassed=(mode == ArmMode.home and s.type in HOME_BYPASSED_SENSORS),
             )
             for s in self.sensors
         ]
@@ -1079,7 +1208,7 @@ class AppState:
         # The controller reports only armed/disarmed, never which mode was
         # requested — so the mode comes from `_arm_mode`, which `arm()`
         # recorded when the request came in. That's what lets Home mode's
-        # vibration bypass survive the controller winning the race to set
+        # sensor bypass survive the controller winning the race to set
         # `armed`; arming from the physical keypad (which the app never told
         # us a mode for) falls back to the last mode used, defaulting to Away
         # — the stricter of the two, so an unknown mode never silently
@@ -1165,9 +1294,10 @@ class AppState:
         only if) the system is currently `armed`. `source` identifies
         which sensor reported it (SensorReading is marked ok=False for
         that sensor below) or is None for non-sensor alerts (failed
-        logins, the debug/demo trigger). Called from three places:
-        AppState._register_failed_attempt (lockout), /trigger-alert (demo
-        button), and /esp32/sensor-event (real sensor reports).
+        logins, manual triggers). Called from three places:
+        AppState._register_failed_attempt (lockout), /trigger-alert (manual
+        trigger, used by simulate.py), and /esp32/sensor-event (real sensor
+        reports).
         """
         if self.alarm_state not in (AlarmState.armed, AlarmState.entryDelay):
             # Ignore triggers while disarmed, still arming (transitional
@@ -1180,10 +1310,10 @@ class AppState:
             # expiry arrives here as the controller's door alert.
             return
 
-        # A bypassed sensor (e.g. vibration in Home mode) is expected to
-        # keep firing physically — that board doesn't know about arm
+        # A bypassed sensor (distance or vibration in Home mode) is expected
+        # to keep firing physically — that board doesn't know about arm
         # modes, it just reports. It's this check, not the board, that
-        # makes Home mode's "ignore vibration" promise actually hold.
+        # makes Home mode's "ignore these sensors" promise actually hold.
         if source is not None:
             reporting_sensor = next((s for s in self.sensors if s.type == source), None)
             if reporting_sensor is not None and reporting_sensor.bypassed:
@@ -1201,12 +1331,17 @@ class AppState:
         # Pushed before the broadcast, but non-blocking (see notifier.notify):
         # this only schedules the request, so the state push below still goes
         # out immediately even if the ntfy server is slow or unreachable.
-        notifier.notify(
-            self.ntfy_server,
-            self.ntfy_topic,
-            title="HomeGuard alarm",
-            message=reason,
-        )
+        if self.alerts_enabled:
+            notifier.notify(
+                self.ntfy_server,
+                self.ntfy_topic,
+                title="HomeGuard alarm",
+                message=reason,
+                alert_to=self.alert_emails,
+                escalation_to=self.escalation_emails,
+                photo=self._alert_photo(),
+                clip=self._alert_clip(),
+            )
         self._start_escalation(reason)
 
         # Push to the apps *before* touching the hardware. This used to run
@@ -1261,20 +1396,37 @@ class AppState:
         if self.alarm_state != AlarmState.triggered:
             return
 
-        contact = self.emergency_number.strip()
         message = (
-            f"Alarm still active after {self.police_call_delay_seconds}s — {reason}."
-            + (f" Call {contact}." if contact else "")
+            f"Alarm still active after {self.police_call_delay_seconds}s — {reason}. "
+            "Nobody has cleared it."
         )
-        self._log("Alarm not cleared — escalation notification sent", EventCategory.alert)
-        notifier.notify(
-            self.ntfy_server,
-            self.ntfy_topic,
-            title="HomeGuard — ALARM NOT CLEARED",
-            message=message,
-            priority="urgent",
-            tags="rotating_light,sos",
-        )
+        if not self.alerts_enabled:
+            self._log(
+                "Alarm not cleared — escalation NOT sent: alerts are switched off",
+                EventCategory.alert,
+            )
+        elif self.ntfy_topic or self._alert_config().any_channel(escalation=True):
+            self._log("Alarm not cleared — escalation notification sent", EventCategory.alert)
+        else:
+            # With no channel `notifier.notify` is a no-op, so claiming a
+            # notification went out would be a lie in the security log.
+            self._log(
+                "Alarm not cleared — escalation NOT sent: no notification channel is set up",
+                EventCategory.alert,
+            )
+        if self.alerts_enabled:
+            notifier.notify(
+                self.ntfy_server,
+                self.ntfy_topic,
+                title="HomeGuard — ALARM NOT CLEARED",
+                message=message,
+                priority="urgent",
+                tags="rotating_light,sos",
+                escalation=True,
+                alert_to=self.alert_emails,
+                escalation_to=self.escalation_emails,
+                photo=self._alert_photo(),
+            )
         await self._broadcast()
 
     # ---- Faces ----------------------------------------------------------------
@@ -1449,6 +1601,33 @@ class AppState:
         self._persist()
         await self._broadcast()
 
+    async def set_alerts_enabled(self, enabled: bool) -> None:
+        """Switches messages that leave the house on or off (email, WhatsApp,
+        ntfy). The alarm itself — siren, app state, event log — is unaffected;
+        only the outgoing messages stop, so a bench test does not flood an inbox.
+        Logged, because "why did no email arrive" must be answerable later."""
+        self.alerts_enabled = enabled
+        self._log(
+            "Alerts switched on" if enabled else "Alerts switched OFF — no messages will be sent",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
+
+    async def set_alert_clip(self, enabled: bool, seconds: int) -> None:
+        """Whether the breach email carries a video of the last few seconds, and
+        how many (5-60, clamped). The camera frames are kept either way."""
+        self.clip_enabled = enabled
+        self.clip_seconds = _clamp_clip_seconds(seconds)
+        self._log(
+            f"Alert video on, last {self.clip_seconds} s"
+            if enabled
+            else "Alert video switched off",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
+
     async def set_night_mode_hours(self, arm_hour: int, disarm_hour: int) -> None:
         """Sets when night mode arms and disarms, as whole hours (0-23).
 
@@ -1523,23 +1702,73 @@ class AppState:
         self._persist()
         await self._broadcast()
 
-    async def send_test_notification(self) -> bool:
-        """Pushes a harmless test notification, so the user can confirm the
-        topic works *before* relying on it for a real break-in. Returns
-        whether a topic was configured at all — not whether it was delivered,
-        which is deliberately not awaited (see notifier.notify).
+    async def send_test_notification(self) -> dict[str, str]:
+        """Sends a harmless test over every configured channel, so the user can
+        confirm alerts really arrive *before* relying on them for a break-in.
+
+        Unlike a real alert this waits for the outcome (it is the user asking
+        "does it work?"). One entry per channel, "" meaning delivered; an
+        empty dict means no channel is set up at all.
         """
-        if not self.ntfy_topic:
-            return False
-        notifier.notify(
+        return await notifier.send_test(
             self.ntfy_server,
             self.ntfy_topic,
-            title="HomeGuard test",
-            message="Test notification — your alerts will arrive here.",
-            priority="default",
-            tags="white_check_mark",
+            self.alert_emails,
+            self.escalation_emails,
+            self._alert_photo(),
+            self._alert_clip(),
         )
-        return True
+
+    def record_clip_frame(self, jpeg: bytes, *, stream: bool = False) -> None:
+        """Remembers one camera frame for the alarm clip, dropping anything
+        older than a minute. `stream=True` is a frame of the live stream (about
+        20 a second); otherwise it is a still pushed for face recognition (1-2 a
+        second), which is only kept while the stream is not delivering."""
+        now = time.time()
+        if stream:
+            self._stream_frame_at = now
+        elif now - self._stream_frame_at < 3:
+            return
+        self.clip_frames.append((now, jpeg))
+        while self.clip_frames and now - self.clip_frames[0][0] > clip.CLIP_SECONDS:
+            self.clip_frames.popleft()
+
+    def _alert_clip(self) -> tuple[tuple[float, bytes], ...] | None:
+        """The frames of the last minute (fewer if that is all there is), or
+        None. A snapshot, taken the moment the alarm fires; the video is made
+        later, off the event loop, by `alerts`."""
+        if not self.clip_enabled:
+            return None
+        cutoff = time.time() - self.clip_seconds
+        frames = tuple(f for f in self.clip_frames if f[0] >= cutoff)
+        return frames if len(frames) >= 2 else None
+
+    def _alert_photo(self) -> bytes | None:
+        """The latest camera frame, for the alarm email, or None.
+
+        Only while the camera is really delivering (a frame in the last
+        `BOARD_TIMEOUT`): the cache keeps the last frame forever, and a picture
+        from hours ago next to "someone is in the house" would mislead."""
+        if self.camera_frame_source is None or not self.camera_online:
+            return None
+        return self.camera_frame_source()
+
+    def _alert_config(self) -> alerts.AlertsConfig:
+        """The local alerts file with the recipients set in the app applied."""
+        return alerts.load_config().with_recipients(self.alert_emails, self.escalation_emails)
+
+    async def set_alert_emails(self, alert_to: list[str], escalation_to: list[str]) -> None:
+        """Replaces who is emailed. The caller has already validated the
+        addresses. Logged as counts only: the event log is shown in the app and
+        sits in `state.json`, and addresses are nobody else's business."""
+        self.alert_emails = list(alert_to)
+        self.escalation_emails = list(escalation_to)
+        self._log(
+            f"Alert recipients updated ({len(alert_to)} alarm, {len(escalation_to)} emergency)",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
 
     async def set_police_call_delay(self, seconds: int) -> None:
         """Stores how long to wait after a triggered alarm before escalating

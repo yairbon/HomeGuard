@@ -8,10 +8,29 @@ import 'homeguard_icons.dart';
 /// BYPASSED state), one per entry in [sensors]. Used on the dashboard to
 /// give an at-a-glance read of every sensor in the current loop.
 class SensorStatusPanel extends StatelessWidget {
-  const SensorStatusPanel({super.key, required this.sensors});
+  const SensorStatusPanel({super.key, required this.sensors, this.offlineBoards = const []});
 
   /// Sensor readings to render, in display order.
   final List<SensorReading> sensors;
+
+  /// Boards the backend has stopped hearing from. A sensor whose board is in
+  /// here says NOT CONNECTED instead of OK: its last reading is history.
+  final List<BoardStatus> offlineBoards;
+
+  /// Whether the board that carries [type] is offline. The vibration sensor can
+  /// ride on the ultrasonic board (one ESP32 for both), so either board
+  /// being silent leaves it uncovered.
+  bool _isOffline(SensorType type) {
+    final names = offlineBoards.map((b) => b.name).toSet();
+    switch (type) {
+      case SensorType.door:
+        return names.contains('door_controller');
+      case SensorType.ultrasonic:
+        return names.contains('ultrasonic');
+      case SensorType.vibration:
+        return names.contains('vibration') || names.contains('ultrasonic');
+    }
+  }
 
   /// Maps a sensor type to the icon used for its badge.
   HGIcon _iconFor(SensorType type) {
@@ -39,9 +58,12 @@ class SensorStatusPanel extends StatelessWidget {
         // ok/breach reading is meaningless since it's been intentionally
         // excluded from monitoring, so it always renders muted regardless
         // of its underlying state.
-        final color = sensor.bypassed
-            ? AppColors.textMuted
-            : (sensor.ok ? AppColors.safe : AppColors.alarm);
+        final offline = _isOffline(sensor.type);
+        final color = offline
+            ? AppColors.transitional
+            : sensor.bypassed
+                ? AppColors.textMuted
+                : (sensor.ok ? AppColors.safe : AppColors.alarm);
 
         return Column(
           children: [
@@ -63,7 +85,9 @@ class SensorStatusPanel extends StatelessWidget {
               style: const TextStyle(fontSize: 11, color: AppColors.textMuted),
             ),
             Text(
-              sensor.bypassed ? 'BYPASSED' : (sensor.ok ? 'OK' : 'BREACH'),
+              offline
+                  ? 'NOT CONNECTED'
+                  : (sensor.bypassed ? 'BYPASSED' : (sensor.ok ? 'OK' : 'BREACH')),
               style: AppTheme.monoBadge.copyWith(color: color),
             ),
           ],

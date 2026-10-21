@@ -37,8 +37,8 @@ class AlarmState(StrEnum):
 
 
 class ArmMode(StrEnum):
-    """Which arm profile was requested. `home` bypasses the vibration
-    sensor (people moving around inside shouldn't trip it); `away`
+    """Which arm profile was requested. `home` bypasses both perimeter
+    sensors, ultrasonic and vibration (people moving around inside shouldn't trip them); `away`
     bypasses nothing. The actual bypass assignment happens in
     AppState._finish_arming, not here — this enum is just the selector.
     """
@@ -170,7 +170,7 @@ class ArmRequest(BaseModel):
 
 
 class TriggerAlertRequest(BaseModel):
-    """Body for /trigger-alert (the demo "simulate intrusion" button).
+    """Body for /trigger-alert (a manual alarm trigger).
     `source` is optional because not every alert is tied to a specific
     sensor — e.g. the 3-failed-logins alert (see AppState.login) passes
     source=None since it's a keypad/auth event, not a sensor report.
@@ -199,6 +199,30 @@ class SetFaceDisarmEnabledRequest(BaseModel):
 
 class SetNightModeRequest(BaseModel):
     enabled: bool
+
+
+class SetAlertEmailsRequest(BaseModel):
+    """Body for /settings/alert-emails: who is emailed when an alarm triggers
+    (`alert_to`), and who is added if it is still not cleared after the delay
+    (`escalation_to`, the emergency contacts). Each may be empty."""
+
+    alert_to: list[str] = []
+    escalation_to: list[str] = []
+
+
+class SetAlertsEnabledRequest(BaseModel):
+    """Body for /settings/alerts-enabled: the master switch for messages that
+    leave the house (email, WhatsApp, ntfy)."""
+
+    enabled: bool
+
+
+class SetAlertClipRequest(BaseModel):
+    """Body for /settings/alert-clip: whether the breach email carries a video
+    and its length in seconds (clamped to 5-60 server-side)."""
+
+    enabled: bool
+    seconds: int = 60
 
 
 class SetNightModeHoursRequest(BaseModel):
@@ -278,6 +302,17 @@ class FullState(BaseModel):
     # Whole hours (0-23) at which night mode arms and disarms.
     night_mode_arm_hour: int
     night_mode_disarm_hour: int
+    # Master switch for alerts that leave the house (email, WhatsApp, ntfy).
+    # Off means an alarm still sounds and shows in the app, it just sends no
+    # message — for testing without flooding an inbox.
+    alerts_enabled: bool
+    # Video clip in the breach email: on/off and its length in seconds (5-60).
+    clip_enabled: bool = True
+    clip_seconds: int = 60
+    # Who the alert emails go to; edited from the app. The sending account and
+    # its password stay in the local alerts file, never here.
+    alert_emails: list[str]
+    escalation_emails: list[str]
     emergency_number: str
     police_call_delay_seconds: int
     # Where alerts are pushed so they arrive with the app closed. The topic

@@ -38,8 +38,10 @@ PROTECTED_ROUTES = [
     ("post", "/settings/emergency-number", {"number": "100"}),
     ("post", "/settings/police-call-delay", {"seconds": 30}),
     ("post", "/settings/ntfy", {"server": "https://ntfy.sh", "topic": "x"}),
-    ("post", "/settings/ntfy/test", None),
-    ("post", "/debug/simulate-face-recognition", None),
+    ("post", "/settings/alerts/test", None),
+    ("post", "/settings/alerts-enabled", {"enabled": False}),
+    ("post", "/settings/alert-clip", {"enabled": True, "seconds": 30}),
+    ("post", "/settings/alert-emails", {"alert_to": ["a@example.com"], "escalation_to": []}),
 ]
 
 DEVICE_ROUTES = [
@@ -94,7 +96,7 @@ def test_every_route_is_covered_by_a_table():
     """The drift guard on the tables above.
 
     Those tables are the project's stated defence against shipping an
-    endpoint that forgot its `Depends(require_app)` (CLAUDE.md says as much),
+    endpoint that forgot its `Depends(require_app)`,
     but they are hand-maintained — and by the time this test was written they
     had silently fallen eight routes behind, including `/face-disarm-enabled`
     (which controls whether a photograph can disarm the alarm) and

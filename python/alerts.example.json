@@ -1,0 +1,16 @@
+{
+  "_readme": "Copy this file to alerts.local.json (same folder) and fill in your own values; alerts.local.json is never committed. Use the whatsapp part, the email part, or both: delete what you do not use. Both need internet access from whatever network the laptop is on.",
+
+  "whatsapp": [
+    { "phone": "+972500000000", "apikey": "the key CallMeBot sends you after you activate it" }
+  ],
+
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "username": "the-sending-account@gmail.com",
+    "app_password": "the 16-letter Google app password",
+    "alert_to": ["you@example.com"],
+    "escalation_to": ["emergency.contact@example.com"]
+  }
+}

@@ -228,6 +228,11 @@ async def test_state_shape_matches_the_flutter_client(auth_client):
         "night_mode",
         "night_mode_arm_hour",
         "night_mode_disarm_hour",
+        "alerts_enabled",
+        "clip_enabled",
+        "clip_seconds",
+        "alert_emails",
+        "escalation_emails",
         "emergency_number",
         "police_call_delay_seconds",
         "ntfy_server",
@@ -343,3 +348,14 @@ async def test_websocket_pushes_state_to_an_authenticated_client(app_module):
             snapshot = json.loads(ws.receive_text())
     assert snapshot["alarm_state"] == "disarmed"
     assert len(snapshot["boards"]) == 3
+
+
+def test_the_camera_stream_is_relabelled_for_safari_but_keeps_its_boundary(app_module):
+    relabel = app_module.app_stream_content_type
+    assert relabel("multipart/x-mixed-replace;boundary=frame") == (
+        "application/octet-stream;boundary=frame"
+    )
+    assert relabel("multipart/x-mixed-replace; boundary=123456789000000000000987654321") == (
+        "application/octet-stream; boundary=123456789000000000000987654321"
+    )
+    assert relabel("image/jpeg") == "image/jpeg"  # anything else is left alone

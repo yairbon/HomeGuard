@@ -23,6 +23,16 @@ DEVICE_KEY = "test-device-key"
 PASSWORD = "homeguard"
 
 
+@pytest.fixture(autouse=True)
+def no_real_alerts(tmp_path, monkeypatch):
+    """Every test starts with no alert channel, whatever `alerts.local.json`
+    says on this machine: a test that raises an alarm would otherwise send a
+    real email or WhatsApp message to the owner."""
+    from backend import alerts
+
+    monkeypatch.setattr(alerts, "CONFIG_FILE", Path(tmp_path) / "no-alerts.local.json")
+
+
 @pytest.fixture
 def app_module(tmp_path: pytest.TempPathFactory, monkeypatch):
     """Reimports the backend with its persistence and device key pointed at a

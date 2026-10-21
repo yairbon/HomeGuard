@@ -1,7 +1,7 @@
 // ==========================================
 // HomeGuard - Door & Keypad Controller (board 3 of 4)
 // Features: Real Door Sensor, Serial Keypad, Configurable Silent Delay,
-// Accelerating Beeps, Alternating Siren, WiFi + Backend Integration
+// Accelerating Beeps, Siren, Keypad/Status Sounds, WiFi + Backend Integration
 // ==========================================
 //
 // This is the arm/disarm AUTHORITY: it's the board with the keypad, so
@@ -58,6 +58,146 @@ const int DOOR_SENSOR_PIN = 4;  // Magnetic Reed Switch
 const int BUZZER_1_PIN = 23;    // Buzzer 1
 const int BUZZER_2_PIN = 22;    // Buzzer 2
 
+// Bench-test hook: 1 = characters typed into the Serial Monitor count as key
+// presses (arm with '*', PIN + '#'), so the state machine can be driven
+// without the keypad. 0 (the shipped default) = only the physical keypad,
+// because anyone holding a USB cable should not be able to type at the panel.
+#ifndef ENABLE_SERIAL_KEYPAD
+#define ENABLE_SERIAL_KEYPAD 0
+#endif
+
+// ==========================================================================
+// SOUNDS - every sound this board makes is defined in this one block, so
+// tuning by ear is a number edit. Nothing in here decides WHEN a sound plays:
+// that is setState() and the entry-delay code further down.
+// ==========================================================================
+//
+// Buzzer type. Both buzzers are driven with a plain HIGH/LOW level and they
+// beep, so they are ACTIVE buzzers: each has its own oscillator and sounds
+// one fixed pitch whenever its pin is HIGH. For those, the "Hz" numbers below
+// only mean on (non-zero) or off (0); the sounds differ by rhythm and by
+// which buzzer plays. If the buzzers turn out to be passive piezos, set this
+// to 0: the very same table then plays the Hz values as real pitches (LEDC).
+#ifndef BUZZERS_ACTIVE
+#define BUZZERS_ACTIVE 1
+#endif
+
+// One step of a sound: what each buzzer does for `ms` milliseconds.
+struct SoundStep {
+  uint16_t hz1;  // buzzer 1 (GPIO23): 0 = silent, else pitch (passive) / "on" (active)
+  uint16_t hz2;  // buzzer 2 (GPIO22): same
+  uint16_t ms;   // length of the step, must be > 0
+};
+
+// Priority, highest first:  siren  >  entry-delay beeps  >  status sounds
+// >  key clicks.  A higher one silences the lower ones; while the siren runs,
+// clicks and status sounds are not played at all. The entry-delay beeps only
+// claim the buzzer(s) named in ENTRY_BEEP_HZ1/2 below, so a click or status
+// sound still plays on a buzzer they leave free. On top of that the countdown
+// beeps pause while someone is typing (TYPING_QUIET_MS below), so keys and the
+// wrong-PIN / disarmed result are never played over them.
+
+// Key press: one short click, buzzer 1 only, every key.
+const SoundStep CLICK_STEPS[] = { {3000, 0, 40} };
+
+// Armed: short-short-long. On passive buzzers it rises in pitch; on active
+// ones it is B1, B1, then B2, which rises only if B2 is the higher-pitched one.
+const SoundStep ARMED_STEPS[] = {
+  {2000, 0, 90}, {0, 0, 60}, {2600, 0, 90}, {0, 0, 60}, {0, 3200, 220},
+};
+
+// Disarmed (also "arming cancelled"): long-short-short, the mirror of armed.
+const SoundStep DISARMED_STEPS[] = {
+  {0, 3200, 220}, {0, 0, 60}, {2600, 0, 90}, {0, 0, 60}, {2000, 0, 90},
+};
+
+// Wrong PIN: one long buzz on both buzzers (low, on passive buzzers). Much
+// longer than any beep or click, and not a rhythm, so it can't be mistaken for
+// the armed / disarmed sounds or the countdown.
+const SoundStep WRONG_PIN_STEPS[] = { {400, 400, 700} };
+
+// Refused ("can't do that", e.g. arming with the door open): a rapid stutter of
+// four short pulses on both buzzers. Nothing else sounds like it: a click is one
+// 40 ms pulse, the countdown beeps are 150 ms, the jingles end or start long.
+const SoundStep REFUSED_STEPS[] = {
+  {2400, 2400, 60}, {0, 0, 60}, {2400, 2400, 60}, {0, 0, 60},
+  {2400, 2400, 60}, {0, 0, 60}, {2400, 2400, 60},
+};
+
+// Siren: plays in a loop for as long as the state is ALARM.
+#if BUZZERS_ACTIVE
+// Pitch can't change, so the two buzzers swap: B1 on / B2 off, then B1 off /
+// B2 on, with no silent gap. 2 steps x 50 ms = 10 swaps per second.
+const SoundStep SIREN_STEPS[] = { {2800, 0, 50}, {0, 3400, 50} };
+#else
+// Each buzzer sweeps up and down, mirrored so they are never at the same
+// pitch. 8 steps x 15 ms = 120 ms per up-down cycle, about 8 per second.
+const SoundStep SIREN_STEPS[] = {
+  {2000, 3500, 15}, {2500, 3000, 15}, {3000, 2500, 15}, {3500, 2000, 15},
+  {3500, 2000, 15}, {3000, 2500, 15}, {2500, 3000, 15}, {2000, 3500, 15},
+};
+#endif
+
+// Entry-delay beeps (the countdown while waiting for a PIN). Which buzzer
+// carries them is set here, 0 = that buzzer is left free: both buzzers together
+// is the loudest; set one to 0 to leave that buzzer free for clicks. For
+// passive buzzers the value is the pitch.
+const uint16_t ENTRY_BEEP_HZ1 = 2700;   // buzzer 1 (GPIO23)
+const uint16_t ENTRY_BEEP_HZ2 = 2700;   // buzzer 2 (GPIO22)
+
+// While someone types during the countdown, the beeps stop at the first key
+// and stay off until this long after the last key. Every key is then heard on
+// its own, and the wrong-PIN buzz or disarmed sound plays in silence. If they
+// stop typing, a burst follows at once. Only the sound pauses: the entry timer
+// still runs out after ENTRY_TIME_LIMIT and the alarm still sounds.
+const unsigned long TYPING_QUIET_MS = 1800;
+
+// Shape of the countdown. It starts after SILENCE_BEFORE_BEEP (below). Each
+// burst is COUNTDOWN_BEEPS_PER_BURST beeps of BEEP_ON_DURATION ms with
+// COUNTDOWN_BURST_GAP_MS between them, then a pause that shrinks in a straight
+// line from COUNTDOWN_PAUSE_START_MS to COUNTDOWN_PAUSE_END_MS as the entry
+// window runs out. The classic accelerating beeps are one beep per burst with
+// a pause of 1500 -> 60 ms. For a triple beep use 3 beeps per burst and a
+// pause of 2500 -> 300; for a steady rhythm set START and END equal.
+const int BEEP_ON_DURATION = 150;
+const int COUNTDOWN_BEEPS_PER_BURST = 1;
+const int COUNTDOWN_BURST_GAP_MS = 100;
+const int COUNTDOWN_PAUSE_START_MS = 1500;
+const int COUNTDOWN_PAUSE_END_MS = 60;
+
+// The one-shot sounds, by id. `priority`: a new sound replaces one that is
+// playing if its priority is the same or higher, and is dropped otherwise.
+enum SoundId : uint8_t {
+  SND_CLICK, SND_ARMED, SND_DISARMED, SND_WRONG_PIN, SND_REFUSED, SOUND_COUNT
+};
+
+struct SoundDef {
+  const SoundStep* steps;
+  uint8_t count;
+  uint8_t priority;
+};
+
+#define SOUND_STEPS(a) (a), (sizeof(a) / sizeof((a)[0]))
+const SoundDef SOUNDS[SOUND_COUNT] = {
+  {SOUND_STEPS(CLICK_STEPS), 1},
+  {SOUND_STEPS(ARMED_STEPS), 2},
+  {SOUND_STEPS(DISARMED_STEPS), 2},
+  {SOUND_STEPS(WRONG_PIN_STEPS), 2},
+  {SOUND_STEPS(REFUSED_STEPS), 2},
+};
+const char* const SOUND_NAMES[SOUND_COUNT] = {"click", "armed", "disarmed", "wrong-pin",
+                                              "refused"};
+
+const uint32_t SOUND_TICK_MS = 2;       // how often the sound task updates the pins
+const int SOUND_QUEUE_DEPTH = 8;
+const uint32_t SOUND_STACK_BYTES = 4096;
+
+// What loop() asks for. loop() never writes the buzzer pins itself.
+volatile bool sirenWanted = false;      // true exactly while the state is ALARM
+volatile bool entryBeepHeld = false;    // true while one entry-delay beep is on
+QueueHandle_t soundQueue = nullptr;     // one-shot sound ids
+bool soundTaskRunning = false;
+
 // --- Physical keypad (3x4: digits 1-9, *, 0, #) ---
 // Rows are driven OUTPUT (idle HIGH, pulled LOW one at a time while
 // scanning); columns are read INPUT_PULLUP (idle HIGH, read LOW when the
@@ -93,10 +233,9 @@ State currentState = DISARMED;
 String enteredPin = "";
 
 // The physical 3x4 matrix is now wired (see ROW_PINS/COL_PINS above) and
-// read by getPhysicalKey() below. getSimulatedKey() (Serial Monitor input)
-// is kept as a fallback, not removed — see getKey() — so the state machine
-// stays testable from a desk even without the physical keypad in hand, and
-// so a wiring mistake on one row/column doesn't block testing the rest.
+// read by getPhysicalKey() below. Typing into the Serial Monitor can stand in
+// for it in a bench-test build (-DENABLE_SERIAL_KEYPAD=1, see the top of the
+// file); the shipped build does not accept keys over USB.
 
 // The disarm PIN, changeable from the app at runtime.
 //
@@ -170,14 +309,15 @@ bool isDoorOpen = false;
 int lastDoorState = LOW;
 unsigned long delayStartTime = 0;
 
-const unsigned long ENTRY_TIME_LIMIT = 25000;   // 25 seconds total to disarm before ALARM
+const unsigned long ENTRY_TIME_LIMIT = 30000;   // 30 seconds total to disarm before ALARM (reported to the backend, which mirrors it in the app)
 const unsigned long SILENCE_BEFORE_BEEP = 2000; // 2 seconds of silence before warning beeps start
 const unsigned long REMOTE_ARM_DELAY = 3000;    // exit delay for app-initiated arming (no door needed)
 
 // --- Beep/Siren Variables ---
 unsigned long lastBeepTime = 0;
 bool isBuzzerCurrentlyOn = false;
-const int BEEP_ON_DURATION = 150;     // Beep stays on for 150ms
+int beepsInBurst = COUNTDOWN_BEEPS_PER_BURST;  // beeps of the current countdown burst so far
+unsigned long lastKeyMs = 0;                   // when a key was last pressed (any state)
 
 // --- Heartbeat ---
 unsigned long lastHeartbeat = 0;
@@ -212,13 +352,41 @@ QueueHandle_t reportQueue = nullptr;
 // Boot sequence: configure pins, force the buzzers quiet so they don't
 // chirp on power-up, read the door's initial state, then bring up WiFi
 // and the remote-control WebServer.
+// ---- WiFi watchdog ------------------------------------------------------
+// The core reconnects by itself, but after a long outage the radio can stay wedged.
+// Nudge it every 20 s while the link is down. `REBOOT_AFTER_MS` of silence reboots the
+// board (0 = never); see the call site for why the door board only does that when disarmed.
+unsigned long wifiDownSince = 0;
+unsigned long wifiLastNudge = 0;
+
+void wifiWatchdog(unsigned long rebootAfterMs) {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    return;
+  }
+  unsigned long now = millis();
+  if (wifiDownSince == 0) {
+    wifiDownSince = now;
+    wifiLastNudge = now;
+  }
+  if (now - wifiLastNudge >= 20000) {
+    wifiLastNudge = now;
+    WiFi.disconnect();
+    WiFi.reconnect();
+  }
+  if (rebootAfterMs > 0 && now - wifiDownSince >= rebootAfterMs) {
+    Serial.println("WiFi down for too long - restarting.");
+    Serial.flush();
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void setup() {
   Serial.begin(9600); // 9600 to ensure stable serial reading
 
   // Setup pins
   pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_1_PIN, OUTPUT);
-  pinMode(BUZZER_2_PIN, OUTPUT);
 
   // Keypad: rows idle HIGH (driven), columns read with internal pull-ups so
   // no external resistors are needed.
@@ -230,8 +398,8 @@ void setup() {
     pinMode(COL_PINS[c], INPUT_PULLUP);
   }
 
-  // Ensure buzzers are quiet on boot
-  silenceBuzzers();
+  // Buzzers: set up quiet, then the sound task takes them over
+  soundInit();
 
   loadKeypadPin();
 
@@ -244,6 +412,12 @@ void setup() {
                // as-is since this pass is documentation-only.
 
   // --- WiFi + remote-control server ---
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  // The SSID can be offered by several mesh nodes. Look at all channels and join the
+  // strongest one instead of the first one found.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -253,6 +427,7 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.print("My IP: ");
   Serial.println(WiFi.localIP());
+  WiFi.setSleep(false);  // power save off: no 100+ ms waits for every packet
 
   // WebServer discards every request header it wasn't explicitly told to
   // keep, so this line is load-bearing: without it server.header("X-Device-Key")
@@ -287,15 +462,175 @@ void setup() {
   Serial.println("====================================");
 }
 
-// Function to safely turn off the alarm hardware
-void silenceBuzzers() {
-  digitalWrite(BUZZER_1_PIN, LOW);
-  digitalWrite(BUZZER_2_PIN, LOW);
-  isBuzzerCurrentlyOn = false;
+// ---- Sound player --------------------------------------------------------
+//
+// loop() never writes the buzzer pins. It only asks: soundPlay() drops a
+// one-shot sound id on a queue, and two flags say what is held on (the siren
+// while the state is ALARM, an entry-delay beep while one is sounding). A
+// small task, at a higher priority than loop(), turns those into pin writes
+// every SOUND_TICK_MS. That means
+//  - no sound code ever waits: there is no delay() anywhere in it, so a
+//    keypress, a PIN or a /disarm is never held up by a sound;
+//  - clearing the flag silences the siren on the next tick (2 ms); and
+//  - if loop() stalls (server.handleClient() on a slow HTTP client), the siren
+//    keeps stepping instead of freezing on one tone.
+// The task owns everything below up to soundTask(); only the two flags above
+// and the queue are shared with loop().
+
+const SoundDef* voiceDef = nullptr;   // the one-shot currently playing, if any
+uint8_t voiceIdx = 0;
+uint32_t voiceStart = 0;
+bool sirenRunning = false;
+uint8_t sirenIdx = 0;
+uint32_t sirenStart = 0;
+
+void writeBuzzer(int pin, uint16_t hz) {
+#if BUZZERS_ACTIVE
+  digitalWrite(pin, hz ? HIGH : LOW);
+#else
+  ledcWriteTone(pin, hz);  // 0 = silent, else ~50% duty at that frequency
+#endif
 }
 
+// Touches a pin only when its value changes.
+void driveBuzzers(uint16_t hz1, uint16_t hz2) {
+  static uint16_t last1 = 0, last2 = 0;
+  if (hz1 != last1) { writeBuzzer(BUZZER_1_PIN, hz1); last1 = hz1; }
+  if (hz2 != last2) { writeBuzzer(BUZZER_2_PIN, hz2); last2 = hz2; }
+}
+
+// Decides what the buzzers do right now: siren > entry beep > one-shot, where
+// the entry beep only takes over the buzzer(s) it names.
+void soundTick(uint32_t now) {
+  // 1. New one-shot requests. They are dropped while the siren runs, and a
+  //    lower-priority one never interrupts a higher-priority one.
+  uint8_t id;
+  while (soundQueue != nullptr && xQueueReceive(soundQueue, &id, 0) == pdTRUE) {
+    if (sirenWanted || id >= SOUND_COUNT) continue;
+    const SoundDef* def = &SOUNDS[id];
+    if (voiceDef == nullptr || def->priority >= voiceDef->priority) {
+      voiceDef = def;
+      voiceIdx = 0;
+      voiceStart = now;
+    }
+  }
+
+  // 2. Step the one-shot along. It keeps its own time even while an entry beep
+  //    covers it, so it ends on schedule instead of resuming late.
+  while (voiceDef != nullptr && now - voiceStart >= voiceDef->steps[voiceIdx].ms) {
+    voiceStart += voiceDef->steps[voiceIdx].ms;
+    if (++voiceIdx >= voiceDef->count) voiceDef = nullptr;
+  }
+
+  // 3. Who gets the buzzers.
+  uint16_t hz1 = 0, hz2 = 0;
+  if (sirenWanted) {
+    voiceDef = nullptr;  // whatever was half-played is moot now
+    const uint8_t sirenCount = sizeof(SIREN_STEPS) / sizeof(SIREN_STEPS[0]);
+    if (!sirenRunning) {
+      sirenRunning = true;
+      sirenIdx = 0;
+      sirenStart = now;
+    }
+    while (now - sirenStart >= SIREN_STEPS[sirenIdx].ms) {
+      sirenStart += SIREN_STEPS[sirenIdx].ms;
+      sirenIdx = (sirenIdx + 1) % sirenCount;
+    }
+    hz1 = SIREN_STEPS[sirenIdx].hz1;
+    hz2 = SIREN_STEPS[sirenIdx].hz2;
+  } else {
+    sirenRunning = false;
+    if (voiceDef != nullptr) {
+      hz1 = voiceDef->steps[voiceIdx].hz1;
+      hz2 = voiceDef->steps[voiceIdx].hz2;
+    }
+    if (entryBeepHeld) {
+      if (ENTRY_BEEP_HZ1) hz1 = ENTRY_BEEP_HZ1;
+      if (ENTRY_BEEP_HZ2) hz2 = ENTRY_BEEP_HZ2;
+    }
+  }
+  driveBuzzers(hz1, hz2);
+}
+
+void soundTask(void* param) {
+  for (;;) {
+    soundTick(millis());
+    vTaskDelay(pdMS_TO_TICKS(SOUND_TICK_MS));
+  }
+}
+
+// Sets the buzzers up quiet and starts the sound task. Called once from setup().
+void soundInit() {
+#if BUZZERS_ACTIVE
+  pinMode(BUZZER_1_PIN, OUTPUT);
+  pinMode(BUZZER_2_PIN, OUTPUT);
+  digitalWrite(BUZZER_1_PIN, LOW);
+  digitalWrite(BUZZER_2_PIN, LOW);
+#else
+  // Two different attach frequencies on purpose: ledcAttach() puts pins with
+  // identical (frequency, resolution) on ONE LEDC timer, and a timer has a
+  // single frequency, so the buzzers could then never sound different pitches
+  // at once. Different arguments give each pin its own timer.
+  ledcAttach(BUZZER_1_PIN, 2000, 10);
+  ledcAttach(BUZZER_2_PIN, 2001, 10);
+  ledcWriteTone(BUZZER_1_PIN, 0);
+  ledcWriteTone(BUZZER_2_PIN, 0);
+#endif
+
+  soundQueue = xQueueCreate(SOUND_QUEUE_DEPTH, sizeof(uint8_t));
+  // Core 1 beside loop(), one priority above it: its work is a few
+  // microseconds every 2 ms, and it must be able to cut in on loop() at once.
+  soundTaskRunning = xTaskCreatePinnedToCore(soundTask, "hgSound", SOUND_STACK_BYTES,
+                                             nullptr, 2, nullptr, 1) == pdPASS;
+  if (!soundTaskRunning) {
+    // loop() then runs soundTick() itself, so the siren still sounds; it just
+    // shares loop()'s timing.
+    Serial.println("Could not start the sound task - sound runs from loop() instead.");
+  }
+}
+
+// Asks for a one-shot sound. Never blocks; a full queue drops the request.
+// Clicks and status sounds are not played while the siren runs.
+void soundPlay(SoundId id) {
+  if (soundQueue == nullptr || sirenWanted) return;
+  if (id != SND_CLICK) {
+    Serial.print("[SOUND] ");
+    Serial.println(SOUND_NAMES[id]);
+  }
+  uint8_t v = id;
+  xQueueSend(soundQueue, &v, 0);
+}
+
+// One entry-delay beep on or off (both buzzers). The accelerating schedule
+// that calls this is unchanged and still lives in the ENTRY_DELAY case.
+void entryBeep(bool on) {
+  entryBeepHeld = on;
+  isBuzzerCurrentlyOn = on;
+}
+
+// Every change of `currentState` goes through here, so the sounds that belong
+// to a transition play exactly once, whichever path caused it: the keypad,
+// the app's /arm and /disarm, the backend's /trigger-alarm, or a timeout.
+void setState(State next) {
+  State prev = currentState;
+  currentState = next;
+  if (next == prev) return;  // e.g. /disarm while already disarmed: no change, no sound
+
+  // The siren belongs to ALARM and nothing else. This comes before the status
+  // sounds below on purpose: soundPlay() drops everything while it is set.
+  sirenWanted = (next == ALARM);
+  if (next != ENTRY_DELAY) entryBeep(false);  // leaving the entry delay ends its beeps
+
+  if (next == ARMED) {
+    soundPlay(SND_ARMED);
+  } else if (next == DISARMED) {
+    soundPlay(SND_DISARMED);
+  }
+}
+
+#if ENABLE_SERIAL_KEYPAD
 // Reads one character typed into the Serial Monitor, standing in for the
-// physical keypad (see TODO above). Filters out '\n'/'\r' so pressing
+// physical keypad. Filters out '\n'/'\r' so pressing
 // Enter after typing a line doesn't get treated as a keypress, and
 // returns '\0' — a sentinel a real keystroke never produces — when
 // nothing new is waiting; callers just compare against digits/'*'/'#'
@@ -309,6 +644,7 @@ char getSimulatedKey() {
   }
   return '\0';
 }
+#endif
 
 // Scans the physical 3x4 matrix: drives one row LOW at a time (all others
 // idle HIGH) and checks which column reads LOW — that intersection is the
@@ -353,12 +689,16 @@ char getPhysicalKey() {
   return found;
 }
 
-// Tries the physical keypad first, falls back to Serial input — see the
-// comment above secretPin for why both stay live at once.
+// The physical keypad, plus Serial Monitor input only in a bench-test build
+// (ENABLE_SERIAL_KEYPAD, off by default — see its definition at the top).
 char getKey() {
   char physical = getPhysicalKey();
   if (physical != '\0') return physical;
+#if ENABLE_SERIAL_KEYPAD
   return getSimulatedKey();
+#else
+  return '\0';
+#endif
 }
 
 // ---- Backend reporting (new) ------------------------------------------
@@ -444,7 +784,11 @@ void sendEntryDelayNow() {
   beginRequest(http, backendUrl("/esp32/entry-delay"));
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_KEY);
-  http.POST("{\"seconds\":" + String(ENTRY_TIME_LIMIT / 1000) + "}");
+  // The seconds LEFT, not the full window: when WiFi is slow this report arrives late, and the
+  // app counted a full 30 s from then while the board's own 30 s was already running.
+  unsigned long used = millis() - delayStartTime;
+  unsigned long left = used < ENTRY_TIME_LIMIT ? ENTRY_TIME_LIMIT - used : 0;
+  http.POST("{\"seconds\":" + String((left + 999) / 1000) + "}");
   http.end();
 }
 
@@ -570,8 +914,8 @@ bool authorized() {
 // (see esp32_client.py send_arm). Note: isHomeMode below only affects
 // the Serial log — this board's state machine doesn't branch on Home vs
 // Away; that distinction is enforced entirely on the backend side
-// (state.py bypasses the vibration sensor's alerts in Home mode
-// regardless of what this board reports).
+// (state.py bypasses the distance and vibration sensors' alerts in Home
+// mode regardless of what this board reports).
 void handleRemoteArm() {
   if (!authorized()) return;
   String body = server.arg("plain");
@@ -580,11 +924,28 @@ void handleRemoteArm() {
   Serial.print(isHomeMode ? "Home" : "Away");
   Serial.println(" mode)");
 
+  // With the door open, arming would finish straight into ENTRY_DELAY (ARMED
+  // sees the open door), i.e. a countdown to the alarm the instant it is armed.
+  // The keypad refuses the same way ("Door must be closed first"). Answer 409
+  // so the backend does not arm its own state either and the app can say why.
+  if (currentState == DISARMED && isDoorOpen) {
+    Serial.println("[REMOTE] Arm refused: the door is open");
+    soundPlay(SND_REFUSED);
+    server.send(409, "text/plain", "Door open");
+    return;
+  }
+
   // Remote arming doesn't require physically walking out the door —
   // skip straight to a short countdown instead of PENDING_ARM/EXITING.
   if (currentState == DISARMED) {
-    currentState = REMOTE_ARMING;
-    delayStartTime = millis();
+    if (isHomeMode) {
+      // Home: somebody stays inside, nobody walks out, so no exit countdown.
+      setState(ARMED);
+      reportStateChange(true);
+    } else {
+      setState(REMOTE_ARMING);
+      delayStartTime = millis();
+    }
   }
   // Always responds 200 OK even when the request above was a no-op
   // (e.g. system was already ARMED) — caller currently can't tell
@@ -595,13 +956,12 @@ void handleRemoteArm() {
 // WebServer handler for POST /disarm. Unlike handleRemoteArm, this has
 // no state guard: disarming has to work from any state (including
 // mid-ALARM), so it unconditionally resets to DISARMED, clears any
-// partially-typed PIN, and cuts the buzzers.
+// partially-typed PIN, and (via setState) cuts the siren.
 void handleRemoteDisarm() {
   if (!authorized()) return;
   Serial.println("\n[REMOTE] Disarm requested via app");
-  currentState = DISARMED;
+  setState(DISARMED);
   enteredPin = "";
-  silenceBuzzers();
   // Answer first, then report. The backend's /disarm is blocked on this
   // response with a 3-second budget; reporting first chained a second
   // backend round trip inside that budget, so one WiFi retransmit made a
@@ -662,9 +1022,8 @@ void handleSetKeypadPin() {
 void handleRemoteTriggerAlarm() {
   if (!authorized()) return;
   Serial.println("\n[REMOTE] Alarm triggered remotely (another sensor reported a breach)");
-  currentState = ALARM;
+  setState(ALARM);
   enteredPin = "";
-  lastBeepTime = millis();
   server.send(200, "text/plain", "OK");
 }
 
@@ -672,6 +1031,12 @@ void handleRemoteTriggerAlarm() {
 // door sensor and the simulated keypad, advances the arm/disarm state
 // machine below, and sends a periodic heartbeat.
 void loop() {
+  // Only reboot over a long outage while DISARMED: a reboot forgets the armed state.
+  wifiWatchdog(currentState == DISARMED ? 300000UL : 0UL);
+
+  // Only if the sound task could not start (see soundInit()).
+  if (!soundTaskRunning) soundTick(millis());
+
   // Must be called every loop for the WebServer to actually respond to
   // incoming /arm and /disarm requests.
   server.handleClient();
@@ -694,6 +1059,15 @@ void loop() {
   // 2. Read a keypress — physical keypad first, Serial Monitor as fallback
   char input = getKey();
 
+  // Every key press clicks. (The Serial fallback can type any character; only
+  // the twelve real keys count.) soundPlay() keeps it quiet during the siren,
+  // and the entry-delay logic below pauses its beeps while keys are being
+  // pressed (lastKeyMs), so the click is never played over them.
+  if ((input >= '0' && input <= '9') || input == '*' || input == '#') {
+    lastKeyMs = millis();
+    soundPlay(SND_CLICK);
+  }
+
   // If a number is typed, hide it with an asterisk
   if (input >= '0' && input <= '9') {
     enteredPin += input;
@@ -707,10 +1081,11 @@ void loop() {
     case DISARMED:
       // You must have the door closed to start the arming process
       if (input == '*' && !isDoorOpen) {
-        currentState = PENDING_ARM;
+        setState(PENDING_ARM);
         Serial.println("\nSystem PENDING. Please open the door to exit.");
       } else if (input == '*' && isDoorOpen) {
         Serial.println("\nCannot arm: Door must be closed first.");
+        soundPlay(SND_REFUSED);
       }
       break;
 
@@ -718,11 +1093,11 @@ void loop() {
     case PENDING_ARM:
       // Waiting for you to open the door to leave
       if (isDoorOpen) {
-        currentState = EXITING;
+        setState(EXITING);
         Serial.println("\nDoor opened. Please exit and close the door to arm.");
       }
       if (input == '*') { // Cancel arming
-        currentState = DISARMED;
+        setState(DISARMED);
         Serial.println("\nArming cancelled. State: DISARMED");
       }
       break;
@@ -731,12 +1106,12 @@ void loop() {
     case EXITING:
       // Waiting for the physical act of closing the door behind you
       if (!isDoorOpen) {
-        currentState = ARMED;
+        setState(ARMED);
         Serial.println("\nDoor closed. System is now ARMED.");
         reportStateChange(true);
       }
       if (input == '*') { // Cancel arming
-        currentState = DISARMED;
+        setState(DISARMED);
         Serial.println("\nArming cancelled. State: DISARMED");
       }
       break;
@@ -747,12 +1122,12 @@ void loop() {
       // (mirrors the backend's own ARMING_EXIT_DELAY, so the app's
       // "Arming..." UI and the physical hardware agree on timing).
       if (millis() - delayStartTime >= REMOTE_ARM_DELAY) {
-        currentState = ARMED;
+        setState(ARMED);
         Serial.println("\nRemote arm countdown complete. System is now ARMED.");
         reportStateChange(true);
       }
       if (input == '*') { // Cancel arming
-        currentState = DISARMED;
+        setState(DISARMED);
         Serial.println("\nArming cancelled. State: DISARMED");
       }
       break;
@@ -761,15 +1136,17 @@ void loop() {
     case ARMED:
       // If the door opens, trigger the countdown
       if (isDoorOpen) {
-        currentState = ENTRY_DELAY;
+        setState(ENTRY_DELAY);
         delayStartTime = millis();
         lastBeepTime = millis();
         isBuzzerCurrentlyOn = false;
+        beepsInBurst = COUNTDOWN_BEEPS_PER_BURST;  // so the first burst follows a full pause
+        lastKeyMs = 0;  // keys typed before the door opened must not delay the beeps
         // Start the disarm window with an empty buffer. Digits accumulate in
         // every state, and none of DISARMED/PENDING_ARM/EXITING/REMOTE_ARMING/
         // ARMED handles '#', so anything typed or brushed against the keypad
         // earlier is still sitting in enteredPin. Without this reset, one
-        // stray digit turns a correctly-typed PIN into "51913" != "1913" and
+        // stray digit turns a correctly-typed PIN into "51234" != "1234" and
         // the siren goes off on a legitimate entry — recoverable only by
         // knowing to press '#' twice. The ENTRY_DELAY -> ALARM transition
         // already cleared it; this is the matching clear on the way in.
@@ -786,9 +1163,8 @@ void loop() {
 
         // 1. Check if they ran out of time
         if (elapsed >= ENTRY_TIME_LIMIT) {
-          currentState = ALARM;
+          setState(ALARM);
           enteredPin = "";
-          lastBeepTime = millis();
           Serial.println("\n*** ALARM TRIGGERED! SIRENS SOUNDING! ***");
           reportDoorAlert();
         }
@@ -797,45 +1173,59 @@ void loop() {
           if (input == '#') {
             Serial.println();
             if (enteredPin == secretPin) {
-              currentState = DISARMED;
+              setState(DISARMED);
               enteredPin = "";
-              silenceBuzzers();
               Serial.println("Correct PIN. System DISARMED.");
               reportStateChange(false);
               // Without this break, execution falls through to the
               // accelerating-beep logic below (still inside this case,
               // same loop() pass) — by then enough time has elapsed since
-              // lastBeepTime that it immediately turns the buzzers back
-              // on, undoing silenceBuzzers() above. Disarming is done;
-              // nothing after this point should run this iteration.
+              // lastBeepTime that it immediately turns the beep back on,
+              // undoing the silence setState() just applied. Disarming is
+              // done; nothing after this point should run this iteration.
               break;
             } else {
               enteredPin = "";
               Serial.println("Wrong PIN. Keep trying!");
+              soundPlay(SND_WRONG_PIN);
             }
           }
 
           // 3. Accelerating Beep Logic WITH SILENT DELAY
           if (elapsed < SILENCE_BEFORE_BEEP) {
             // Do nothing yet, keep it silent
-            silenceBuzzers();
+            entryBeep(false);
+          }
+          else if (millis() - lastKeyMs < TYPING_QUIET_MS) {
+            // Someone is typing: no countdown beeps (see TYPING_QUIET_MS). The
+            // burst counter is rewound so a fresh burst follows once they stop.
+            entryBeep(false);
+            beepsInBurst = COUNTDOWN_BEEPS_PER_BURST;
           }
           else {
             // The silent time has passed, start the warning beeps!
             // Map the remaining time (from when silence ends to the time limit)
-            int currentOffDuration = map(elapsed, SILENCE_BEFORE_BEEP, ENTRY_TIME_LIMIT, 1500, 60);
+            int currentOffDuration = map(elapsed, SILENCE_BEFORE_BEEP, ENTRY_TIME_LIMIT,
+                                         COUNTDOWN_PAUSE_START_MS, COUNTDOWN_PAUSE_END_MS);
+            // Between the beeps of one burst the gap is short; after a
+            // burst's last beep it is the long, shrinking pause above. (With
+            // one beep per burst that is always the long pause: the original
+            // accelerating beeps.)
+            if (beepsInBurst > 0 && beepsInBurst < COUNTDOWN_BEEPS_PER_BURST) {
+              currentOffDuration = COUNTDOWN_BURST_GAP_MS;
+            }
             unsigned long timeSinceLastChange = millis() - lastBeepTime;
 
             if (isBuzzerCurrentlyOn) {
               if (timeSinceLastChange >= BEEP_ON_DURATION) {
-                silenceBuzzers();
+                entryBeep(false);
                 lastBeepTime = millis();
               }
             } else {
               if (timeSinceLastChange >= currentOffDuration) {
-                digitalWrite(BUZZER_1_PIN, HIGH);
-                digitalWrite(BUZZER_2_PIN, HIGH);
-                isBuzzerCurrentlyOn = true;
+                if (beepsInBurst >= COUNTDOWN_BEEPS_PER_BURST) beepsInBurst = 0;  // new burst
+                beepsInBurst++;
+                entryBeep(true);
                 lastBeepTime = millis();
               }
             }
@@ -847,27 +1237,21 @@ void loop() {
     // -----------------------------------------
     case ALARM:
       {
-        // 1. Continuous Alternating Siren Effect
-        unsigned long timeSinceLastSirenChange = millis() - lastBeepTime;
-        if (timeSinceLastSirenChange > 100) { // Toggle every 100ms for a harsh alarm sound
-          isBuzzerCurrentlyOn = !isBuzzerCurrentlyOn;
-          digitalWrite(BUZZER_1_PIN, isBuzzerCurrentlyOn ? HIGH : LOW);
-          digitalWrite(BUZZER_2_PIN, isBuzzerCurrentlyOn ? LOW : HIGH);
-          lastBeepTime = millis();
-        }
+        // The siren itself plays from the sound task for as long as the state
+        // is ALARM (see setState()); nothing to do for it here.
 
-        // 2. The only way to stop the alarm is entering the correct PIN
+        // The only way to stop the alarm is entering the correct PIN
         if (input == '#') {
           Serial.println();
           if (enteredPin == secretPin) {
-            currentState = DISARMED;
+            setState(DISARMED);
             enteredPin = "";
-            silenceBuzzers();
             Serial.println("Correct PIN. ALARM SILENCED. System DISARMED.");
             reportStateChange(false);
           } else {
             enteredPin = "";
             Serial.println("Wrong PIN! ALARM STILL SOUNDING!");
+            soundPlay(SND_WRONG_PIN);  // muted while the siren runs
           }
         }
       }

@@ -66,12 +66,12 @@ async def test_arm_is_ignored_unless_disarmed(state):
     assert state.alarm_state == AlarmState.triggered
 
 
-async def test_home_mode_bypasses_vibration_only(state):
+async def test_home_mode_bypasses_both_perimeter_sensors(state):
     await arm_now(state, ArmMode.home)
     by_type = {s.type: s for s in state.sensors}
     assert by_type[SensorType.vibration].bypassed is True
+    assert by_type[SensorType.ultrasonic].bypassed is True
     assert by_type[SensorType.door].bypassed is False
-    assert by_type[SensorType.ultrasonic].bypassed is False
 
 
 async def test_away_mode_bypasses_nothing(state):
@@ -79,13 +79,21 @@ async def test_away_mode_bypasses_nothing(state):
     assert all(not s.bypassed for s in state.sensors)
 
 
-async def test_bypassed_sensor_does_not_escalate(state):
-    """The Home-mode promise: the vibration board keeps physically firing
-    (it has no idea the system is in Home mode), and the backend is what
-    decides to ignore it."""
+@pytest.mark.parametrize("sensor", [SensorType.vibration, SensorType.ultrasonic])
+async def test_bypassed_sensor_does_not_escalate(state, sensor):
+    """The Home-mode promise: the sensor board keeps physically firing (it has
+    no idea the system is in Home mode), and the backend is what decides to
+    ignore it."""
     await arm_now(state, ArmMode.home)
-    await state.trigger_alert(SensorType.vibration, "someone walking around inside")
+    await state.trigger_alert(sensor, "someone walking around inside")
     assert state.alarm_state == AlarmState.armed
+
+
+@pytest.mark.parametrize("sensor", [SensorType.vibration, SensorType.ultrasonic])
+async def test_away_mode_escalates_on_every_board_sensor(state, sensor):
+    await arm_now(state, ArmMode.away)
+    await state.trigger_alert(sensor, "intrusion")
+    assert state.alarm_state == AlarmState.triggered
 
 
 async def test_non_bypassed_sensor_escalates(state):
@@ -108,18 +116,20 @@ async def test_alerts_are_ignored_when_not_armed(state, initial):
 async def test_controller_report_reapplies_home_bypass(state):
     """The bug this closes: the door controller reports only armed/disarmed,
     never the mode. When its report was what put the system into `armed`
-    (rather than our own exit-delay timer), Home mode's vibration bypass was
+    (rather than our own exit-delay timer), Home mode's sensor bypass was
     silently lost — so a Home-armed system would alarm on someone walking
-    past the vibration sensor indoors.
+    past the distance or vibration sensor indoors.
     """
     await state.arm(ArmMode.home)  # records the mode, still transitional
     await state.report_state_from_esp32(armed=True)
 
     assert state.alarm_state == AlarmState.armed
-    vibration = next(s for s in state.sensors if s.type == SensorType.vibration)
-    assert vibration.bypassed is True, "Home mode's bypass was lost on the controller's report"
+    for sensor in (SensorType.vibration, SensorType.ultrasonic):
+        reading = next(s for s in state.sensors if s.type == sensor)
+        assert reading.bypassed is True, "Home mode's bypass was lost on the controller's report"
 
     await state.trigger_alert(SensorType.vibration, "movement inside")
+    await state.trigger_alert(SensorType.ultrasonic, "walking past the sensor")
     assert state.alarm_state == AlarmState.armed
 
 
@@ -399,3 +409,71 @@ async def test_a_siren_command_that_lands_is_not_repeated(state, monkeypatch):
 
     assert await esp32_client.send_trigger_alarm() is True
     assert len(attempts) == 1
+
+
+# ---- Arming with the door open -------------------------------------------------
+
+
+class _FakeBoard:
+    """Stands in for the door controller's HTTP client."""
+
+    def __init__(self, status: int | None):
+        self.status = status  # None = unreachable
+        self.calls: list[str] = []
+
+    async def post(self, url, json=None, headers=None):
+        import httpx
+
+        self.calls.append(url)
+        if self.status is None:
+            raise httpx.ConnectError("no route to host")
+        return httpx.Response(self.status, request=httpx.Request("POST", url))
+
+
+async def test_arming_is_refused_when_the_door_is_open(auth_client, state, monkeypatch):
+    from backend import esp32_client
+
+    board = _FakeBoard(409)
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", board)
+
+    reply = await auth_client.post("/arm", json={"mode": "away"})
+
+    assert reply.status_code == 409
+    assert "door is open" in reply.json()["detail"]
+    assert state.alarm_state == AlarmState.disarmed  # nothing was armed
+
+
+async def test_arming_goes_ahead_when_the_board_accepts(auth_client, state, monkeypatch):
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", _FakeBoard(200))
+
+    body = (await auth_client.post("/arm", json={"mode": "away"})).json()
+
+    assert body == {"ok": True, "hardware": True}
+    assert state.alarm_state == AlarmState.transitional
+
+
+async def test_arming_still_happens_locally_when_the_board_does_not_answer(
+    auth_client, state, monkeypatch
+):
+    from backend import esp32_client
+
+    monkeypatch.setattr(esp32_client, "DOOR_CONTROLLER_URL", "http://door.test")
+    monkeypatch.setattr(esp32_client, "_client", _FakeBoard(None))
+
+    body = (await auth_client.post("/arm", json={"mode": "away"})).json()
+
+    assert body == {"ok": True, "hardware": False}
+    assert state.alarm_state == AlarmState.transitional
+
+
+async def test_home_mode_arms_at_once_with_no_exit_delay(state):
+    """Home means someone stays inside, so nobody walks out: no transitional."""
+    await state.arm(ArmMode.home)
+    assert state.alarm_state == AlarmState.armed
+    assert state._arming_task is None
+    by_type = {s.type: s for s in state.sensors}
+    assert by_type[SensorType.ultrasonic].bypassed and by_type[SensorType.vibration].bypassed

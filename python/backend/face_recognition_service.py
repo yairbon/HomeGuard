@@ -7,7 +7,7 @@ the recognition quality cost zero new dependencies and, critically, zero
 native build steps. The obvious "better" alternatives all fail that test —
 `face_recognition` wraps dlib, and `insightface` ships a Cython extension;
 both require a working MSVC/CMake toolchain on Windows, which is precisely
-the class of problem this project has already lost days to (see CLAUDE.md).
+the class of problem this project has already lost days to.
 
 What changed and why
 --------------------

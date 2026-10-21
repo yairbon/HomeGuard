@@ -41,8 +41,8 @@ class FacesScreen extends StatelessWidget {
             child: Text(
               'Adding a face captures the current camera frame as its '
               'reference photo, so point the camera at the person first. '
-              "A face that isn't listed triggers an alert while the system "
-              'is armed.',
+              'An approved face can disarm the system when "Disarm with '
+              'Face ID" is switched on in the Camera screen.',
               style: TextStyle(color: AppColors.textMuted, fontSize: 13),
             ),
           ),

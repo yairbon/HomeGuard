@@ -166,6 +166,91 @@ const unsigned long HEARTBEAT_INTERVAL = 10000;
 // הוא בדיוק המקרה שצריך להגיע לבקנד, ובלי רשת setFault היה יכול רק
 // להדפיס ל-Serial — שאף אחד לא קורא ב-02:00. ההמתנה ל-WiFi גם משמשת
 // כזמן ההתייצבות של החיישן אחרי power-up, הרבה מעבר ל-200ms שהיו כאן.
+// Plot mode (see checkPlotToggle): while on, ONLY dist:..,base:..,thr:.. lines are printed after startup.
+bool plotMode = true;  // on by default; 'p' toggles
+
+// ---- Backend address on an iPhone hotspot -----------------------------------
+// At home the backend is BACKEND_HOST from secrets.h, as always. On an iPhone hotspot (this board's
+// own address is inside 172.20.10.0/28) the laptop's address is not fixed, so a background task probes
+// 172.20.10.2 to .14 with GET /health (no key needed) and the first answer wins. It runs on its own
+// task, so the 15 Hz sensor loop never waits for it, and it runs again after 3 failed posts in a row.
+char hostBufs[2][16];
+volatile int hostIdx = 0;
+volatile int failedPosts = 0;
+volatile bool probeRequested = false;
+
+bool onIphoneHotspot() {
+  IPAddress ip = WiFi.localIP();
+  return ip[0] == 172 && ip[1] == 20 && ip[2] == 10 && ip[3] < 16;
+}
+
+void noteBackendResult(int code) {
+  if (code > 0) {
+    failedPosts = 0;
+  } else if (++failedPosts >= 3 && onIphoneHotspot()) {
+    probeRequested = true;
+  }
+}
+
+void probeTask(void*) {
+  for (;;) {
+    if (probeRequested && WiFi.status() == WL_CONNECTED && onIphoneHotspot()) {
+      int self = WiFi.localIP()[3];
+      for (int last = 2; last <= 14; last++) {
+        if (last == self) continue;
+        char ip[16];
+        snprintf(ip, sizeof(ip), "172.20.10.%d", last);
+        HTTPClient http;
+        http.setConnectTimeout(400);
+        http.setTimeout(400);
+        http.begin(String("http://") + ip + ":" + String(backendPort) + "/health");
+        int code = http.GET();
+        http.end();
+        if (code == 200) {
+          int next = 1 - hostIdx;
+          strcpy(hostBufs[next], ip);
+          hostIdx = next;
+          failedPosts = 0;
+          if (!plotMode) Serial.printf("Backend found at %s\n", ip);
+          break;
+        }
+      }
+      probeRequested = false;  // one sweep per request
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ---- WiFi watchdog ------------------------------------------------------
+// The core reconnects by itself, but after a long outage the radio can stay wedged.
+// Nudge it every 20 s while the link is down. `REBOOT_AFTER_MS` of silence reboots the
+// board (0 = never); see the call site for why the door board only does that when disarmed.
+unsigned long wifiDownSince = 0;
+unsigned long wifiLastNudge = 0;
+
+void wifiWatchdog(unsigned long rebootAfterMs) {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    return;
+  }
+  unsigned long now = millis();
+  if (wifiDownSince == 0) {
+    wifiDownSince = now;
+    wifiLastNudge = now;
+  }
+  if (now - wifiLastNudge >= 20000) {
+    wifiLastNudge = now;
+    WiFi.disconnect();
+    WiFi.reconnect();
+  }
+  if (rebootAfterMs > 0 && now - wifiDownSince >= rebootAfterMs) {
+    if (!plotMode) Serial.println("WiFi down for too long - restarting.");
+    if (!plotMode) Serial.flush();
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(trigPin, OUTPUT);
@@ -179,15 +264,26 @@ void setup() {
   lastForceReportTime = millis() - FORCE_REPORT_COOLDOWN;
 
   // התחברות ל-WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  // The SSID can be offered by several mesh nodes. Look at all channels and join the
+  // strongest one instead of the first one found.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
+  if (!plotMode) Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    if (!plotMode) Serial.print(".");
   }
-  Serial.println("\nWiFi connected!");
-  Serial.print("My IP: ");
-  Serial.println(WiFi.localIP());
+  if (!plotMode) Serial.println("\nWiFi connected!");
+  if (!plotMode) Serial.print("My IP: ");
+  if (!plotMode) Serial.println(WiFi.localIP());
+  WiFi.setSleep(false);  // power save off: ping was 111 ms median with it on
+  strncpy(hostBufs[0], backendHost, 15);
+  hostBufs[0][15] = 0;
+  xTaskCreate(probeTask, "probe", 4096, NULL, 1, NULL);
+  if (onIphoneHotspot()) probeRequested = true;
 
   // מאפשר דיווח ראשון מיד: lastAlertTime=0 היה אומר ש-millis()-0 קטן
   // מ-ALERT_COOLDOWN בכל חמש השניות הראשונות אחרי אתחול, כלומר חלון
@@ -228,7 +324,7 @@ float getDistance() {
 // שונה מעט מהתכנון (למשל 150 ס"מ מקיר, לא 200), הסף מתאים את עצמו
 // אוטומטית — פשוט נותנים ל-reset אחד לקרות אחרי שהחיישן כבר במקומו.
 void calibrateBaseline() {
-  Serial.println("Calibrating baseline distance...");
+  if (!plotMode) Serial.println("Calibrating baseline distance...");
   float sum = 0;
   int collected = 0;
   int attempts = 0;
@@ -240,7 +336,7 @@ void calibrateBaseline() {
     if (d > 0) {
       collected++;
       sum += d;
-      Serial.printf("  sample %d/%d: %.1f cm\n", collected, CALIBRATION_SAMPLES, d);
+      if (!plotMode) Serial.printf("  sample %d/%d: %.1f cm\n", collected, CALIBRATION_SAMPLES, d);
     }
     delay(60); // מרווח קצר בין דגימות, שהד קודם ידעך לפני הבאה
   }
@@ -250,7 +346,7 @@ void calibrateBaseline() {
     // האפקטיבי שלו) - נשארים עם הבסיס הקודם/ברירת המחדל במקום 0, שהיה
     // גורם לכל קריאה עתידית להיחשב חריגה (0 < DEFAULT_DISTANCE - TOLERANCE
     // תמיד אמת). זו תקלה אמיתית, לא הערת Serial: בלי דיווח הלוח נראה בריא.
-    Serial.printf("WARNING: calibration got no valid reading — keeping %.1f cm.\n", DEFAULT_DISTANCE);
+    if (!plotMode) Serial.printf("WARNING: calibration got no valid reading — keeping %.1f cm.\n", DEFAULT_DISTANCE);
     setFault(FAULT_BASELINE);
     return;
   }
@@ -260,7 +356,7 @@ void calibrateBaseline() {
   if (!isPlausibleBaseline(measured)) {
     // הערך נמדד, הוא פשוט לא יכול להיות התקנה אמיתית (ראה BASELINE_MIN_CM).
     // נופלים חזרה למה שכבר ידוע — הבסיס השמור, או ברירת המחדל — ומדווחים.
-    Serial.printf("WARNING: measured baseline %.1f cm is outside %.0f-%.0f cm — rejected, keeping %.1f cm.\n",
+    if (!plotMode) Serial.printf("WARNING: measured baseline %.1f cm is outside %.0f-%.0f cm — rejected, keeping %.1f cm.\n",
                   measured, BASELINE_MIN_CM, BASELINE_MAX_CM, DEFAULT_DISTANCE);
     setFault(FAULT_BASELINE);
     return;
@@ -270,14 +366,14 @@ void calibrateBaseline() {
   // ראה BASELINE_DRIFT_CM) ומאמצים אותו, כדי שהאתחול הבא כבר ישווה
   // למציאות הנוכחית ולא ידווח על אותה קפיצה שוב ושוב.
   if (haveStoredBaseline && fabs(measured - DEFAULT_DISTANCE) > BASELINE_DRIFT_CM) {
-    Serial.printf("WARNING: baseline moved %.1f cm -> %.1f cm since the last boot.\n",
+    if (!plotMode) Serial.printf("WARNING: baseline moved %.1f cm -> %.1f cm since the last boot.\n",
                   DEFAULT_DISTANCE, measured);
     setFault(FAULT_BASELINE_MOVED);
   }
 
   DEFAULT_DISTANCE = measured;
   storeBaseline(measured);
-  Serial.printf("Baseline calibrated: %.1f cm (from %d readings)\n", DEFAULT_DISTANCE, collected);
+  if (!plotMode) Serial.printf("Baseline calibrated: %.1f cm (from %d readings)\n", DEFAULT_DISTANCE, collected);
 }
 
 // האם הערך נראה כמו בסיס של התקנה אמיתית (ראה BASELINE_MIN_CM/MAX_CM).
@@ -297,9 +393,9 @@ void loadStoredBaseline() {
   if (isPlausibleBaseline(stored)) {
     DEFAULT_DISTANCE = stored;
     haveStoredBaseline = true;
-    Serial.printf("Previous baseline from NVS: %.1f cm\n", stored);
+    if (!plotMode) Serial.printf("Previous baseline from NVS: %.1f cm\n", stored);
   } else {
-    Serial.printf("No usable baseline in NVS — falling back on %.1f cm.\n", DEFAULT_DISTANCE);
+    if (!plotMode) Serial.printf("No usable baseline in NVS — falling back on %.1f cm.\n", DEFAULT_DISTANCE);
   }
 }
 
@@ -315,7 +411,7 @@ void storeBaseline(float cm) {
 
 // בסיס ה-URL של הבקנד, מורכב פעם אחת במקום בכל קריאה.
 String backendUrl(const char* path) {
-  return "http://" + String(backendHost) + ":" + String(backendPort) + String(path);
+  return "http://" + String(hostBufs[hostIdx]) + ":" + String(backendPort) + String(path);
 }
 
 // פותח בקשה יוצאת עם ה-timeout-ים מוגדרים. כל קריאה יוצאת בקובץ הזה
@@ -340,7 +436,7 @@ void beginRequest(HTTPClient& http, const String& url) {
 // אותו גוף בקשה, שונים רק באיזה sensor= הם מדווחים.
 void sendAlert(const char* sensor, const char* reason) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Cannot send alert — WiFi disconnected");
+    if (!plotMode) Serial.println("Cannot send alert — WiFi disconnected");
     return;
   }
 
@@ -350,13 +446,14 @@ void sendAlert(const char* sensor, const char* reason) {
   beginRequest(http, url);
   http.addHeader("X-Device-Key", DEVICE_KEY);
   int httpResponseCode = http.POST("");  // גוף ריק — כל המידע ב-query string
+  noteBackendResult(httpResponseCode);
 
   if (httpResponseCode == 401) {
-    Serial.println("Alert REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
+    if (!plotMode) Serial.println("Alert REJECTED (401) — DEVICE_KEY in secrets.h doesn't match the backend's.");
   } else if (httpResponseCode > 0) {
-    Serial.printf("Alert sent successfully. Server responded: %d\n", httpResponseCode);
+    if (!plotMode) Serial.printf("Alert sent successfully. Server responded: %d\n", httpResponseCode);
   } else {
-    Serial.printf("Error sending alert: %s\n", http.errorToString(httpResponseCode).c_str());
+    if (!plotMode) Serial.printf("Error sending alert: %s\n", http.errorToString(httpResponseCode).c_str());
   }
   http.end();
 }
@@ -376,7 +473,7 @@ void sendHeartbeat() {
   HTTPClient http;
   beginRequest(http, url);
   http.addHeader("X-Device-Key", DEVICE_KEY);
-  http.POST("");
+  noteBackendResult(http.POST(""));
   http.end();
 }
 
@@ -386,14 +483,14 @@ void sendHeartbeat() {
 void setFault(const char* code) {
   if (activeFault == code) return; // כבר נעול על אותה תקלה
   activeFault = code;
-  Serial.printf("FAULT reported to backend: %s\n", code);
+  if (!plotMode) Serial.printf("FAULT reported to backend: %s\n", code);
   sendHeartbeat();
 }
 
 // מנקה את התקלה ומדווח מיד, כדי שהבקנד לא ימשיך לראות תקלה שנפתרה.
 void clearFault() {
   if (activeFault == nullptr) return;
-  Serial.printf("FAULT cleared: %s\n", activeFault);
+  if (!plotMode) Serial.printf("FAULT cleared: %s\n", activeFault);
   activeFault = nullptr;
   sendHeartbeat();
 }
@@ -401,8 +498,29 @@ void clearFault() {
 // לולאת הריצה: דוגמת את החיישן, סופרת חריגות רצופות, מדווחת פריצה
 // כשמצטברות מספיק חריגות ברצף, ומדווחת heartbeat תקופתי — הכל בלי
 // delay ארוך שיפגע בקצב הדגימה.
+// ---- Plot mode (runtime toggle) -------------------------------------------
+// While on (the default), EVERY reading is printed as one line in the label format the Arduino
+// Serial Plotter draws: dist:<cm>,base:<cm>,thr:<cm>. Send the character 'p' over serial to switch
+// it off or on again.
+
+void checkPlotToggle() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == 'p' || c == 'P') {
+      plotMode = !plotMode;
+      if (!plotMode) Serial.println("PLOT MODE OFF");
+    }
+  }
+}
+
 void loop() {
+  wifiWatchdog(300000UL);  // a reboot only recalibrates; 5 min of silence is long enough
+  checkPlotToggle();
   float currentDistance = getDistance();
+  if (plotMode) {
+    // getDistance() returns 0 for "no echo": printed as it is, so the plot shows the holes
+    Serial.printf("dist:%.1f,base:%.1f,thr:%.1f\n", currentDistance, DEFAULT_DISTANCE, DEFAULT_DISTANCE - TOLERANCE);
+  }
 
   // אנחנו בודקים רק קריאות חוקיות (מעל 0)
   if (currentDistance > 0) {
@@ -413,7 +531,7 @@ void loop() {
     // אם המרחק קטן משמעותית מהמרחק לקיר ממול — כנראה שמישהו/משהו חוסם
     if (currentDistance < (DEFAULT_DISTANCE - TOLERANCE)) {
       consecutiveBreaches++; // מעלים את המונה
-      Serial.printf("Anomaly detected! Distance: %.1f cm (Count: %d)\n", currentDistance, consecutiveBreaches);
+      if (!plotMode) Serial.printf("Anomaly detected! Distance: %.1f cm (Count: %d)\n", currentDistance, consecutiveBreaches);
 
       // אם הגענו לרצף הנדרש - זו חדירה אמיתית ולא רעש אקראי
       if (consecutiveBreaches >= REQUIRED_BREACHES) {
@@ -423,7 +541,7 @@ void loop() {
         // שממשיכה בזמן הקירור נספרת מחדש ומדווחת מיד כשהחלון נסגר,
         // במקום להתחיל להימדד רק אחרי 5 שניות של עיוורון.
         if (millis() - lastAlertTime >= ALERT_COOLDOWN) {
-          Serial.println("ALARM! Confirmed intrusion.");
+          if (!plotMode) Serial.println("ALARM! Confirmed intrusion.");
           sendAlert("ultrasonic", "Ultrasonic%20sensor%20breached");
           lastAlertTime = millis();
         }
@@ -439,7 +557,7 @@ void loop() {
     // דיווח בכל דגימה כל עוד המצב נמשך.
     consecutiveZeroReadings++;
     if (consecutiveZeroReadings == ZERO_READINGS_FAULT) {
-      Serial.printf("WARNING: %d consecutive empty readings (~%lus) — sensor looks dead.\n",
+      if (!plotMode) Serial.printf("WARNING: %d consecutive empty readings (~%lus) — sensor looks dead.\n",
                     consecutiveZeroReadings, ZERO_FAULT_MS / 1000);
       setFault(FAULT_NO_ECHO);
     }
@@ -450,7 +568,7 @@ void loop() {
   // שמגיע תוך כדי הדיווח.
   if (forceLatched) {
     forceLatched = false;
-    Serial.println("Force sensor triggered! (window)");
+    if (!plotMode) Serial.println("Force sensor triggered! (window)");
 
     if (millis() - lastForceReportTime >= FORCE_REPORT_COOLDOWN) {
       sendAlert("vibration", "Force%20sensor%20breached%20(window)");

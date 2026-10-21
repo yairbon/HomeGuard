@@ -4,8 +4,9 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 /// Local (on-device) notifications for security alerts. This is NOT remote
 /// push — it only fires while the app process is alive (foreground or
 /// backgrounded), not when fully closed. Notifications that have to arrive
-/// with the app closed come from the backend over ntfy instead; Firebase
-/// Cloud Messaging was rejected (see CLAUDE.md).
+/// with the app closed come from the backend by email instead; Firebase
+/// Cloud Messaging was rejected (it needs a Firebase project and a
+/// google-services.json).
 class NotificationService {
   static final _plugin = FlutterLocalNotificationsPlugin();
   static bool _initialized = false;

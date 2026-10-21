@@ -326,8 +326,9 @@ async def test_night_mode_arms_at_the_configured_hour(state):
     await state.set_night_mode(True)
     await state._night_mode_tick(datetime(2026, 8, 7, 23, 0))
 
-    # arm() starts the exit delay rather than jumping straight to armed.
-    assert state.alarm_state == AlarmState.transitional
+    # Night mode arms Home, and Home has no exit delay: armed at once.
+    assert state.alarm_state == AlarmState.armed
+    assert all(s.bypassed for s in state.sensors if s.type != SensorType.door)
     assert any("Night mode — arming automatically" in e.message for e in state.events)
 
 
@@ -398,7 +399,7 @@ async def test_night_mode_uses_the_configured_hours(state):
     assert state.alarm_state == AlarmState.disarmed  # no longer the arm hour
 
     await state._night_mode_tick(datetime(2026, 8, 8, 1, 0))
-    assert state.alarm_state == AlarmState.transitional
+    assert state.alarm_state == AlarmState.armed  # Home arms at once
 
 
 # ---- Escalation ------------------------------------------------------------
@@ -419,11 +420,11 @@ def sent(monkeypatch):
 
 
 async def test_escalation_fires_if_the_alarm_is_not_cleared(state, sent, monkeypatch):
-    """`emergency_number` and `police_call_delay_seconds` previously drove
-    nothing at all — stored settings with no code behind them, while the UI
-    said the number would be auto-called."""
+    """`police_call_delay_seconds` is how long an alarm may stay uncleared
+    before the follow-up goes out. Nothing dials a phone: the follow-up is a
+    notification (here over ntfy), and the stored phone number it used to
+    quote is no longer part of the message."""
     await state.set_ntfy("https://ntfy.example", "topic")
-    await state.set_emergency_number("100")
     await state.set_police_call_delay(0)  # fire immediately
 
     await arm_now(state, ArmMode.away)
@@ -435,7 +436,8 @@ async def test_escalation_fires_if_the_alarm_is_not_cleared(state, sent, monkeyp
 
     escalations = [c for c in sent if "NOT CLEARED" in c["title"]]
     assert len(escalations) == 1
-    assert "Call 100" in escalations[0]["message"]
+    assert "Nobody has cleared it" in escalations[0]["message"]
+    assert "Call" not in escalations[0]["message"]
     assert escalations[0]["priority"] == "urgent"
 
 

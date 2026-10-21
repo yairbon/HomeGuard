@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Persists the user-editable backend URL (see [SettingsScreen]'s
@@ -17,10 +18,22 @@ class BackendConfig {
   /// device (see the historical note in `main.dart`).
   static const defaultUrl = 'http://localhost:8000';
 
-  /// Reads the saved backend URL, or [defaultUrl] if none was ever saved.
+  /// True for the web build the backend itself serves
+  /// (`flutter build web --dart-define=HOMEGUARD_SAME_ORIGIN=true`, see
+  /// `scripts/build-web.ps1`). The page and the API then share one origin, so
+  /// the right backend address is simply the address the page was loaded from
+  /// — which is what makes the same build work from the laptop, a phone on
+  /// the WiFi, or a Tailscale address without anyone typing a URL.
+  static const _sameOrigin = bool.fromEnvironment('HOMEGUARD_SAME_ORIGIN');
+
+  /// Reads the saved backend URL; failing that, the page's own origin for the
+  /// backend-served web build; failing that, [defaultUrl].
   static Future<String> load() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_prefsKey) ?? defaultUrl;
+    final saved = prefs.getString(_prefsKey);
+    if (saved != null) return saved;
+    if (kIsWeb && _sameOrigin) return Uri.base.origin;
+    return defaultUrl;
   }
 
   /// Persists [url] as the backend URL for future launches. Doesn't affect

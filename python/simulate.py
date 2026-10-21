@@ -255,6 +255,8 @@ time.sleep(3.5)
 state = c.get("/state").json()
 vib = next(s for s in state["sensors"] if s["type"] == "vibration")
 check("vibration sensor is bypassed in Home mode", vib["bypassed"] is True, vib)
+dist = next(s for s in state["sensors"] if s["type"] == "ultrasonic")
+check("distance sensor is bypassed in Home mode", dist["bypassed"] is True, dist)
 
 r = c.post(
     "/trigger-alert", json={"source": "vibration", "reason": "test vibration while bypassed"}
@@ -262,6 +264,16 @@ r = c.post(
 state = c.get("/state").json()
 check(
     "bypassed vibration sensor does NOT escalate to alarm",
+    state["alarm_state"] == "armed",
+    f"expected still 'armed', got {state['alarm_state']}",
+)
+
+r = c.post(
+    "/trigger-alert", json={"source": "ultrasonic", "reason": "test distance while bypassed"}
+)
+state = c.get("/state").json()
+check(
+    "bypassed distance sensor does NOT escalate to alarm",
     state["alarm_state"] == "armed",
     f"expected still 'armed', got {state['alarm_state']}",
 )
@@ -316,7 +328,7 @@ for sensor in ["ultrasonic", "door", "vibration"]:
 section("Faces CRUD")
 r = c.get("/faces")
 initial_count = len(r.json())
-check("GET /faces returns seeded faces", initial_count >= 2)
+check("a fresh install has no approved faces", initial_count == 0, initial_count)
 
 r = c.post("/faces", json={"name": "Simulation Test Person"})
 new_face = r.json()
@@ -380,10 +392,9 @@ r = c.post(
 check("faceless training photo returns 422", r.status_code == 422, r.status_code)
 c.delete(f"/faces/{face_for_upload['id']}")
 
+# The old demo endpoint that faked a recognition (and a log entry) is gone.
 r = c.post("/debug/simulate-face-recognition")
-check("debug simulate-face-recognition works", r.json()["ok"] is True, r.json())
-state = c.get("/state").json()
-check("simulated recognition logged as faceId event", state["events"][0]["category"] == "faceId")
+check("the demo recognition endpoint no longer exists", r.status_code in (404, 405), r.status_code)
 
 # ---- Settings ----------------------------------------------------------------
 section("Settings")
@@ -431,30 +442,14 @@ section("Face ID disarm (opt-in)")
 state = c.get("/state").json()
 check("face disarm is off by default", state["face_disarm_enabled"] is False)
 
-c.post("/arm", json={"mode": "away"})
-time.sleep(3.5)
-c.post("/debug/simulate-face-recognition")
-state = c.get("/state").json()
-check(
-    "a recognized face does NOT disarm while the setting is off",
-    state["alarm_state"] == "armed",
-    state["alarm_state"],
-)
-
+# The old demo endpoint that faked a recognition is gone, and a live check of
+# "a recognized face disarms" would need a real enrolled face in front of the
+# camera. That decision (face disarm on/off x live/not live x armed/not armed,
+# attribution in the log) is covered in-process by tests/test_face_disarm_and_schedule.py.
 r = c.post("/face-disarm-enabled", json={"enabled": True})
 check("face disarm can be enabled", r.json()["ok"] is True)
-c.post("/debug/simulate-face-recognition")
 state = c.get("/state").json()
-check(
-    "a recognized face DOES disarm once enabled",
-    state["alarm_state"] == "disarmed",
-    state["alarm_state"],
-)
-check(
-    "the disarm is attributed in the log",
-    any("Disarmed by Face ID" in e["message"] for e in state["events"][:5]),
-    state["events"][:3],
-)
+check("face disarm shows as enabled in /state", state["face_disarm_enabled"] is True)
 c.post("/face-disarm-enabled", json={"enabled": False})
 
 # ---- Notifications / night mode --------------------------------------------------
@@ -467,11 +462,11 @@ check(
     "the topic is not leaked into the event log",
     all("sim-topic" not in e["message"] for e in state["events"]),
 )
-r = c.post("/settings/ntfy/test")
-check("test notification reports configured", r.json()["ok"] is True)
+r = c.post("/settings/alerts/test")
+check("test alert reports configured", r.json()["ok"] is True, r.json())
 c.post("/settings/ntfy", json={"server": "https://ntfy.sh", "topic": ""})
-r = c.post("/settings/ntfy/test")
-check("test notification reports not-configured when off", r.json()["ok"] is False)
+r = c.post("/settings/alerts/test")
+check("test alert reports not-configured when off", r.json()["ok"] is False, r.json())
 
 r = c.post("/settings/night-mode-hours", json={"arm_hour": 1, "disarm_hour": 9})
 check("night-mode hours accepted", r.json()["ok"] is True)

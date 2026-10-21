@@ -31,6 +31,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "esp_system.h"  // esp_restart(), for the two unrecoverable paths below
+#include "esp_wifi.h"    // esp_wifi_set_ps(): WiFi power-save off, see connectWiFi()
+#include "esp_heap_caps.h"
+#include "lwip/sockets.h"  // setsockopt(TCP_NODELAY) on the stream socket
 
 // See esp32/secrets.h.example. Copy it into this folder as secrets.h and
 // fill in the same values used for the other three boards.
@@ -59,16 +62,15 @@ const int backendPort = BACKEND_PORT;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// How often a frame is sent. Originally matched camera_worker.py's own
-// default (1500ms, tuned for face-recognition cost, not visual smoothness)
-// — dropped to 500ms for a noticeably more "live" feed once the app
-// actually had a way to show one. Frame capture itself has no equivalent
-// of the ultrasonic sensor's echo-settling constraint, so there's no
-// physical floor here the way there was for CAPTURE_INTERVAL there — the
-// real ceiling is how fast the backend can process a frame (recognition,
-// when enabled, is the expensive part) and how much WiFi/CPU load is
-// worth spending on a live view.
-const unsigned long CAPTURE_INTERVAL_MS = 500;
+// How often a frame is pushed for face recognition (the live view is the
+// separate /stream below and does not depend on this). It is the time from the
+// START of one push to the start of the next, so a slow reply from the backend
+// does not stretch it: about 3 pushes a second, which in practice is ~2 a
+// second because each push also waits for the backend's answer. Faster pushes
+// make a face disarm quicker; measured, they do not slow the stream. The real
+// ceiling is how fast the backend can process a frame (recognition, when
+// enabled, is the expensive part).
+const unsigned long CAPTURE_INTERVAL_MS = 300;
 unsigned long lastCapture = 0;
 
 bool initCamera() {
@@ -100,7 +102,7 @@ bool initCamera() {
   // stock CameraWebServer example uses, kept here for the same reason.
   //
   // grab_mode/fb_location weren't set explicitly before (left as whatever
-  // the stack held) — that was harmless for a single 500ms-interval shot,
+  // the stack held) — that was harmless for a single timed shot,
   // but now that /stream (startCameraServer, below) and sendFrame() are two
   // independent consumers pulling frames concurrently, it matters:
   // CAMERA_GRAB_LATEST always hands back the newest frame and drops stale
@@ -222,9 +224,9 @@ int sendFrame() {
   } else if (code < 200 || code >= 300) {
     Serial.printf("Backend refused the frame: HTTP %d\n", code);
   }
-  // No success message on every frame — at 2fps that would flood the log; a
-  // rejection or a connection error is the only thing worth interrupting the
-  // console for.
+  // No success message on every frame — a couple of lines a second would flood
+  // the log; a rejection or a connection error is the only thing worth
+  // interrupting the console for.
 
   return code;
 }
@@ -310,36 +312,63 @@ bool authorized(httpd_req_t* req) {
   return false;
 }
 
+// Room for "boundary + part header + one JPEG" in one piece. A VGA q12 frame is
+// 10-40 KB, so this has plenty of margin; a frame that does not fit is sent the
+// slow way (three chunks), and so is every frame if there is no PSRAM to hold
+// the buffer.
+static const size_t STREAM_BUF_BYTES = 96 * 1024;
+
 esp_err_t streamHandler(httpd_req_t* req) {
   if (!authorized(req)) {
     httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, NULL);
     return ESP_FAIL;
   }
 
+  // TCP_NODELAY. Without it the stack holds a small trailing piece of data back
+  // until the receiver has acknowledged the data before it, and the receiver
+  // (Windows) in turn holds its acknowledgement back for up to ~200 ms hoping to
+  // piggyback it. The two waits together showed up as frames that arrived in
+  // bursts with 100-400 ms holes between them. Each chunk below is sent whole, so
+  // there is nothing to gain by letting the stack wait.
+  int sock = httpd_req_to_sockfd(req);
+  int one = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
   esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
   if (res != ESP_OK) return res;
 
+  uint8_t* out = (uint8_t*)heap_caps_malloc(STREAM_BUF_BYTES, MALLOC_CAP_SPIRAM);  // NULL is fine
+  const size_t blen = strlen(STREAM_BOUNDARY);
   char partHeader[64];
   while (true) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
       res = ESP_FAIL;
     } else {
-      res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-      if (res == ESP_OK) {
-        size_t hlen = snprintf(partHeader, sizeof(partHeader), STREAM_PART_HEADER, fb->len);
-        res = httpd_resp_send_chunk(req, partHeader, hlen);
+      const size_t len = fb->len;
+      const size_t hlen = snprintf(partHeader, sizeof(partHeader), STREAM_PART_HEADER, (unsigned)len);
+      if (out && blen + hlen + len <= STREAM_BUF_BYTES) {
+        // One chunk per frame, and the camera's buffer goes back to the driver
+        // as soon as it is copied, so the sensor can already be capturing the
+        // next frame while this one is still on its way out.
+        memcpy(out, STREAM_BOUNDARY, blen);
+        memcpy(out + blen, partHeader, hlen);
+        memcpy(out + blen + hlen, fb->buf, len);
+        esp_camera_fb_return(fb);
+        res = httpd_resp_send_chunk(req, (const char*)out, blen + hlen + len);
+      } else {
+        res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, blen);
+        if (res == ESP_OK) res = httpd_resp_send_chunk(req, partHeader, hlen);
+        if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char*)fb->buf, len);
+        esp_camera_fb_return(fb);
       }
-      if (res == ESP_OK) {
-        res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
-      }
-      esp_camera_fb_return(fb);
     }
     // A closed connection (app disconnected, or the backend's proxy gave
     // up) makes httpd_resp_send_chunk fail — that's the normal, expected
     // way this loop ends, not an error to recover from.
     if (res != ESP_OK) break;
   }
+  if (out) heap_caps_free(out);
   return res;
 }
 
@@ -377,6 +406,21 @@ void connectWiFi() {
   Serial.println("\nWiFi connected!");
   Serial.print("My IP: ");
   Serial.println(WiFi.localIP());
+
+  // Power save off. The default (modem sleep) lets the radio doze between the
+  // router's beacons, so a packet addressed to this board can wait up to a
+  // beacon interval (~100 ms) before the board even hears it, and every TCP
+  // acknowledgement for the stream waits the same way. Measured on this board
+  // with it on: ping time 5-80 ms, and a worst gap between stream frames of
+  // 717 ms (340 ms with it off, in the same dim room). The cost is a little more
+  // current, which a board that streams video is already drawing. Done after
+  // the connection is up, because the WiFi driver applies its own default when
+  // it starts.
+  WiFi.setSleep(false);
+  wifi_ps_type_t ps = WIFI_PS_MAX_MODEM;
+  if (esp_wifi_get_ps(&ps) == ESP_OK) {
+    Serial.printf("WiFi power save: %s\n", ps == WIFI_PS_NONE ? "off" : "STILL ON");
+  }
 }
 
 void setup() {
@@ -440,10 +484,14 @@ void loop() {
   // sendBackoffMs stretches the interval while the backend is refusing frames
   // or unreachable; it is zero the rest of the time, which is almost always.
   if (millis() - lastCapture >= CAPTURE_INTERVAL_MS + sendBackoffMs) {
+    // Stamped BEFORE the send: the interval is the time between the starts of
+    // two pushes. Stamped after, it was the interval plus however long the
+    // backend took to answer (recognition included), which made the real rate
+    // about 1.3 a second instead of the 2 the interval says.
+    lastCapture = millis();
     if (WiFi.status() == WL_CONNECTED) {
       noteSendResult(sendFrame());
     }
-    lastCapture = millis();
   }
 
   // Yield. Without this the loop task spins at 100% CPU through the entire

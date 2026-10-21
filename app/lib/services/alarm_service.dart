@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:math';
 
+import 'package:clock/clock.dart';
 import 'package:flutter/foundation.dart';
 
 import 'backend_service.dart';
@@ -8,8 +8,8 @@ import 'notification_service.dart';
 
 /// Bridges [BackendService]'s streams into a single [ChangeNotifier] the
 /// widget tree can `watch`/`read` with `provider`, and adds the small
-/// bits of derived/demo behavior the UI needs on top (triggered-alert
-/// notifications, [simulateIntrusion], [simulateFaceRecognition]).
+/// bits of derived behavior the UI needs on top (triggered-alert
+/// notifications).
 ///
 /// Must be constructed eagerly (see the `lazy: false` + comment on its
 /// provider in main.dart), not lazily on first read: its constructor is
@@ -144,12 +144,17 @@ class AlarmService extends ChangeNotifier {
   void _restartEntryDelayCountdown(int seconds) {
     _entryDelayTimer?.cancel();
     if (seconds <= 0) return;
-    _entryDelayTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (_entryDelaySecondsRemaining <= 0) {
-        _entryDelayTimer?.cancel();
-        return;
-      }
-      _entryDelaySecondsRemaining--;
+    // The number shown is computed from a DEADLINE on every tick, never decremented.
+    // A decrementing counter froze whenever the browser throttled or paused the page's
+    // timers (a background tab, a busy phone): it showed 9 s while the real window ran
+    // out. With a deadline, the first tick after the timers wake shows the true time.
+    final deadline = clock.now().add(Duration(seconds: seconds));
+    _entryDelayTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      final left = (deadline.difference(clock.now()).inMilliseconds / 1000).ceil();
+      final remaining = left < 0 ? 0 : left;
+      if (remaining == _entryDelaySecondsRemaining && remaining > 0) return;
+      _entryDelaySecondsRemaining = remaining;
+      if (remaining <= 0) _entryDelayTimer?.cancel();
       notifyListeners();
     });
   }
@@ -269,20 +274,6 @@ class AlarmService extends ChangeNotifier {
   Future<void> removeFace(String id) => _backend.removeFace(id);
   Future<void> setFaceIdEnabled(bool enabled) => _backend.setFaceIdEnabled(enabled);
   Future<void> setFaceDisarmEnabled(bool enabled) => _backend.setFaceDisarmEnabled(enabled);
-
-  /// Demo-only: picks one of the currently-monitored (non-bypassed)
-  /// sensors and triggers it, so the alert flow can be seen without real
-  /// hardware. Works against either backend — triggerAlert is a real
-  /// interface method, not mock-specific.
-  void simulateIntrusion() {
-    final monitored = _sensors.where((s) => !s.bypassed).toList();
-    if (monitored.isEmpty) return;
-    final sensor = monitored[Random().nextInt(monitored.length)];
-    _backend.triggerAlert(source: sensor.type, reason: '${sensor.label} breached');
-  }
-
-  /// Demo-only pass-through (see [BackendService.simulateFaceRecognition]).
-  void simulateFaceRecognition() => _backend.simulateFaceRecognition();
 
   /// Marks [lastError] as handled, so the same message isn't shown twice on
   /// the next rebuild. Called by the widget that displayed it.
