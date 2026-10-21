@@ -36,7 +36,7 @@ HEBREW = re.compile(r"[֐-׿]")
 PLACEHOLDER = re.compile(r"\[(הכנס|להשלים|לאמת|הוסף קישור|תאריך)|dd/mm/yy")
 MAX_W_IN, MAX_H_IN = 6.25, 8.0  # A4 text width: 8.27 in minus 2 in of margins
 # photos and phone screenshots need more height than the 3.2 in diagrams get
-FIG_MAX_H = {"fig3": 4.2, "fig6": 3.7, "fig8": 4.8}
+FIG_MAX_H = {"fig3": 4.2, "fig6": 3.7, "fig8": 4.2}
 
 PARTS = ["HomeGuard_Report.md"]
 REFERENCES_FILE = "references.json"
