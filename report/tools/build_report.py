@@ -440,7 +440,8 @@ def style_table(table):
                     for r in p.runs:
                         r.font.bold = True
                 # a short table is kept on one page; long ones may break (the header row repeats)
-                if short_table and ri < len(table.rows) - 1:
+                # and the last three rows stay together, so a total or last row is never alone on a page
+                if ri < len(table.rows) - 1 and (short_table or ri >= len(table.rows) - 3):
                     p.paragraph_format.keep_with_next = True
 
 
