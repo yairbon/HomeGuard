@@ -663,7 +663,7 @@ def build_cover(doc):
     add(para(tmp, "בקרי ESP32, בקנד ב-Python ואפליקציה לטלפון", 13, False,
              after=40))
     add(para(tmp, "תאריך הביצוע: 20/10/26", 14, True, after=4))
-    add(para(tmp, "תאריך ההגשה: 20/10/26", 14, True, after=40))
+    add(para(tmp, "תאריך ההגשה: 21/10/26", 14, True, after=40))
 
     t = tmp.add_table(rows=5, cols=3)
     rows = [("", "שותף א'", "שותף ב'"),
