@@ -14,7 +14,7 @@ python report/tools/build_report.py report report/figures report/HomeGuard_Repor
 python report/tools/list_placeholders.py report/HomeGuard_Report.docx report/TODO_before_submission.md
 
 # 4. אחרי שיוצאים PDF סופי מ-Word: חבילת הגשה
-report/tools/package_submission.sh <HomeGuard_Report.pdf> HomeGuard_Submission.zip
+report/tools/package_submission.sh <HomeGuard_Report.pdf> HomeGuard_Submission.zip [HomeGuard_Report.docx]   # קבצים נוספים אחרי שם ה-ZIP נכנסים לתיקייה העליונה
 ```
 
 * תמונה בשם `figN.png` / `codeN.png` בתיקיית התמונות מחליפה אוטומטית את הסימון `[הכנס ...]` עם אותו מספר איור/קוד בכיתוב. איור 7 (פלט Serial Monitor) הוא הצילום היחיד שחסר; כדי להחליף ב-Word, מדביקים ידנית במקום הסימון הצהוב. צילומים (איורים 3, 5, 6, 8) מעבדים לפני ההכנסה: טשטוש פרטים מזהים וחיתוך שורת הסטטוס של הטלפון. הגובה המרבי של כל איור נקבע ב-`FIG_MAX_H` ב-`build_report.py`.
