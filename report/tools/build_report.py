@@ -662,21 +662,21 @@ def build_cover(doc):
     add(para(tmp, "מערכת אבטחה היברידית מרובת שכבות", 18, True, after=4))
     add(para(tmp, "בקרי ESP32, בקנד ב-Python ואפליקציה לטלפון", 13, False,
              after=40))
-    add(para(tmp, "תאריך הביצוע: dd/mm/yy", 14, True, after=4, hl=True))
-    add(para(tmp, "תאריך ההגשה: dd/mm/yy", 14, True, after=40, hl=True))
+    add(para(tmp, "תאריך הביצוע: 20/10/26", 14, True, after=4))
+    add(para(tmp, "תאריך ההגשה: 20/10/26", 14, True, after=40))
 
     t = tmp.add_table(rows=5, cols=3)
     rows = [("", "שותף א'", "שותף ב'"),
             ("שמות המבצעים:", "גיא בר", "יאיר אברהם בונפיל"),
             ("מספר זהות:", "213263932", "325534121"),
-            ('דוא"ל:', "[להשלים]@mail.tau.ac.il", "yairbonfil@mail.tau.ac.il"),
+            ('דוא"ל:', "guybar1@mail.tau.ac.il", "yairbonfil@mail.tau.ac.il"),
             ("חתימת המגישים:", "", "")]
     for ri, rv in enumerate(rows):
         for ci, val in enumerate(rv):
             cell = t.cell(ri, ci)
             cell.paragraphs[0]._p.getparent().remove(cell.paragraphs[0]._p)
             pp = para(cell, val, 12, bold=(ci == 0 or ri == 0), align=WD_ALIGN_PARAGRAPH.CENTER, after=2,
-                      hl=bool(PLACEHOLDER.search(val)), ltr=(ci > 0 and bool(re.search(r"[a-z]@", val))))
+                      hl=bool(PLACEHOLDER.search(val)), ltr=(ci > 0 and bool(re.search(r"[a-z0-9]@", val))))
             if ri == 4:
                 row = t.rows[ri]
                 trpr = row._tr.get_or_add_trPr()
