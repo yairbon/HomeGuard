@@ -464,3 +464,12 @@ async def test_arming_still_happens_locally_when_the_board_does_not_answer(
 
     assert body == {"ok": True, "hardware": False}
     assert state.alarm_state == AlarmState.transitional
+
+
+async def test_home_mode_arms_at_once_with_no_exit_delay(state):
+    """Home means someone stays inside, so nobody walks out: no transitional."""
+    await state.arm(ArmMode.home)
+    assert state.alarm_state == AlarmState.armed
+    assert state._arming_task is None
+    by_type = {s.type: s for s in state.sensors}
+    assert by_type[SensorType.ultrasonic].bypassed and by_type[SensorType.vibration].bypassed

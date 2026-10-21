@@ -1028,6 +1028,14 @@ class AppState:
         if self.alarm_state != AlarmState.disarmed:
             return
         self._arm_mode = mode
+        if mode == ArmMode.home:
+            # Home means someone stays inside, so there is nobody to walk out
+            # and no exit delay to wait for: armed at once.
+            self.alarm_state = AlarmState.armed
+            self._apply_bypass(mode)
+            self._log("System armed (Home)", EventCategory.armDisarm)
+            await self._broadcast()
+            return
         self._log(
             f"Arming ({'Away' if mode == ArmMode.away else 'Home'}) — exit now",
             EventCategory.armDisarm,

@@ -45,18 +45,19 @@ _WRITERS = (
 )
 
 
-def _timeline(frames: list[tuple[float, bytes]]) -> list[bytes]:
-    """The JPEG to show at each 1/CLIP_FPS tick, oldest first."""
+def _paced(frames: list[tuple[float, bytes]]) -> tuple[list[bytes], float]:
+    """Every frame once, oldest first, and the steady frame rate that makes the
+    clip last as long as the footage did (frames / real time span).
+
+    The camera delivers in bursts with gaps (WiFi). Laying the frames on a fixed
+    grid by arrival time repeated one frame across each gap and dropped frames
+    inside each burst, which looked like stutter. Playing every frame exactly
+    once at an even rate shows the motion smoothly; a long dropout is shortened
+    rather than frozen."""
     frames = sorted(frames, key=lambda f: f[0])
-    start, end = frames[0][0], frames[-1][0]
-    ticks = int((end - start) * CLIP_FPS) + 1
-    out, i = [], 0
-    for k in range(ticks):
-        t = start + k / CLIP_FPS
-        while i + 1 < len(frames) and frames[i + 1][0] <= t:
-            i += 1
-        out.append(frames[i][1])
-    return out
+    span = frames[-1][0] - frames[0][0]
+    fps = (len(frames) - 1) / span if span > 0 else CLIP_FPS
+    return [f[1] for f in frames], min(30.0, max(1.0, fps))
 
 
 def _write(timeline: list[bytes], fps: float, w: int, h: int) -> bytes | None:
@@ -89,8 +90,8 @@ def _write(timeline: list[bytes], fps: float, w: int, h: int) -> bytes | None:
     return None
 
 
-def _ffmpeg(timeline: list[bytes], crf: int) -> bytes | None:
-    """H.264 (libx264, yuv420p, faststart) at CLIP_FPS through ffmpeg, which is
+def _ffmpeg(timeline: list[bytes], fps: float, crf: int) -> bytes | None:
+    """H.264 (libx264, yuv420p, faststart) at `fps` through ffmpeg, which is
     fed the JPEGs as they are. None if ffmpeg is missing or fails."""
     if imageio_ffmpeg is None:
         return None
@@ -99,7 +100,7 @@ def _ffmpeg(timeline: list[bytes], crf: int) -> bytes | None:
     try:
         cmd = [
             imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
-            "-f", "image2pipe", "-framerate", str(CLIP_FPS), "-c:v", "mjpeg", "-i", "-",
+            "-f", "image2pipe", "-framerate", f"{fps:.3f}", "-c:v", "mjpeg", "-i", "-",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", path,
@@ -139,9 +140,9 @@ def encode_clip(
             return None
         h, w = first.shape[:2]
         w, h = w - w % 2, h - h % 2  # H.264 wants even sides
-        timeline = _timeline(frames)
-        for crf in (28, 34):  # preferred route: the real 20 fps timeline through ffmpeg
-            data = _ffmpeg(timeline, crf)
+        timeline, fps = _paced(frames)
+        for crf in (28, 34):  # preferred route: every frame once, through ffmpeg
+            data = _ffmpeg(timeline, fps, crf)
             if data is None:
                 break
             if len(data) <= MAX_BYTES:
@@ -152,7 +153,7 @@ def encode_clip(
         # Fallback (no ffmpeg, or still too big): OpenCV's encoder, retried with
         # every 2nd, then every 4th frame if the file is too big for an email.
         for step in (1, 2, 4):
-            data = _write(timeline[::step], CLIP_FPS / step, w, h)
+            data = _write(timeline[::step], fps / step, w, h)
             if data is None:
                 return None
             if len(data) <= MAX_BYTES:

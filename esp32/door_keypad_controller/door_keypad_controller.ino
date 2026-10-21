@@ -352,6 +352,36 @@ QueueHandle_t reportQueue = nullptr;
 // Boot sequence: configure pins, force the buzzers quiet so they don't
 // chirp on power-up, read the door's initial state, then bring up WiFi
 // and the remote-control WebServer.
+// ---- WiFi watchdog ------------------------------------------------------
+// The core reconnects by itself, but after a long outage the radio can stay wedged.
+// Nudge it every 20 s while the link is down. `REBOOT_AFTER_MS` of silence reboots the
+// board (0 = never); see the call site for why the door board only does that when disarmed.
+unsigned long wifiDownSince = 0;
+unsigned long wifiLastNudge = 0;
+
+void wifiWatchdog(unsigned long rebootAfterMs) {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    return;
+  }
+  unsigned long now = millis();
+  if (wifiDownSince == 0) {
+    wifiDownSince = now;
+    wifiLastNudge = now;
+  }
+  if (now - wifiLastNudge >= 20000) {
+    wifiLastNudge = now;
+    WiFi.disconnect();
+    WiFi.reconnect();
+  }
+  if (rebootAfterMs > 0 && now - wifiDownSince >= rebootAfterMs) {
+    Serial.println("WiFi down for too long - restarting.");
+    Serial.flush();
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void setup() {
   Serial.begin(9600); // 9600 to ensure stable serial reading
 
@@ -382,6 +412,12 @@ void setup() {
                // as-is since this pass is documentation-only.
 
   // --- WiFi + remote-control server ---
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  // The SSID can be offered by several mesh nodes. Look at all channels and join the
+  // strongest one instead of the first one found.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -391,6 +427,7 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.print("My IP: ");
   Serial.println(WiFi.localIP());
+  WiFi.setSleep(false);  // power save off: no 100+ ms waits for every packet
 
   // WebServer discards every request header it wasn't explicitly told to
   // keep, so this line is load-bearing: without it server.header("X-Device-Key")
@@ -747,7 +784,11 @@ void sendEntryDelayNow() {
   beginRequest(http, backendUrl("/esp32/entry-delay"));
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_KEY);
-  http.POST("{\"seconds\":" + String(ENTRY_TIME_LIMIT / 1000) + "}");
+  // The seconds LEFT, not the full window: when WiFi is slow this report arrives late, and the
+  // app counted a full 30 s from then while the board's own 30 s was already running.
+  unsigned long used = millis() - delayStartTime;
+  unsigned long left = used < ENTRY_TIME_LIMIT ? ENTRY_TIME_LIMIT - used : 0;
+  http.POST("{\"seconds\":" + String((left + 999) / 1000) + "}");
   http.end();
 }
 
@@ -897,8 +938,14 @@ void handleRemoteArm() {
   // Remote arming doesn't require physically walking out the door —
   // skip straight to a short countdown instead of PENDING_ARM/EXITING.
   if (currentState == DISARMED) {
-    setState(REMOTE_ARMING);
-    delayStartTime = millis();
+    if (isHomeMode) {
+      // Home: somebody stays inside, nobody walks out, so no exit countdown.
+      setState(ARMED);
+      reportStateChange(true);
+    } else {
+      setState(REMOTE_ARMING);
+      delayStartTime = millis();
+    }
   }
   // Always responds 200 OK even when the request above was a no-op
   // (e.g. system was already ARMED) — caller currently can't tell
@@ -984,6 +1031,9 @@ void handleRemoteTriggerAlarm() {
 // door sensor and the simulated keypad, advances the arm/disarm state
 // machine below, and sends a periodic heartbeat.
 void loop() {
+  // Only reboot over a long outage while DISARMED: a reboot forgets the armed state.
+  wifiWatchdog(currentState == DISARMED ? 300000UL : 0UL);
+
   // Only if the sound task could not start (see soundInit()).
   if (!soundTaskRunning) soundTick(millis());
 

@@ -23,6 +23,7 @@ param(
 
 $python = Join-Path $PSScriptRoot '..\python'
 $env:HOMEGUARD_DOOR_CONTROLLER_URL = "http://$DoorIp"
+$env:HOMEGUARD_PORT = "$Port"   # the UDP announcement tells the boards this port
 $env:HOMEGUARD_CAMERA_STREAM_URL   = "http://$CameraIp/stream"
 # The boards that send heartbeats (the camera's frames are its heartbeat).
 $env:HOMEGUARD_BOARDS = 'ultrasonic,door_controller'

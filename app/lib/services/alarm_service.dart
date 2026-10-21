@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:clock/clock.dart';
 import 'package:flutter/foundation.dart';
 
 import 'backend_service.dart';
@@ -143,12 +144,17 @@ class AlarmService extends ChangeNotifier {
   void _restartEntryDelayCountdown(int seconds) {
     _entryDelayTimer?.cancel();
     if (seconds <= 0) return;
-    _entryDelayTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (_entryDelaySecondsRemaining <= 0) {
-        _entryDelayTimer?.cancel();
-        return;
-      }
-      _entryDelaySecondsRemaining--;
+    // The number shown is computed from a DEADLINE on every tick, never decremented.
+    // A decrementing counter froze whenever the browser throttled or paused the page's
+    // timers (a background tab, a busy phone): it showed 9 s while the real window ran
+    // out. With a deadline, the first tick after the timers wake shows the true time.
+    final deadline = clock.now().add(Duration(seconds: seconds));
+    _entryDelayTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      final left = (deadline.difference(clock.now()).inMilliseconds / 1000).ceil();
+      final remaining = left < 0 ? 0 : left;
+      if (remaining == _entryDelaySecondsRemaining && remaining > 0) return;
+      _entryDelaySecondsRemaining = remaining;
+      if (remaining <= 0) _entryDelayTimer?.cancel();
       notifyListeners();
     });
   }
