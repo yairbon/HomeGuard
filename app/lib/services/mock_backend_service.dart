@@ -62,6 +62,8 @@ class MockBackendService implements BackendService {
   int _nightModeArmHour = 23;
   int _nightModeDisarmHour = 7;
   bool _alertsEnabled = true;
+  bool _clipEnabled = true;
+  int _clipSeconds = 60;
   List<String> _alertEmails = [];
   List<String> _escalationEmails = [];
   String _emergencyNumber = '';
@@ -257,8 +259,8 @@ class MockBackendService implements BackendService {
   /// nothing sensible to transition from). Immediately moves to
   /// [AlarmState.transitional] so the UI can show an exit-delay
   /// countdown, then after a fixed delay flips to [AlarmState.armed] and
-  /// marks each sensor's bypass state (vibration is bypassed in Home
-  /// mode — see [ArmMode]). The delay is a fixed demo value standing in
+  /// marks each sensor's bypass state (ultrasonic and vibration are bypassed in
+  /// Home mode — see [ArmMode]). The delay is a fixed demo value standing in
   /// for whatever exit-delay the real hardware/backend would use.
   @override
   Future<void> arm(ArmMode mode) async {
@@ -277,7 +279,8 @@ class MockBackendService implements BackendService {
                 type: s.type,
                 label: s.label,
                 ok: true,
-                bypassed: mode == ArmMode.home && s.type == SensorType.vibration,
+                bypassed: mode == ArmMode.home &&
+                    (s.type == SensorType.vibration || s.type == SensorType.ultrasonic),
               ))
           .toList();
       _logEvent(
@@ -413,6 +416,8 @@ class MockBackendService implements BackendService {
         nightModeArmHour: _nightModeArmHour,
         nightModeDisarmHour: _nightModeDisarmHour,
         alertsEnabled: _alertsEnabled,
+        clipEnabled: _clipEnabled,
+        clipSeconds: _clipSeconds,
         alertEmails: _alertEmails,
         escalationEmails: _escalationEmails,
         emergencyNumber: _emergencyNumber,
@@ -440,6 +445,12 @@ class MockBackendService implements BackendService {
     _alertEmails = List.of(alertTo);
     _escalationEmails = List.of(escalationTo);
     return null;
+  }
+
+  @override
+  Future<void> setAlertClip(bool enabled, int seconds) async {
+    _clipEnabled = enabled;
+    _clipSeconds = seconds.clamp(5, 60);
   }
 
   @override

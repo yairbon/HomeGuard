@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import TypeVar
 
 from fastapi import WebSocket
 
-from . import alerts, notifier, secrets_file
+from . import alerts, clip, notifier, secrets_file
 from .models import (
     AlarmState,
     ApprovedFace,
@@ -222,6 +224,15 @@ STATE_FILE = Path(
 )
 
 
+
+def _clamp_clip_seconds(value) -> int:
+    """The video length setting as a whole number of seconds between 5 and 60."""
+    try:
+        return max(5, min(int(clip.CLIP_SECONDS), int(value)))
+    except (TypeError, ValueError):
+        return int(clip.CLIP_SECONDS)
+
+
 class AppState:
     """Single in-process instance (see `state` at the bottom of this file)
     holding every piece of mutable system state, plus the logic that
@@ -280,6 +291,9 @@ class AppState:
         self.night_mode = False
         # Master switch for messages that leave the house; see FullState.
         self.alerts_enabled = True
+        # The video clip in the breach email: on/off and how many seconds (5-60).
+        self.clip_enabled = True
+        self.clip_seconds = 60
         # Who the alert emails go to, set from the app. On the first start after
         # this existed they are carried over from the local alerts file (see
         # `_load`), so nobody has to type them twice.
@@ -289,6 +303,10 @@ class AppState:
         # Returns the newest camera frame (JPEG bytes) or None. Set by main.py,
         # which owns the frame cache; used to attach a picture to alarm emails.
         self.camera_frame_source: Callable[[], bytes | None] | None = None
+        # The last minute of camera frames as (unix time, JPEG), for the video
+        # clip in the alarm email. In memory only: a restart starts it empty.
+        self.clip_frames: deque[tuple[float, bytes]] = deque(maxlen=clip.MAX_FRAMES)
+        self._stream_frame_at = 0.0  # when the live stream last delivered a frame
         # Whole hours (0-23): when night mode arms and disarms. Defaults to
         # arming at 23:00 and disarming at 07:00.
         self.night_mode_arm_hour = 23
@@ -410,6 +428,8 @@ class AppState:
         self.face_disarm_enabled = _scalar(data, "face_disarm_enabled", self.face_disarm_enabled)
         self.night_mode = _scalar(data, "night_mode", self.night_mode)
         self.alerts_enabled = _scalar(data, "alerts_enabled", self.alerts_enabled)
+        self.clip_enabled = _scalar(data, "clip_enabled", self.clip_enabled)
+        self.clip_seconds = _clamp_clip_seconds(_scalar(data, "clip_seconds", self.clip_seconds))
         stored_alert, stored_escalation = data.get("alert_emails"), data.get("escalation_emails")
         if isinstance(stored_alert, list) or isinstance(stored_escalation, list):
             self.alert_emails = list(alerts.parse_addresses(stored_alert)[0])
@@ -505,6 +525,8 @@ class AppState:
             "face_disarm_enabled": self.face_disarm_enabled,
             "night_mode": self.night_mode,
             "alerts_enabled": self.alerts_enabled,
+            "clip_enabled": self.clip_enabled,
+            "clip_seconds": self.clip_seconds,
             "alert_emails": self.alert_emails,
             "escalation_emails": self.escalation_emails,
             "night_mode_arm_hour": self.night_mode_arm_hour,
@@ -752,6 +774,8 @@ class AppState:
             face_disarm_enabled=self.face_disarm_enabled,
             night_mode=self.night_mode,
             alerts_enabled=self.alerts_enabled,
+            clip_enabled=self.clip_enabled,
+            clip_seconds=self.clip_seconds,
             alert_emails=self.alert_emails,
             escalation_emails=self.escalation_emails,
             night_mode_arm_hour=self.night_mode_arm_hour,
@@ -1022,8 +1046,9 @@ class AppState:
     def _apply_bypass(self, mode: ArmMode) -> None:
         """Resets every sensor to ok and applies `mode`'s bypass rules.
 
-        Home mode bypasses the vibration sensor (people moving around inside
-        shouldn't trip it); Away mode bypasses nothing. Factored out of
+        Home mode bypasses both perimeter sensors, the ultrasonic one and the
+        vibration one (people moving around inside shouldn't trip them); the
+        door sensor stays live. Away mode bypasses nothing. Factored out of
         `_finish_arming` so `report_state_from_esp32` can apply the exact
         same rules when the door controller is what puts the system into
         `armed` — previously that path had no way to do this and Home mode's
@@ -1034,7 +1059,10 @@ class AppState:
                 type=s.type,
                 label=s.label,
                 ok=True,
-                bypassed=(mode == ArmMode.home and s.type == SensorType.vibration),
+                bypassed=(
+                    mode == ArmMode.home
+                    and s.type in (SensorType.vibration, SensorType.ultrasonic)
+                ),
             )
             for s in self.sensors
         ]
@@ -1302,6 +1330,7 @@ class AppState:
                 alert_to=self.alert_emails,
                 escalation_to=self.escalation_emails,
                 photo=self._alert_photo(),
+                clip=self._alert_clip(),
             )
         self._start_escalation(reason)
 
@@ -1575,6 +1604,20 @@ class AppState:
         self._persist()
         await self._broadcast()
 
+    async def set_alert_clip(self, enabled: bool, seconds: int) -> None:
+        """Whether the breach email carries a video of the last few seconds, and
+        how many (5-60, clamped). The camera frames are kept either way."""
+        self.clip_enabled = enabled
+        self.clip_seconds = _clamp_clip_seconds(seconds)
+        self._log(
+            f"Alert video on, last {self.clip_seconds} s"
+            if enabled
+            else "Alert video switched off",
+            EventCategory.info,
+        )
+        self._persist()
+        await self._broadcast()
+
     async def set_night_mode_hours(self, arm_hour: int, disarm_hour: int) -> None:
         """Sets when night mode arms and disarms, as whole hours (0-23).
 
@@ -1663,7 +1706,32 @@ class AppState:
             self.alert_emails,
             self.escalation_emails,
             self._alert_photo(),
+            self._alert_clip(),
         )
+
+    def record_clip_frame(self, jpeg: bytes, *, stream: bool = False) -> None:
+        """Remembers one camera frame for the alarm clip, dropping anything
+        older than a minute. `stream=True` is a frame of the live stream (about
+        20 a second); otherwise it is a still pushed for face recognition (1-2 a
+        second), which is only kept while the stream is not delivering."""
+        now = time.time()
+        if stream:
+            self._stream_frame_at = now
+        elif now - self._stream_frame_at < 3:
+            return
+        self.clip_frames.append((now, jpeg))
+        while self.clip_frames and now - self.clip_frames[0][0] > clip.CLIP_SECONDS:
+            self.clip_frames.popleft()
+
+    def _alert_clip(self) -> tuple[tuple[float, bytes], ...] | None:
+        """The frames of the last minute (fewer if that is all there is), or
+        None. A snapshot, taken the moment the alarm fires; the video is made
+        later, off the event loop, by `alerts`."""
+        if not self.clip_enabled:
+            return None
+        cutoff = time.time() - self.clip_seconds
+        frames = tuple(f for f in self.clip_frames if f[0] >= cutoff)
+        return frames if len(frames) >= 2 else None
 
     def _alert_photo(self) -> bytes | None:
         """The latest camera frame, for the alarm email, or None.

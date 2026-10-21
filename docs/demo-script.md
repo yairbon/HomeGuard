@@ -44,8 +44,8 @@ Keep the siren short: disarm within a few seconds each time.
    intrusion detection by distance.
 7. **Forced entry (20 s).** Arm Away, knock on the window where the force sensor
    is taped: siren, TRIGGERED. Disarm. Proves: forced-entry detection.
-8. **Home mode (15 s, optional).** Arm Home, knock on the window: nothing, because
-   Home mode ignores that sensor. Open the door: the entry countdown starts.
+8. **Home mode (15 s, optional).** Arm Home, knock on the window or walk in front of the
+   ultrasonic sensor: nothing, because Home mode ignores both of those sensors. Open the door: the entry countdown starts.
 9. **Arming refused (10 s).** Leave the door open and press `*` on the keypad: rapid
    four-pulse refusal sound. In the app, tap Arm: "Can't arm: the door is open".
 10. **Camera and face disarm (40 s).** Camera tab: live picture. Arm, open the

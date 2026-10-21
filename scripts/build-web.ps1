@@ -15,8 +15,13 @@ Push-Location (Join-Path $PSScriptRoot '..\app')
 try {
     & $Flutter pub get
     if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed" }
+    # Flutter prints a deprecation warning on stderr; under 'Stop' PowerShell would
+    # treat that as a failure, so only the exit code decides here.
+    $ErrorActionPreference = 'Continue'
     & $Flutter build web --release --no-web-resources-cdn --pwa-strategy=none --dart-define=HOMEGUARD_SAME_ORIGIN=true
-    if ($LASTEXITCODE -ne 0) { throw "flutter build web failed" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) { throw "flutter build web failed" }
     Write-Host "Built app\build\web"
 } finally {
     Pop-Location

@@ -66,12 +66,18 @@ async def test_arm_is_ignored_unless_disarmed(state):
     assert state.alarm_state == AlarmState.triggered
 
 
-async def test_home_mode_bypasses_vibration_only(state):
+async def test_home_mode_bypasses_both_perimeter_sensors(state):
     await arm_now(state, ArmMode.home)
     by_type = {s.type: s for s in state.sensors}
     assert by_type[SensorType.vibration].bypassed is True
+    assert by_type[SensorType.ultrasonic].bypassed is True
     assert by_type[SensorType.door].bypassed is False
-    assert by_type[SensorType.ultrasonic].bypassed is False
+
+
+async def test_bypassed_ultrasonic_does_not_escalate_in_home_mode(state):
+    await arm_now(state, ArmMode.home)
+    await state.trigger_alert(SensorType.ultrasonic, "someone walking through the hall")
+    assert state.alarm_state == AlarmState.armed
 
 
 async def test_away_mode_bypasses_nothing(state):

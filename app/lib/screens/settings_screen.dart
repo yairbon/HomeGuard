@@ -62,6 +62,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool _nightMode = false;
   bool _alertsEnabled = true;
+  bool _clipEnabled = true;
+  double _clipSeconds = 60;
   int _nightModeArmHour = 23;
   int _nightModeDisarmHour = 7;
 
@@ -177,6 +179,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
       _nightMode = settings.nightMode;
       _alertsEnabled = settings.alertsEnabled;
+      _clipEnabled = settings.clipEnabled;
+      _clipSeconds = settings.clipSeconds.toDouble().clamp(5, 60);
       _alertEmailsController.text = settings.alertEmails.join(', ');
       _escalationEmailsController.text = settings.escalationEmails.join(', ');
       _nightModeArmHour = settings.nightModeArmHour;
@@ -410,6 +414,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                           ),
                         ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _clipEnabled,
+                          activeThumbColor: AppColors.system,
+                          onChanged: (value) async {
+                            setState(() => _clipEnabled = value);
+                            await context
+                                .read<BackendService>()
+                                .setAlertClip(value, _clipSeconds.round());
+                          },
+                          title: const Text(
+                            'Attach a video to the alarm email',
+                            style: TextStyle(color: AppColors.textPrimary),
+                          ),
+                          subtitle: Text(
+                            _clipEnabled
+                                ? 'The last ${_clipSeconds.round()} s from the camera'
+                                : 'Off: the email carries only a picture',
+                            style: const TextStyle(color: AppColors.textMuted, fontSize: 12),
+                          ),
+                        ),
+                        if (_clipEnabled)
+                          Slider(
+                            value: _clipSeconds,
+                            min: 5,
+                            max: 60,
+                            divisions: 11,
+                            label: '${_clipSeconds.round()} s',
+                            activeColor: AppColors.system,
+                            onChanged: (value) => setState(() => _clipSeconds = value),
+                            onChangeEnd: (value) async {
+                              await context
+                                  .read<BackendService>()
+                                  .setAlertClip(true, value.round());
+                            },
+                          ),
                         const SizedBox(height: 10),
                         TextField(
                           controller: _alertEmailsController,
@@ -527,15 +567,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             children: [
                               const HomeGuardIcon(HGIcon.auth, color: AppColors.system, size: 20),
                               const SizedBox(width: 10),
-                              const Text('Password & keypad PIN',
+                              const Text('Change PIN / password',
                                   style: TextStyle(color: AppColors.textPrimary)),
                             ],
                           ),
                           const SizedBox(height: 6),
                           const Text(
-                            'One shared code: logs into this app, and disarms at the '
-                            'physical keypad. Sent to the door controller, which '
-                            'stores it and keeps it across reboots.',
+                            'This is also the keypad PIN: 4 to 8 digits. One shared '
+                            'code that logs into this app and disarms at the physical '
+                            'keypad. Sent to the door controller, which stores it and '
+                            'keeps it across reboots.',
                             style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                           ),
                           const SizedBox(height: 16),

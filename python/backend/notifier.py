@@ -109,6 +109,7 @@ def notify(
     alert_to: Iterable[str] | None = None,
     escalation_to: Iterable[str] | None = None,
     photo: bytes | None = None,
+    clip: tuple[tuple[float, bytes], ...] | None = None,
 ) -> None:
     """Fires off an alert on every configured channel without waiting for it.
 
@@ -129,7 +130,8 @@ def notify(
     if topic:
         _spawn(_send(server, topic, title, message, priority, tags))
     if config.any_channel(escalation=escalation):
-        _spawn(alerts.deliver(config, title, message, escalation=escalation, photo=photo))
+        _spawn(alerts.deliver(config, title, message, escalation=escalation, photo=photo, clip=clip)
+        )
 
 
 def _with_app_recipients(
@@ -149,6 +151,7 @@ async def send_test(
     alert_to: Iterable[str] | None = None,
     escalation_to: Iterable[str] | None = None,
     photo: bytes | None = None,
+    clip: tuple[tuple[float, bytes], ...] | None = None,
 ) -> dict[str, str]:
     """Sends a harmless test over every configured channel and *waits* for the
     outcome, unlike `notify`: this is the user asking "does it work?", so the
@@ -164,6 +167,7 @@ async def send_test(
         "Test alert - this is how a real alarm will reach you.",
         escalation=True,
         photo=photo,
+        clip=clip,
     )
     if topic:
         _spawn(

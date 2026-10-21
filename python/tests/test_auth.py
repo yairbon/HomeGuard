@@ -40,6 +40,7 @@ PROTECTED_ROUTES = [
     ("post", "/settings/ntfy", {"server": "https://ntfy.sh", "topic": "x"}),
     ("post", "/settings/alerts/test", None),
     ("post", "/settings/alerts-enabled", {"enabled": False}),
+    ("post", "/settings/alert-clip", {"enabled": True, "seconds": 30}),
     ("post", "/settings/alert-emails", {"alert_to": ["a@example.com"], "escalation_to": []}),
 ]
 
