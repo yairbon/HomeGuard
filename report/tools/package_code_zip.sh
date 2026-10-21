@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packs only the code (tracked files; no secrets, no .claude/CLAUDE.md, no report/) into a ZIP
+# Packs only the code (tracked files; no secrets, no .claude/CLAUDE.md, no report/, no PDFs) into a ZIP
 # that can be embedded in the report PDF with embed_zip.py.
 #
 #   report/tools/package_code_zip.sh <out.zip> [--light]
@@ -9,7 +9,7 @@
 set -euo pipefail
 out="${1:?usage: package_code_zip.sh <out.zip> [--light]}"
 root="$(git rev-parse --show-toplevel)"
-excludes=(':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report')
+excludes=(':(exclude).claude' ':(exclude)CLAUDE.md' ':(exclude)report' ':(exclude)docs/*.pdf')
 if [ "${2:-}" = "--light" ]; then
   excludes+=(':(exclude)python/models/*.onnx')
 fi
