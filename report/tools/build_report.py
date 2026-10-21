@@ -14,7 +14,6 @@
 """
 import copy
 import math
-import os
 import re
 import subprocess
 import sys
@@ -28,10 +27,6 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Emu, Inches, Mm, Pt, RGBColor
 from PIL import Image
-
-# Optional: a picture of Guy's signature for the cover table. Kept outside the repository on purpose
-# (set HOMEGUARD_SIGNATURE_GUY to the file); without it the cell stays empty for signing by hand.
-SIGNATURE_GUY = os.environ.get("HOMEGUARD_SIGNATURE_GUY", "")
 
 REPORT_DIR = Path(sys.argv[1])
 FIGS = Path(sys.argv[2])
@@ -670,25 +665,17 @@ def build_cover(doc):
     add(para(tmp, "תאריך הביצוע: 20/10/26", 14, True, after=4))
     add(para(tmp, "תאריך ההגשה: 21/10/26", 14, True, after=40))
 
-    t = tmp.add_table(rows=5, cols=3)
+    t = tmp.add_table(rows=4, cols=3)
     rows = [("", "שותף א'", "שותף ב'"),
             ("שמות המבצעים:", "גיא בר", "יאיר אברהם בונפיל"),
             ("מספר זהות:", "213263932", "325534121"),
-            ('דוא"ל:', "guybar1@mail.tau.ac.il", "yairbonfil@mail.tau.ac.il"),
-            ("חתימת המגישים:", "", "")]
+            ('דוא"ל:', "guybar1@mail.tau.ac.il", "yairbonfil@mail.tau.ac.il")]
     for ri, rv in enumerate(rows):
         for ci, val in enumerate(rv):
             cell = t.cell(ri, ci)
             cell.paragraphs[0]._p.getparent().remove(cell.paragraphs[0]._p)
             pp = para(cell, val, 12, bold=(ci == 0 or ri == 0), align=WD_ALIGN_PARAGRAPH.CENTER, after=2,
                       hl=bool(PLACEHOLDER.search(val)), ltr=(ci > 0 and bool(re.search(r"[a-z0-9]@", val))))
-            if ri == 4:
-                row = t.rows[ri]
-                trpr = row._tr.get_or_add_trPr()
-                h = OxmlElement("w:trHeight")
-                h.set(qn("w:val"), "900")
-                h.set(qn("w:hRule"), "atLeast")
-                trpr.append(h)
     style_table(t)
     # style_table sizes to 6.3in and shades header; fine for the cover
     add_t = t._tbl
@@ -697,10 +684,6 @@ def build_cover(doc):
     add(para(tmp, "שמות המנחים: אריאלה צברי, עידן הבר", 13, True, after=2))
     for el in cover:
         first.addprevious(el)
-    if SIGNATURE_GUY and Path(SIGNATURE_GUY).exists():
-        # added here, not while the cover is built in the scratch document: the picture's
-        # relationship must belong to the real document
-        doc.tables[0].cell(4, 1).paragraphs[0].add_run().add_picture(SIGNATURE_GUY, width=Inches(0.9))
 
 
 ORDERS = {
