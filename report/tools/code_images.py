@@ -24,11 +24,11 @@ HERE = Path(__file__).resolve().parent
 # name -> (file, [(first, last), ...]) with 1-based inclusive line numbers
 SNIPPETS = {
     # distance sensor: several abnormal readings in a row are an intrusion
-    "code1": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(404, 405), (413, 434)]),
+    "code1": ("esp32/ultrasonic_sensor/ultrasonic_sensor.ino", [(405, 405), (413, 434)]),
     # keypad scan: one row at a time, read the columns
-    "code2": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(627, 644)]),
+    "code2": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(627, 653)]),
     # door board: the 30-second entry delay (time-out -> alarm, PIN -> disarm)
-    "code3": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(1110, 1142)]),
+    "code3": ("esp32/door_keypad_controller/door_keypad_controller.ino", [(1112, 1120), (1122, 1142)]),
 }
 
 LEXERS = {".ino": CppLexer(), ".py": PythonLexer(), ".dart": DartLexer()}

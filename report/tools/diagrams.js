@@ -59,7 +59,7 @@ D.fig4 = `stateDiagram-v2
   Arming --> Disarmed: ביטול
   Armed --> EntryDelay: דלת נפתחה
   Armed --> Alarm: חיישן הופעל
-  Armed --> Disarmed: אפליקציה
+  Armed --> Disarmed: אפליקציה<br/>או פנים
   EntryDelay --> Alarm: 30${U}s
   EntryDelay --> Disarmed: קוד, אפליקציה<br/>או פנים
   Alarm --> Disarmed: קוד, אפליקציה<br/>או פנים`;

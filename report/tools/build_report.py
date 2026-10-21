@@ -253,7 +253,7 @@ def make_reference(path: Path):
                      align=None, keep_next=True)
     for n in ("Caption", "Image Caption"):
         if n in names:
-            style_pf(names[n], 12, bold=False, italic=False, spacing=1.0, before=2, after=10,
+            style_pf(names[n], 12, bold=False, italic=False, spacing=1.5, before=2, after=10,
                      align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0, 0, 0))
     if "Verbatim Char" in names:
         # inline code (the keypad keys * and #): Arial like everything else, bold to stand out
