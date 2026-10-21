@@ -55,7 +55,8 @@ D.fig4 = `stateDiagram-v2
   EntryDelay: ספירת כניסה
   Alarm: אזעקה
   Disarmed --> Arming: קודן או אפליקציה
-  Arming --> Armed: דלת נסגרה<br/>או 3${U}s באפליקציה
+  Arming --> Armed: דלת נסגרה<br/>או 3${U}s ב-Away באפליקציה
+  Disarmed --> Armed: Home באפליקציה
   Arming --> Disarmed: ביטול
   Armed --> EntryDelay: דלת נפתחה
   Armed --> Alarm: חיישן הופעל
