@@ -396,10 +396,16 @@ def style_table(table):
     header = " ".join(c.text for c in table.rows[0].cells)
     if "קישור לרכישה" in header and len(weights) == 6:
         weights = [3, 17, 30, 5, 9, 30]  # BOM: leave room for real purchase URLs
+    elif "בקודן" in header and "באפליקציה" in header and len(weights) == 3:
+        weights = [15, 44, 41]  # operating guide: a readable action column, two wide text columns
+    elif "איפה ומה עושים" in header and len(weights) == 2:
+        weights = [20, 80]
     s = sum(weights)
     widths = [max(500, int(total * x / s)) for x in weights]
     widths[-1] += total - sum(widths)
     grid = tbl.tblGrid
+    # short tables stay on one page; long or text-heavy ones may break (the header row repeats)
+    short_table = len(table.rows) <= 10 and sum(len(c.text) for r in table.rows for c in r.cells) <= 900
     for gc, wd in zip(grid.findall(qn("w:gridCol")), widths):
         gc.set(qn("w:w"), str(wd))
     for ri, row in enumerate(table.rows):
@@ -432,7 +438,7 @@ def style_table(table):
                     for r in p.runs:
                         r.font.bold = True
                 # a short table is kept on one page; long ones may break (the header row repeats)
-                if len(table.rows) <= 10 and ri < len(table.rows) - 1:
+                if short_table and ri < len(table.rows) - 1:
                     p.paragraph_format.keep_with_next = True
 
 
@@ -752,6 +758,11 @@ def finalize_doc(raw: Path, out: Path):
     style_special_paragraphs(doc)
     for t in doc.tables:
         style_table(t)
+        # breathing room for the paragraph that follows a table
+        nxt = t._tbl.getnext()
+        if nxt is not None and nxt.tag == qn("w:p"):
+            from docx.text.paragraph import Paragraph
+            Paragraph(nxt, t._parent).paragraph_format.space_before = Pt(10)
     post_runs(doc)
     build_cover(doc)
     add_page_number_footer(doc)
